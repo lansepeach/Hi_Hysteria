@@ -1,5 +1,36 @@
 #!/bin/bash
 hihyV="1.0.3"
+printN=""
+
+HY_DEFAULT_REPO_OWNER="lansepeach"
+HY_DEFAULT_REPO_NAME="Hi_Hysteria"
+HY_REPO_OWNER="${HY_REPO_OWNER:-${HY_DEFAULT_REPO_OWNER}}"
+HY_REPO_NAME="${HY_REPO_NAME:-${HY_DEFAULT_REPO_NAME}}"
+HY_INSTALL_DIR="${HY_INSTALL_DIR:-/etc/hihy}"
+HY_SCRIPT_PATH="${HY_INSTALL_DIR}/hy2.sh"
+HY_SCRIPT_TMP="${HY_SCRIPT_PATH}.tmp"
+HY_SCRIPT_BAK="${HY_SCRIPT_PATH}.bak"
+HY_SCRIPT_ETAG="${HY_SCRIPT_PATH}.etag"
+HY_BINARY_PATH="${HY_BINARY_PATH:-/usr/bin/hihy}"
+HY_RELEASE_ASSET="${HY_RELEASE_ASSET:-hy2.sh}"
+HY_RELEASE_CHECKSUM_ASSET="${HY_RELEASE_CHECKSUM_ASSET:-hy2.sh.sha256}"
+HY_NIGHTLY_BRANCH="${HY_NIGHTLY_BRANCH:-main}"
+HY_RAW_PATH="${HY_RAW_PATH:-server/hy2.sh}"
+HY_UPDATE_DEFAULT_CHANNEL="stable"
+HY_USER_AGENT="HiHysteria/${hihyV}"
+
+if [ -n "${HY_VERBOSE:-}" ]; then
+    case "$(printf '%s' "${HY_VERBOSE}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)
+            HY_VERBOSE=true
+            ;;
+        *)
+            HY_VERBOSE=false
+            ;;
+    esac
+else
+    HY_VERBOSE=false
+fi
 
 # 检测虚拟化类型的函数
 detectVirtualization() {
@@ -117,6 +148,129 @@ echoColor() {
     esac
 }
 
+hy_lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+normalize_version() {
+    local version="$1"
+    version="${version#v}"
+    version="${version#V}"
+    printf '%s\n' "$version"
+}
+
+log_info() {
+    echoColor skyBlue "[INFO] $*"
+}
+
+log_warn() {
+    echoColor yellow "[WARN] $*"
+}
+
+log_error() {
+    echoColor red "[ERROR] $*"
+}
+
+log_success() {
+    echoColor green "[OK] $*"
+}
+
+log_verbose() {
+    if [ "${HY_VERBOSE}" = true ]; then
+        echoColor gray "[VERBOSE] $*"
+    fi
+}
+
+curl_request() {
+    local url="$1"
+    shift || true
+    local -a opts=("--fail" "--location" "--retry" "3" "--retry-delay" "2" "--connect-timeout" "10" "--max-time" "120" "--header" "User-Agent: ${HY_USER_AGENT}")
+    if [ "${HY_VERBOSE}" = true ]; then
+        opts+=("-v")
+    else
+        opts+=("--silent" "--show-error")
+    fi
+    if [ "$#" -gt 0 ]; then
+        opts+=("$@")
+    fi
+    curl "${opts[@]}" "$url"
+}
+
+apply_mirror_url() {
+    local url="$1"
+    case "${HY_GH_MIRROR:-}" in
+        ghproxy)
+            printf 'https://ghproxy.com/%s\n' "$url"
+            ;;
+        fastgit)
+            case "$url" in
+                https://github.com/*)
+                    printf '%s\n' "${url/https:\/\/github.com\//https:\/\/download.fastgit.org/}"
+                    ;;
+                https://raw.githubusercontent.com/*)
+                    printf '%s\n' "${url/https:\/\/raw.githubusercontent.com\//https:\/\/raw.fastgit.org/}"
+                    ;;
+                https://api.github.com/*)
+                    printf '%s\n' "${url/https:\/\/api.github.com\//https:\/\/hub.fastgit.org/}"
+                    ;;
+                *)
+                    printf '%s\n' "$url"
+                    ;;
+            esac
+            ;;
+        *)
+            printf '%s\n' "$url"
+            ;;
+    esac
+}
+
+download_with_mirror() {
+    local url="$1"
+    local dest="$2"
+    local header_file="$3"
+    shift 3 || true
+    local -a args=("--output" "$dest")
+    if [ -n "$header_file" ]; then
+        : > "$header_file"
+        args+=("--dump-header" "$header_file")
+    fi
+    if [ "$#" -gt 0 ]; then
+        args+=("$@")
+    fi
+    mkdir -p "$(dirname "$dest")"
+    if curl_request "$url" "${args[@]}"; then
+        return 0
+    fi
+    if [ -n "${HY_GH_MIRROR:-}" ]; then
+        local mirror_url
+        mirror_url=$(apply_mirror_url "$url")
+        if [ -n "$mirror_url" ] && [ "$mirror_url" != "$url" ]; then
+            if [ -n "$header_file" ]; then
+                : > "$header_file"
+            fi
+            log_warn "Primary download failed, retrying via mirror (${HY_GH_MIRROR})..."
+            if curl_request "$mirror_url" "${args[@]}"; then
+                return 0
+            fi
+        fi
+    fi
+    if [ -n "$header_file" ]; then
+        rm -f "$header_file"
+    fi
+    rm -f "$dest"
+    return 1
+}
+
+gh_api() {
+    local endpoint="$1"
+    local url="https://api.github.com${endpoint}"
+    url="$(apply_mirror_url "$url")"
+    local -a headers=("--header" "Accept: application/vnd.github+json")
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        headers+=("--header" "Authorization: Bearer ${GITHUB_TOKEN}")
+    fi
+    curl_request "$url" "${headers[@]}"
+}
 
 # 检测系统架构的函数
 getArchitecture() {
@@ -429,103 +583,103 @@ countdown() {
 
 
 setHysteriaConfig(){
-	mkdir -p /etc/hihy/bin /etc/hihy/conf /etc/hihy/cert  /etc/hihy/result /etc/hihy/acl/
+    mkdir -p /etc/hihy/bin /etc/hihy/conf /etc/hihy/cert  /etc/hihy/result /etc/hihy/acl/
     acl_file="/etc/hihy/acl/acl.txt"
     if [ -f "${acl_file}" ];then
         rm -r ${acl_file}
         
     fi
     touch $acl_file
-	echoColor yellowBlack "开始配置:"
-	echo -e "\033[32m(1/11)请选择证书申请方式:\n\n\033[0m\033[33m\033[01m1、使用ACME申请(推荐,需打开tcp/80端口)\n2、使用本地证书文件\n3、自签证书\n4、dns验证\033[0m\033[32m\n\n输入序号:\033[0m"
+    echoColor yellowBlack "开始配置:"
+    echo -e "\033[32m(1/11)请选择证书申请方式:\n\n\033[0m\033[33m\033[01m1、使用ACME申请(推荐,需打开tcp/80端口)\n2、使用本地证书文件\n3、自签证书\n4、dns验证\033[0m\033[32m\n\n输入序号:\033[0m"
     read certNum
-	useAcme=false
-	useLocalCert=false
-	yaml_file="/etc/hihy/conf/config.yaml"
-	if [ -f "${yaml_file}" ];then
-		rm -f ${yaml_file}
-	fi
-	touch $yaml_file
-	
+    useAcme=false
+    useLocalCert=false
+    yaml_file="/etc/hihy/conf/config.yaml"
+    if [ -f "${yaml_file}" ];then
+        rm -f ${yaml_file}
+    fi
+    touch $yaml_file
+    
 
-	if [ -z "${certNum}" ] || [ "${certNum}" == "3" ];then
-		echoColor green "请输入自签证书的域名(默认:helloworld.com):"
-		read domain
-		if [ -z "${domain}" ];then
-			domain="helloworld.com"
-		fi
-		echo -e "->自签证书域名为:"`echoColor red ${domain}`"\n"
-		ip=`curl -4 -s -m 8 ip.sb`
-		if [ -z "${ip}" ];then
-			ip=`curl -s -m 8 ip.sb`
-		fi
-		echoColor green "判断客户端连接所使用的地址是否正确?公网ip:"`echoColor red ${ip}`"\n"
-		while true
-		do	
-			echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、正确(默认)\n2、不正确,手动输入ip\033[0m\033[32m\n\n输入序号:\033[0m"
-			read ipNum
-			if [ -z "${ipNum}" ] || [ "${ipNum}" == "1" ];then
-				break
-			elif [ "${ipNum}" == "2" ];then
-				echoColor green "请输入正确的公网ip(ipv6地址不需要加[]):"
-				read ip
-				if [ -z "${ip}" ];then
-					echoColor red "输入错误,请重新输入..."
-					continue
-				fi
-				break
-			else
-				echoColor red "\n->输入错误,请重新输入:"
-			fi
-		done		
-		cert="/etc/hihy/cert/${domain}.crt"
-		key="/etc/hihy/cert/${domain}.key"
-		useAcme=false
-		echoColor purple "\n\n->您已选择自签${domain}证书加密.公网ip:"`echoColor red ${ip}`"\n"
-		echo -e "\n"
+    if [ -z "${certNum}" ] || [ "${certNum}" == "3" ];then
+        echoColor green "请输入自签证书的域名(默认:helloworld.com):"
+        read domain
+        if [ -z "${domain}" ];then
+            domain="helloworld.com"
+        fi
+        echo -e "->自签证书域名为:"`echoColor red ${domain}`"\n"
+        ip=`curl -4 -s -m 8 ip.sb`
+        if [ -z "${ip}" ];then
+            ip=`curl -s -m 8 ip.sb`
+        fi
+        echoColor green "判断客户端连接所使用的地址是否正确?公网ip:"`echoColor red ${ip}`"\n"
+        while true
+        do    
+            echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、正确(默认)\n2、不正确,手动输入ip\033[0m\033[32m\n\n输入序号:\033[0m"
+            read ipNum
+            if [ -z "${ipNum}" ] || [ "${ipNum}" == "1" ];then
+                break
+            elif [ "${ipNum}" == "2" ];then
+                echoColor green "请输入正确的公网ip(ipv6地址不需要加[]):"
+                read ip
+                if [ -z "${ip}" ];then
+                    echoColor red "输入错误,请重新输入..."
+                    continue
+                fi
+                break
+            else
+                echoColor red "\n->输入错误,请重新输入:"
+            fi
+        done        
+        cert="/etc/hihy/cert/${domain}.crt"
+        key="/etc/hihy/cert/${domain}.key"
+        useAcme=false
+        echoColor purple "\n\n->您已选择自签${domain}证书加密.公网ip:"`echoColor red ${ip}`"\n"
+        echo -e "\n"
 
     elif [ "${certNum}" == "2" ];then
-		echoColor green "请输入证书cert文件路径(需fullchain cert,提供完整证书链):"
-		read local_cert
-		while :
-		do
-			if [ ! -f "${local_cert}" ];then
-				echoColor red "\n\n->路径不存在,请重新输入!"
-				echoColor green "请输入证书cert文件路径:"
-				read  local_cert
-			else
-				break
-			fi
-		done
-		echo -e "\n\n->cert文件路径: "`echoColor red ${local_cert}`"\n"
-		echoColor green "请输入证书key文件路径:"
-		read local_key
-		while :
-		do
-			if [ ! -f "${local_key}" ];then
-				echoColor red "\n\n->路径不存在,请重新输入!"
-				echoColor green "请输入证书key文件路径:"
-				read  local_key
-			else
-				break
-			fi
-		done
-		echo -e "\n\n->key文件路径: "`echoColor red ${local_key}`"\n"
-		echoColor green "请输入所选证书域名:"
-		read domain
-		while :
-		do
-			if [ -z "${domain}" ];then
-				echoColor red "\n\n->此选项不能为空,请重新输入!"
-				echoColor green "请输入所选证书域名:"
-				read  domain
-			else
-				break
-			fi
-		done
-		useAcme=false
-		useLocalCert=true
-		echoColor purple "\n\n->您已选择本地证书加密.域名:"`echoColor red ${domain}`"\n"
+        echoColor green "请输入证书cert文件路径(需fullchain cert,提供完整证书链):"
+        read local_cert
+        while :
+        do
+            if [ ! -f "${local_cert}" ];then
+                echoColor red "\n\n->路径不存在,请重新输入!"
+                echoColor green "请输入证书cert文件路径:"
+                read  local_cert
+            else
+                break
+            fi
+        done
+        echo -e "\n\n->cert文件路径: "`echoColor red ${local_cert}`"\n"
+        echoColor green "请输入证书key文件路径:"
+        read local_key
+        while :
+        do
+            if [ ! -f "${local_key}" ];then
+                echoColor red "\n\n->路径不存在,请重新输入!"
+                echoColor green "请输入证书key文件路径:"
+                read  local_key
+            else
+                break
+            fi
+        done
+        echo -e "\n\n->key文件路径: "`echoColor red ${local_key}`"\n"
+        echoColor green "请输入所选证书域名:"
+        read domain
+        while :
+        do
+            if [ -z "${domain}" ];then
+                echoColor red "\n\n->此选项不能为空,请重新输入!"
+                echoColor green "请输入所选证书域名:"
+                read  domain
+            else
+                break
+            fi
+        done
+        useAcme=false
+        useLocalCert=true
+        echoColor purple "\n\n->您已选择本地证书加密.域名:"`echoColor red ${domain}`"\n"
     elif [ "${certNum}" == "4" ];then
         echoColor green "请输入域名:"
         read domain
@@ -667,218 +821,218 @@ setHysteriaConfig(){
             echoColor red "\n->输入错误,请重新输入:"
         fi
         ip=`curl -4 -s -m 8 ip.sb`
-		if [ -z "${ip}" ];then
-			ip=`curl -s -m 8 ip.sb`
-		fi
-		echoColor green "判断客户端连接所使用的地址是否正确?公网ip:"`echoColor red ${ip}`"\n"
-		while true
-		do	
-			echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、正确(默认)\n2、不正确,手动输入ip\033[0m\033[32m\n\n输入序号:\033[0m"
-			read ipNum
-			if [ -z "${ipNum}" ] || [ "${ipNum}" == "1" ];then
-				break
-			elif [ "${ipNum}" == "2" ];then
-				echoColor green "请输入正确的公网ip(ipv6地址不需要加[]):"
-				read ip
-				if [ -z "${ip}" ];then
-					echoColor red "输入错误,请重新输入..."
-					continue
-				fi
-				break
-			else
-				echoColor red "\n->输入错误,请重新输入:"
-			fi
-		done		
+        if [ -z "${ip}" ];then
+            ip=`curl -s -m 8 ip.sb`
+        fi
+        echoColor green "判断客户端连接所使用的地址是否正确?公网ip:"`echoColor red ${ip}`"\n"
+        while true
+        do    
+            echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、正确(默认)\n2、不正确,手动输入ip\033[0m\033[32m\n\n输入序号:\033[0m"
+            read ipNum
+            if [ -z "${ipNum}" ] || [ "${ipNum}" == "1" ];then
+                break
+            elif [ "${ipNum}" == "2" ];then
+                echoColor green "请输入正确的公网ip(ipv6地址不需要加[]):"
+                read ip
+                if [ -z "${ip}" ];then
+                    echoColor red "输入错误,请重新输入..."
+                    continue
+                fi
+                break
+            else
+                echoColor red "\n->输入错误,请重新输入:"
+            fi
+        done        
         echo -e "\n\n->您选择使用acme dns验证申请证书: "`echoColor red ${domain}`"\n"
         echo -e "\n ->dns验证方式: "`echoColor red ${dns}`"\n"
         echo -e "\n ->公网ip: "`echoColor red ${ip}`"\n"
         useAcme=true
         useDns=true
     else 
-    	echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
-		read domain
-		while :
-		do
-			if [ -z "${domain}" ];then
-				echoColor red "\n\n->此选项不能为空,请重新输入!"
-				echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
-				read  domain
-			else
-				break
-			fi
-		done
-		while :
-		do	
-			echoColor purple "\n->检测${domain},DNS解析..."
-			ip_resolv=`dig +short ${domain} A`
-			if [ -z "${ip_resolv}" ];then
-				ip_resolv=`dig +short ${domain} AAAA`
-			fi
-			if [ -z "${ip_resolv}" ];then
-				echoColor red "\n\n->域名解析失败,没有获得任何dns记录(A/AAAA),请检查域名是否正确解析到本机!"
-				echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
-				read  domain
-				continue
-			fi
-			remoteip=`echo ${ip_resolv} | awk -F " " '{print $1}'`
-			v6str=":" #Is ipv6?
-			result=$(echo ${remoteip} | grep ${v6str})
-			if [ "${result}" != "" ];then
-				localip=`curl -6 -s -m 8 ip.sb`
-			else
-				localip=`curl -4 -s -m 8 ip.sb`
-			fi
-			if [ -z "${localip}" ];then
-				localip=`curl -s -m 8 ip.sb` #如果上面的ip.sb都失败了,最后检测一次
-				if [ -z "${localip}" ];then
-					echoColor red "\n\n->获取本机ip失败,请检查网络连接!curl -s -m 8 ip.sb"
-					exit 1
-				fi
-			fi
-			if [ "${localip}" != "${remoteip}" ];then
-				echo -e " \n\n->本机ip: "`echoColor red ${localip}`" \n\n->域名ip: "`echoColor red ${remoteip}`"\n"
-				echoColor green "多ip或者dns未生效时可能检测失败,如果你确定正确解析到了本机,是否自己指定本机ip? [y/N]:"
-				read isLocalip
-				if [ "${isLocalip}" == "y" ];then
-					echoColor green "请自行输入本机ip:"
-					read localip
-					while :
-					do
-						if [ -z "${localip}" ];then
-							echoColor red "\n\n->此选项不能为空,请重新输入!"
-							echoColor green "请输入本机ip:"
-							read  localip
-						else
-							break
-						fi
-					done
-				fi
-				if [ "${localip}" != "${remoteip}" ];then
-					echoColor red "\n\n->域名解析到的ip与本机ip不一致,请重新输入!"
-					echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
-					read  domain
-					continue
-				else
-					break
-				fi
-			else
-				break
-			fi
-		done
-		useAcme=true
+        echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
+        read domain
+        while :
+        do
+            if [ -z "${domain}" ];then
+                echoColor red "\n\n->此选项不能为空,请重新输入!"
+                echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
+                read  domain
+            else
+                break
+            fi
+        done
+        while :
+        do    
+            echoColor purple "\n->检测${domain},DNS解析..."
+            ip_resolv=`dig +short ${domain} A`
+            if [ -z "${ip_resolv}" ];then
+                ip_resolv=`dig +short ${domain} AAAA`
+            fi
+            if [ -z "${ip_resolv}" ];then
+                echoColor red "\n\n->域名解析失败,没有获得任何dns记录(A/AAAA),请检查域名是否正确解析到本机!"
+                echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
+                read  domain
+                continue
+            fi
+            remoteip=`echo ${ip_resolv} | awk -F " " '{print $1}'`
+            v6str=":" #Is ipv6?
+            result=$(echo ${remoteip} | grep ${v6str})
+            if [ "${result}" != "" ];then
+                localip=`curl -6 -s -m 8 ip.sb`
+            else
+                localip=`curl -4 -s -m 8 ip.sb`
+            fi
+            if [ -z "${localip}" ];then
+                localip=`curl -s -m 8 ip.sb` #如果上面的ip.sb都失败了,最后检测一次
+                if [ -z "${localip}" ];then
+                    echoColor red "\n\n->获取本机ip失败,请检查网络连接!curl -s -m 8 ip.sb"
+                    exit 1
+                fi
+            fi
+            if [ "${localip}" != "${remoteip}" ];then
+                echo -e " \n\n->本机ip: "`echoColor red ${localip}`" \n\n->域名ip: "`echoColor red ${remoteip}`"\n"
+                echoColor green "多ip或者dns未生效时可能检测失败,如果你确定正确解析到了本机,是否自己指定本机ip? [y/N]:"
+                read isLocalip
+                if [ "${isLocalip}" == "y" ];then
+                    echoColor green "请自行输入本机ip:"
+                    read localip
+                    while :
+                    do
+                        if [ -z "${localip}" ];then
+                            echoColor red "\n\n->此选项不能为空,请重新输入!"
+                            echoColor green "请输入本机ip:"
+                            read  localip
+                        else
+                            break
+                        fi
+                    done
+                fi
+                if [ "${localip}" != "${remoteip}" ];then
+                    echoColor red "\n\n->域名解析到的ip与本机ip不一致,请重新输入!"
+                    echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
+                    read  domain
+                    continue
+                else
+                    break
+                fi
+            else
+                break
+            fi
+        done
+        useAcme=true
         useDns=false
-		echoColor purple "\n\n->解析正确,使用hysteria内置ACME申请证书.域名:"`echoColor red ${domain}`"\n"
+        echoColor purple "\n\n->解析正确,使用hysteria内置ACME申请证书.域名:"`echoColor red ${domain}`"\n"
     fi
 
-	while :
-	do
-		echoColor green "\n(2/11)请输入你想要开启的端口,此端口是server端口,推荐443.(默认随机10000-65535)"
-		echo "并没有证据表明非udp/443的端口会被阻断,它仅仅是可能有更好的伪装一种措施,`echoColor red "如果你使用端口跳跃的话，这里建议使用随机端口"`"
-		read  port
-		if [ -z "${port}" ];then
-			port=$(($(od -An -N2 -i /dev/random) % (65534 - 10001) + 10001))
-			echo -e "\n->使用随机端口:"`echoColor red udp/${port}`"\n"
-		else
-			echo -e "\n->您输入的端口:"`echoColor red udp/${port}`"\n"
+    while :
+    do
+        echoColor green "\n(2/11)请输入你想要开启的端口,此端口是server端口,推荐443.(默认随机10000-65535)"
+        echo "并没有证据表明非udp/443的端口会被阻断,它仅仅是可能有更好的伪装一种措施,`echoColor red "如果你使用端口跳跃的话，这里建议使用随机端口"`"
+        read  port
+        if [ -z "${port}" ];then
+            port=$(($(od -An -N2 -i /dev/random) % (65534 - 10001) + 10001))
+            echo -e "\n->使用随机端口:"`echoColor red udp/${port}`"\n"
+        else
+            echo -e "\n->您输入的端口:"`echoColor red udp/${port}`"\n"
 
-		fi
-		if [ "${port}" -gt 65535 ];then
-			echoColor red "端口范围错误,请重新输入!"
-			continue
-		fi
-		if [ "${ut}" != "udp" ];then
-			pIDa=`lsof -i ${ut}:${port} | grep "LISTEN" | grep -v "PID" | awk '{print $2}'`
-		else
-			pIDa=`lsof -i ${ut}:${port} | grep -v "PID" | awk '{print $2}'`
-		fi
-		if [ "$pIDa" != "" ];
-		then
-			echoColor red "\n->端口${port}被占用,PID:${pIDa}!请重新输入或者运行kill -9 ${pIDa}后重新安装!"
-		else
-			break
-		fi
-		
-	done
-	
+        fi
+        if [ "${port}" -gt 65535 ];then
+            echoColor red "端口范围错误,请重新输入!"
+            continue
+        fi
+        if [ "${ut}" != "udp" ];then
+            pIDa=`lsof -i ${ut}:${port} | grep "LISTEN" | grep -v "PID" | awk '{print $2}'`
+        else
+            pIDa=`lsof -i ${ut}:${port} | grep -v "PID" | awk '{print $2}'`
+        fi
+        if [ "$pIDa" != "" ];
+        then
+            echoColor red "\n->端口${port}被占用,PID:${pIDa}!请重新输入或者运行kill -9 ${pIDa}后重新安装!"
+        else
+            break
+        fi
+        
+    done
+    
 
-	echoColor green "\n->(3/11)是否使用端口跳跃(Port Hopping),推荐使用"
-	echo -e "Tip: 长时间单端口 UDP 连接容易被运营商封锁/QoS/断流,启动此功能可以有效避免此问题."
-	echo -e "更加详细介绍请参考: https://v2.hysteria.network/zh/docs/advanced/Port-Hopping/\n"
-	echo -e "\033[32m选择是否启用:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、跳过\033[0m\033[32m\n\n输入序号:\033[0m"
-	read portHoppingStatus
-	if [ -z "${portHoppingStatus}" ] || [ $portHoppingStatus == "1" ];then
-		portHoppingStatus="true"
-		echoColor purple "\n->您选择启用端口跳跃/多端口(Port Hopping)功能"
-		echo -e "端口跳跃/多端口(Port Hopping)功能需要占用多个端口,请保证这些端口没有监听其他服务\nTip: 端口选择数量不宜过多,推荐1000个左右,范围1-65535,建议选择连续的端口范围.\n"
-		while :
-		do
-			echoColor green "请输入起始端口(默认47000):"
-			read  portHoppingStart
-			if [ -z "${portHoppingStart}" ];then
-				portHoppingStart=47000
-			fi
-			if [ $portHoppingStart -gt 65535 ];then
-				echoColor red "\n->端口范围错误,请重新输入!"
-				continue
-			fi
-			echo -e "\n->起始端口:"`echoColor red ${portHoppingStart}`"\n"
-			echoColor green "请输入结束端口(默认48000):"
-			read  portHoppingEnd
-			if [ -z "${portHoppingEnd}" ];then
-				portHoppingEnd=48000
-			fi
-			if [ $portHoppingEnd -gt 65535 ];then
-				echoColor red "\n->端口范围错误,请重新输入!"
-				continue
-			fi
-			echo -e "\n->结束端口:"`echoColor red ${portHoppingEnd}`"\n"
-			if [ $portHoppingStart -ge $portHoppingEnd ];then
-				echoColor red "\n->起始端口必须小于结束端口,请重新输入!"
-			else
-				break
-			fi
-		done
-		clientPort="${port},${portHoppingStart}-${portHoppingEnd}"
-		echo -e "\n->您选择的端口跳跃/多端口(Port Hopping)参数为: "`echoColor red ${portHoppingStart}:${portHoppingEnd}`"\n"
-	else
-		portHoppingStatus="false"
-		echoColor red "\n->您选择不使用端口跳跃功能"
-	fi
+    echoColor green "\n->(3/11)是否使用端口跳跃(Port Hopping),推荐使用"
+    echo -e "Tip: 长时间单端口 UDP 连接容易被运营商封锁/QoS/断流,启动此功能可以有效避免此问题."
+    echo -e "更加详细介绍请参考: https://v2.hysteria.network/zh/docs/advanced/Port-Hopping/\n"
+    echo -e "\033[32m选择是否启用:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、跳过\033[0m\033[32m\n\n输入序号:\033[0m"
+    read portHoppingStatus
+    if [ -z "${portHoppingStatus}" ] || [ $portHoppingStatus == "1" ];then
+        portHoppingStatus="true"
+        echoColor purple "\n->您选择启用端口跳跃/多端口(Port Hopping)功能"
+        echo -e "端口跳跃/多端口(Port Hopping)功能需要占用多个端口,请保证这些端口没有监听其他服务\nTip: 端口选择数量不宜过多,推荐1000个左右,范围1-65535,建议选择连续的端口范围.\n"
+        while :
+        do
+            echoColor green "请输入起始端口(默认47000):"
+            read  portHoppingStart
+            if [ -z "${portHoppingStart}" ];then
+                portHoppingStart=47000
+            fi
+            if [ $portHoppingStart -gt 65535 ];then
+                echoColor red "\n->端口范围错误,请重新输入!"
+                continue
+            fi
+            echo -e "\n->起始端口:"`echoColor red ${portHoppingStart}`"\n"
+            echoColor green "请输入结束端口(默认48000):"
+            read  portHoppingEnd
+            if [ -z "${portHoppingEnd}" ];then
+                portHoppingEnd=48000
+            fi
+            if [ $portHoppingEnd -gt 65535 ];then
+                echoColor red "\n->端口范围错误,请重新输入!"
+                continue
+            fi
+            echo -e "\n->结束端口:"`echoColor red ${portHoppingEnd}`"\n"
+            if [ $portHoppingStart -ge $portHoppingEnd ];then
+                echoColor red "\n->起始端口必须小于结束端口,请重新输入!"
+            else
+                break
+            fi
+        done
+        clientPort="${port},${portHoppingStart}-${portHoppingEnd}"
+        echo -e "\n->您选择的端口跳跃/多端口(Port Hopping)参数为: "`echoColor red ${portHoppingStart}:${portHoppingEnd}`"\n"
+    else
+        portHoppingStatus="false"
+        echoColor red "\n->您选择不使用端口跳跃功能"
+    fi
 
     echoColor green "(4/11)请输入您到此服务器的平均延迟,关系到转发速度(默认200,单位:ms):"
     read  delay
     if [ -z "${delay}" ];then
-		delay=200
+        delay=200
     fi
-	echo -e "\n->延迟:`echoColor red ${delay}`ms\n"
+    echo -e "\n->延迟:`echoColor red ${delay}`ms\n"
     echo -e "\n期望速度,这是客户端的峰值速度,服务端默认不受限。"`echoColor red Tips:脚本会自动*1.10做冗余，您期望过低或者过高会影响速度,请如实填写!`
     echoColor green "(5/11)请输入客户端期望的下行速度:(默认50,单位:mbps):"
     read  download
     if [ -z "${download}" ];then
         download=50
     fi
-	echo -e "\n->客户端下行速度："`echoColor red ${download}`"mbps\n"
+    echo -e "\n->客户端下行速度："`echoColor red ${download}`"mbps\n"
     echo -e "\033[32m(6/11)请输入客户端期望的上行速度(默认10,单位:mbps):\033[0m" 
     read  upload
     if [ -z "${upload}" ];then
         upload=10
     fi
-	echo -e "\n->客户端上行速度："`echoColor red ${upload}`"mbps\n"
-	echoColor green "(7/11)请输入认证口令(默认随机生成UUID作为密码,建议使用强密码):"
-	read auth_secret
-	if [ -z "${auth_secret}" ]; then
-    	auth_secret=$(generate_uuid)
+    echo -e "\n->客户端上行速度："`echoColor red ${upload}`"mbps\n"
+    echoColor green "(7/11)请输入认证口令(默认随机生成UUID作为密码,建议使用强密码):"
+    read auth_secret
+    if [ -z "${auth_secret}" ]; then
+        auth_secret=$(generate_uuid)
     fi
     echo -e "\n->认证口令:"`echoColor red ${auth_secret}`"\n"
-	echo -e "Tips: 如果使用obfs混淆,抗封锁能力更强,能被识别为未知udp流量。\n但是会增加cpu负载导致峰值速度下降,如果您追求性能且未被针对封锁建议不使用"
-	echo -e "\033[32m(8/11)是否使用salamander进行流量混淆:\n\n\033[0m\033[33m\033[01m1、不使用(推荐)\n2、使用\033[0m\033[32m\n\n输入序号:\033[0m"
-	read obfs_num
-	if [ -z "${obfs_num}" ] || [ ${obfs_num} == "1" ];then
-		obfs_status="false"
-	else
-		obfs_status="true"
-		obfs_pass=${auth_secret}
-	fi
+    echo -e "Tips: 如果使用obfs混淆,抗封锁能力更强,能被识别为未知udp流量。\n但是会增加cpu负载导致峰值速度下降,如果您追求性能且未被针对封锁建议不使用"
+    echo -e "\033[32m(8/11)是否使用salamander进行流量混淆:\n\n\033[0m\033[33m\033[01m1、不使用(推荐)\n2、使用\033[0m\033[32m\n\n输入序号:\033[0m"
+    read obfs_num
+    if [ -z "${obfs_num}" ] || [ ${obfs_num} == "1" ];then
+        obfs_status="false"
+    else
+        obfs_status="true"
+        obfs_pass=${auth_secret}
+    fi
 
     if [ "${obfs_status}" == "true" ];then
         echo -e "\n->您将使用salamander混淆加密流量\n"
@@ -887,7 +1041,7 @@ setHysteriaConfig(){
     fi
 
     echo -e "\033[32m(9/11)请选择伪装类型:\n\n\033[0m\033[33m\033[01m1、string(默认、返回一个固定的字符串)\n2、proxy(作为一个反向代理，从另一个网站提供内容。)\n3、file(作为一个静态文件服务器，从一个目录提供内容。目录内必须含有index.html)\033[0m\033[32m\n\n输入序号:\033[0m"
-	read masquerade_type
+    read masquerade_type
     if [ -z "${masquerade_type}" ] || [ ${masquerade_type} == "1" ];then
         masquerade_type="string"
         echo -e "请输入伪装字符串(默认:HelloWorld):"
@@ -952,7 +1106,7 @@ setHysteriaConfig(){
 
 
     echoColor green "请输入客户端名称备注(默认使用域名或IP区分,例如输入test,则名称为Hy2-test):"
-	read remarks
+    read remarks
     echoColor green "\n配置录入完成!\n"
     echoColor yellowBlack "执行配置..."
     download=$(($download + $download / 10))
@@ -965,22 +1119,22 @@ setHysteriaConfig(){
     server_upload=${download}
     server_download=${upload}
     
-	addOrUpdateYaml "$yaml_file" "listen" ":${port}"
+    addOrUpdateYaml "$yaml_file" "listen" ":${port}"
     addOrUpdateYaml "$yaml_file" "auth.type" "password"
-	addOrUpdateYaml "$yaml_file" "auth.password" "${auth_secret}"
+    addOrUpdateYaml "$yaml_file" "auth.password" "${auth_secret}"
     if [ "${obfs_status}" == "true" ];then
         addOrUpdateYaml "$yaml_file" "obfs.type" "salamander"
         addOrUpdateYaml "$yaml_file" "obfs.salamander.password" "${obfs_pass}"
     fi
-	addOrUpdateYaml "$yaml_file" "quic.initStreamReceiveWindow" "${SRW}"
-	addOrUpdateYaml "$yaml_file" "quic.maxStreamReceiveWindow" "${max_SRW}"
-	addOrUpdateYaml "$yaml_file" "quic.initConnReceiveWindow" "${CRW}"
-	addOrUpdateYaml "$yaml_file" "quic.maxConnReceiveWindow" "${max_CRW}"
-	addOrUpdateYaml "$yaml_file" "quic.maxIdleTimeout" "30s"
-	addOrUpdateYaml "$yaml_file" "quic.maxIncomingStreams" "1024"
-	addOrUpdateYaml "$yaml_file" "quic.disablePathMTUDiscovery" "false"
-	addOrUpdateYaml "$yaml_file" "bandwidth.up" "${server_upload}mbps"
-	addOrUpdateYaml "$yaml_file" "bandwidth.down" "${server_download}mbps"
+    addOrUpdateYaml "$yaml_file" "quic.initStreamReceiveWindow" "${SRW}"
+    addOrUpdateYaml "$yaml_file" "quic.maxStreamReceiveWindow" "${max_SRW}"
+    addOrUpdateYaml "$yaml_file" "quic.initConnReceiveWindow" "${CRW}"
+    addOrUpdateYaml "$yaml_file" "quic.maxConnReceiveWindow" "${max_CRW}"
+    addOrUpdateYaml "$yaml_file" "quic.maxIdleTimeout" "30s"
+    addOrUpdateYaml "$yaml_file" "quic.maxIncomingStreams" "1024"
+    addOrUpdateYaml "$yaml_file" "quic.disablePathMTUDiscovery" "false"
+    addOrUpdateYaml "$yaml_file" "bandwidth.up" "${server_upload}mbps"
+    addOrUpdateYaml "$yaml_file" "bandwidth.down" "${server_download}mbps"
     addOrUpdateYaml "$yaml_file" "acl.file" "${acl_file}"
     case ${masquerade_type} in 
         "string")
@@ -1014,18 +1168,18 @@ setHysteriaConfig(){
     fi
     addOrUpdateYaml "$yaml_file" "speedTest" "true"
     if echo "${useAcme}" | grep -q "false";then
-		if echo "${useLocalCert}" | grep -q "false";then
-			v6str=":" #Is ipv6?
-			result=$(echo ${ip} | grep ${v6str})
-			if [ "${result}" != "" ];then
-				ip="[${ip}]" 
-			fi
-			u_host=${ip}
-			u_domain=${domain}
-			if [ -z "${remarks}" ];then
-				remarks="${ip}"
-			fi
-			insecure="1"
+        if echo "${useLocalCert}" | grep -q "false";then
+            v6str=":" #Is ipv6?
+            result=$(echo ${ip} | grep ${v6str})
+            if [ "${result}" != "" ];then
+                ip="[${ip}]" 
+            fi
+            u_host=${ip}
+            u_domain=${domain}
+            if [ -z "${remarks}" ];then
+                remarks="${ip}"
+            fi
+            insecure="1"
             days=3650  # 替换为实际的有效天数
             mail="no-reply@qq.com"
 
@@ -1058,29 +1212,29 @@ setHysteriaConfig(){
 
             # 完成
             echoColor purple "证书生成成功！\n"
-			addOrUpdateYaml "$yaml_file" "tls.cert" "/etc/hihy/cert/${domain}.crt"
-			addOrUpdateYaml "$yaml_file" "tls.key" "/etc/hihy/cert/${domain}.key"
+            addOrUpdateYaml "$yaml_file" "tls.cert" "/etc/hihy/cert/${domain}.crt"
+            addOrUpdateYaml "$yaml_file" "tls.key" "/etc/hihy/cert/${domain}.key"
             addOrUpdateYaml "$yaml_file" "tls.sniGuard" "strict"
-		else
-			u_host=${domain}
-			u_domain=${domain}
-			if [ -z "${remarks}" ];then
-				remarks="${domain}"
-			fi
-			insecure="0"
-			addOrUpdateYaml "$yaml_file" "tls.cert" "${local_cert}"
-			addOrUpdateYaml "$yaml_file" "tls.key" "${local_key}"
+        else
+            u_host=${domain}
+            u_domain=${domain}
+            if [ -z "${remarks}" ];then
+                remarks="${domain}"
+            fi
+            insecure="0"
+            addOrUpdateYaml "$yaml_file" "tls.cert" "${local_cert}"
+            addOrUpdateYaml "$yaml_file" "tls.key" "${local_key}"
             addOrUpdateYaml "$yaml_file" "tls.sniGuard" "strict"
-		fi		
+        fi        
 
 
     else
-		u_host=${domain}
-		u_domain=${domain}
-		insecure="0"
-		if [ -z "${remarks}" ];then
-			remarks="${domain}"
-		fi
+        u_host=${domain}
+        u_domain=${domain}
+        insecure="0"
+        if [ -z "${remarks}" ];then
+            remarks="${domain}"
+        fi
         addOrUpdateYaml "$yaml_file" "acme.domains" "${domain}"
         addOrUpdateYaml "$yaml_file" "acme.email" "pekora@${domain}"
         addOrUpdateYaml "$yaml_file" "acme.ca" "letsencrypt"
@@ -1119,12 +1273,12 @@ setHysteriaConfig(){
             esac
         else
             getPortBindMsg TCP 80
-		    allowPort tcp 80
+            allowPort tcp 80
             addOrUpdateYaml "$yaml_file" "acme.type" "http"
             addOrUpdateYaml "$yaml_file" "acme.listenHost" "0.0.0.0"
 
         fi
-		
+        
     fi
     addOrUpdateYaml "$yaml_file" "sniff.enabled" "true"
     addOrUpdateYaml "$yaml_file" "sniff.timeout" "2s"
@@ -1156,25 +1310,25 @@ setHysteriaConfig(){
     
     sysctl -w net.core.rmem_max=${max_CRW}
     sysctl -w net.core.wmem_max=${max_CRW}
-	if echo "${portHoppingStatus}" | grep -q "true";then
-		sysctl -w net.ipv4.ip_forward=1
-		sysctl -w net.ipv6.conf.all.forwarding=1
-	fi
+    if echo "${portHoppingStatus}" | grep -q "true";then
+        sysctl -w net.ipv4.ip_forward=1
+        sysctl -w net.ipv6.conf.all.forwarding=1
+    fi
     if [ ! -f "/etc/sysctl.conf" ]; then
         touch /etc/sysctl.conf
     fi
     sysctl -p
-	echo -e "\033[1;;35m\nTest config...\n\033[0m"
-	/etc/hihy/bin/appS -c ${yaml_file} server > ./hihy_debug.info 2>&1 &
+    echo -e "\033[1;;35m\nTest config...\n\033[0m"
+    /etc/hihy/bin/appS -c ${yaml_file} server > ./hihy_debug.info 2>&1 &
 
     if [ "${useAcme}" == "true" ];then
         countdown 20
     else
         countdown 5
     fi
-	
-	
-	msg=`cat ./hihy_debug.info`
+    
+    
+    msg=`cat ./hihy_debug.info`
     case ${msg} in 
         *"failed to get a certificate with ACME"*)
             echoColor red "域名:${u_host},申请证书失败!请重新安装使用自签证书."
@@ -1215,7 +1369,7 @@ setHysteriaConfig(){
             fi
             echoColor purple "Generating config..."
             ;;
-        *) 	
+        *)     
             # 确保有 pkill 命令
             if ! command -v pkill >/dev/null 2>&1; then
                 apk add --no-cache procps
@@ -1229,18 +1383,18 @@ setHysteriaConfig(){
             exit
             ;;
     esac
-	if [ -f "/etc/hihy/conf/backup.yaml" ]; then
-		rm /etc/hihy/conf/backup.yaml
-	fi
-	backup_file="/etc/hihy/conf/backup.yaml"
-	touch ${backup_file}
-	addOrUpdateYaml ${backup_file} "remarks" "${remarks}"
-	addOrUpdateYaml ${backup_file} "serverAddress" "${u_host}" "string"
-	addOrUpdateYaml ${backup_file} "serverPort" "${port}"
-	addOrUpdateYaml ${backup_file} "portHoppingStatus" "${portHoppingStatus}"
-	addOrUpdateYaml ${backup_file} "portHoppingStart" "${portHoppingStart}"
-	addOrUpdateYaml ${backup_file} "portHoppingEnd" "${portHoppingEnd}"
-	addOrUpdateYaml ${backup_file} "domain" "${domain}"
+    if [ -f "/etc/hihy/conf/backup.yaml" ]; then
+        rm /etc/hihy/conf/backup.yaml
+    fi
+    backup_file="/etc/hihy/conf/backup.yaml"
+    touch ${backup_file}
+    addOrUpdateYaml ${backup_file} "remarks" "${remarks}"
+    addOrUpdateYaml ${backup_file} "serverAddress" "${u_host}" "string"
+    addOrUpdateYaml ${backup_file} "serverPort" "${port}"
+    addOrUpdateYaml ${backup_file} "portHoppingStatus" "${portHoppingStatus}"
+    addOrUpdateYaml ${backup_file} "portHoppingStart" "${portHoppingStart}"
+    addOrUpdateYaml ${backup_file} "portHoppingEnd" "${portHoppingEnd}"
+    addOrUpdateYaml ${backup_file} "domain" "${domain}"
     addOrUpdateYaml ${backup_file} "trafficPort" "${trafficPort}"
     addOrUpdateYaml ${backup_file} "socks5_status" "false"
     if [ "$masquerade_tcp" == "true" ];then
@@ -1248,12 +1402,12 @@ setHysteriaConfig(){
     else
         addOrUpdateYaml ${backup_file} "masquerade_tcp" "false"
     fi
-	if [ $insecure == "1" ];then
-		addOrUpdateYaml ${backup_file} "insecure" "true"
-	else
-		addOrUpdateYaml ${backup_file} "insecure" "false"
-	fi
-	echoColor greenWhite "安装成功,请查看下方配置详细信息"
+    if [ $insecure == "1" ];then
+        addOrUpdateYaml ${backup_file} "insecure" "true"
+    else
+        addOrUpdateYaml ${backup_file} "insecure" "false"
+    fi
+    echoColor greenWhite "安装成功,请查看下方配置详细信息"
 }
 
 downloadHysteriaCore(){
@@ -1340,49 +1494,391 @@ updateHysteriaCore(){
     fi
 }
 
+get_latest_release_tag(){
+    local response tag
+    response=$(gh_api "/repos/${HY_REPO_OWNER}/${HY_REPO_NAME}/releases/latest") || return 1
+    if command -v jq >/dev/null 2>&1; then
+        tag=$(printf '%s
+' "$response" | jq -r '.tag_name // empty')
+    else
+        tag=$(printf '%s
+' "$response" | grep -m1 '"tag_name"' | sed 's/.*"tag_name":[[:space:]]*"//;s/".*//')
+    fi
+    if [ -n "$tag" ]; then
+        printf '%s
+' "$tag"
+        return 0
+    fi
+    return 1
+}
+
+get_commit_sha(){
+    local branch="${1:-${HY_NIGHTLY_BRANCH}}"
+    local response sha
+    response=$(gh_api "/repos/${HY_REPO_OWNER}/${HY_REPO_NAME}/commits/${branch}") || return 1
+    if command -v jq >/dev/null 2>&1; then
+        sha=$(printf '%s
+' "$response" | jq -r '.sha // empty')
+    else
+        sha=$(printf '%s
+' "$response" | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"//;s/".*//')
+    fi
+    if [ -n "$sha" ]; then
+        printf '%s
+' "$sha"
+        return 0
+    fi
+    return 1
+}
+
+extract_header_value(){
+    local header_file="$1"
+    local name="$2"
+    if [ ! -f "$header_file" ]; then
+        return 1
+    fi
+    awk -v key="$name" 'BEGIN{IGNORECASE=1}
+        $0 ~ "^" key ":" {
+            sub("^[^:]+:[[:space:]]*", "")
+            gsub("\r", "")
+            print
+        }' "$header_file" | tail -n1
+}
+
+store_etag_from_header(){
+    local header_file="$1"
+    local etag_file="$2"
+    local etag
+    etag=$(extract_header_value "$header_file" "ETag")
+    if [ -n "$etag" ]; then
+        etag=$(printf '%s
+' "$etag" | tr -d '"')
+        printf '%s
+' "$etag" > "$etag_file"
+        log_verbose "Stored ETag: ${etag}"
+        return 0
+    fi
+    return 1
+}
+
+verify_basic_integrity(){
+    local file="$1"
+    local header_file="$2"
+    local etag_file="$3"
+    if [ ! -f "$file" ]; then
+        log_error "Downloaded file missing: $file"
+        return 1
+    fi
+    local actual_size
+    actual_size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    if [ "$actual_size" -le 0 ]; then
+        log_error "Downloaded file is empty."
+        return 1
+    fi
+    local content_length
+    content_length=$(extract_header_value "$header_file" "Content-Length")
+    case "$content_length" in
+        '' )
+            log_verbose "Content-Length header not provided; observed size ${actual_size} bytes."
+            ;;
+        *[!0-9]*)
+            log_verbose "Unable to parse Content-Length header value: ${content_length}"
+            ;;
+        *)
+            if [ "$actual_size" -ne "$content_length" ]; then
+                log_error "Content length mismatch (expected ${content_length}, got ${actual_size})."
+                return 1
+            fi
+            ;;
+    esac
+    if ! store_etag_from_header "$header_file" "$etag_file"; then
+        rm -f "$etag_file"
+        log_warn "ETag header missing in response."
+    fi
+    return 0
+}
+
+verify_sha256(){
+    local file="$1"
+    local checksum_file="$2"
+    if [ ! -f "$checksum_file" ]; then
+        return 1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log_warn "sha256sum not available; skipping checksum verification."
+        return 3
+    fi
+    local expected
+    expected=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^[A-Fa-f0-9]{64}$/) {print tolower($i); exit}}' "$checksum_file")
+    if [ -z "$expected" ]; then
+        log_warn "Checksum file does not contain a valid SHA256 digest."
+        return 1
+    fi
+    local actual
+    actual=$(sha256sum "$file" | awk '{print tolower($1)}')
+    if [ "$expected" != "$actual" ]; then
+        log_error "Checksum mismatch (expected ${expected}, got ${actual})."
+        return 2
+    fi
+    log_success "Checksum verified."
+    return 0
+}
+
+atomic_replace(){
+    local src="$1"
+    local dest="$2"
+    local backup="$3"
+    if [ ! -f "$src" ]; then
+        log_error "Source file missing: $src"
+        return 1
+    fi
+    if [ -f "$dest" ]; then
+        cp -p "$dest" "$backup"
+    fi
+    mv "$src" "$dest"
+    chmod 755 "$dest"
+    log_verbose "Replaced $(basename "$dest") atomically."
+    return 0
+}
+
+sync_hihy_binary(){
+    local source="$1"
+    local target="${HY_BINARY_PATH}"
+    if [ -z "$target" ]; then
+        return 0
+    fi
+    if [ ! -e "$source" ]; then
+        return 1
+    fi
+    local source_real target_real
+    source_real=$(readlink -f "$source" 2>/dev/null || echo "$source")
+    target_real=$(readlink -f "$target" 2>/dev/null || echo "$target")
+    if [ "$source_real" = "$target_real" ]; then
+        log_verbose "Executable ${target} already points to the updated script."
+        return 0
+    fi
+    local target_dir
+    target_dir=$(dirname "$target")
+    if [ ! -d "$target_dir" ]; then
+        log_verbose "Target directory ${target_dir} not found; skipping executable sync."
+        return 0
+    fi
+    local tmp="${target}.tmp"
+    if cp "$source" "$tmp" 2>/dev/null; then
+        chmod 755 "$tmp" 2>/dev/null || true
+        mv "$tmp" "$target"
+        log_success "Synchronized executable to ${target}."
+    else
+        rm -f "$tmp"
+        log_warn "Insufficient permissions to update ${target}; skipping executable sync."
+    fi
+    return 0
+}
+
+update_self(){
+    local channel="${1:-$HY_UPDATE_DEFAULT_CHANNEL}"
+    local requested_version="${2:-}"
+    local check_only="${3:-false}"
+    channel=$(hy_lower "$channel")
+    case "$channel" in
+        stable|nightly) ;;
+        *)
+            log_error "Unsupported update channel: ${channel}"
+            return 1
+            ;;
+    esac
+    if [ "$channel" = "nightly" ] && [ -n "$requested_version" ]; then
+        log_error "--version is only supported with the stable channel."
+        return 1
+    fi
+
+    local previous_opts
+    previous_opts=$(set +o)
+    set -euo pipefail
+
+    local script_dir="$HY_INSTALL_DIR"
+    mkdir -p "$script_dir"
+
+    local tmp_file="$HY_SCRIPT_TMP"
+    local header_file="${HY_SCRIPT_TMP}.header"
+    local checksum_tmp="${HY_SCRIPT_TMP}.sha256"
+    local target_file="$HY_SCRIPT_PATH"
+    local backup_file="$HY_SCRIPT_BAK"
+    local etag_file="$HY_SCRIPT_ETAG"
+    local cleanup_cmd="rm -f '$tmp_file' '$header_file' '$checksum_tmp'"
+    trap "$cleanup_cmd; eval \"\$previous_opts\"" RETURN
+
+    local local_version="v${hihyV}"
+    local normalized_local
+    normalized_local=$(normalize_version "$local_version")
+    local etag_before=""
+    if [ -f "$etag_file" ]; then
+        etag_before=$(tr -d '\r\n' < "$etag_file" 2>/dev/null || true)
+    fi
+
+    case "$channel" in
+        stable)
+            local resolved_tag
+            if [ -n "$requested_version" ]; then
+                resolved_tag="$requested_version"
+            else
+                log_verbose "Resolving latest release tag..."
+                resolved_tag=$(get_latest_release_tag || true)
+            fi
+            if [ -z "$resolved_tag" ]; then
+                log_error "Unable to determine target release; please check your network connectivity."
+                return 1
+            fi
+            local normalized_target
+            normalized_target=$(normalize_version "$resolved_tag")
+
+            if [ "$check_only" = true ]; then
+                log_info "Current version: ${local_version}"
+                log_info "Latest stable: ${resolved_tag}"
+                if [ "$normalized_target" = "$normalized_local" ]; then
+                    log_success "Already up to date."
+                else
+                    log_warn "Update available."
+                fi
+                return 0
+            fi
+
+            if [ "$normalized_target" = "$normalized_local" ] && [ -z "$requested_version" ]; then
+                log_success "Already running the latest stable release (${resolved_tag})."
+                return 0
+            fi
+
+            log_info "Downloading release ${resolved_tag}..."
+            local asset_url="https://github.com/${HY_REPO_OWNER}/${HY_REPO_NAME}/releases/download/${resolved_tag}/${HY_RELEASE_ASSET}"
+            if ! download_with_mirror "$asset_url" "$tmp_file" "$header_file"; then
+                log_error "Failed to download ${HY_RELEASE_ASSET} from release ${resolved_tag}."
+                return 1
+            fi
+
+            local checksum_url="https://github.com/${HY_REPO_OWNER}/${HY_REPO_NAME}/releases/download/${resolved_tag}/${HY_RELEASE_CHECKSUM_ASSET}"
+            local has_checksum=false
+            if download_with_mirror "$checksum_url" "$checksum_tmp" ""; then
+                has_checksum=true
+                log_verbose "Checksum asset ${HY_RELEASE_CHECKSUM_ASSET} downloaded."
+            else
+                rm -f "$checksum_tmp"
+                log_verbose "Checksum asset ${HY_RELEASE_CHECKSUM_ASSET} unavailable; falling back to integrity checks."
+            fi
+
+            if [ "$has_checksum" = true ]; then
+                log_info "Verifying checksum..."
+                local checksum_status=0
+                verify_sha256 "$tmp_file" "$checksum_tmp" || checksum_status=$?
+                case "$checksum_status" in
+                    0)
+                        store_etag_from_header "$header_file" "$etag_file" || true
+                        ;;
+                    3)
+                        log_warn "Checksum verification skipped; validating response headers instead."
+                        verify_basic_integrity "$tmp_file" "$header_file" "$etag_file" || return 1
+                        ;;
+                    *)
+                        return 1
+                        ;;
+                esac
+            else
+                log_info "Verifying download integrity..."
+                verify_basic_integrity "$tmp_file" "$header_file" "$etag_file" || return 1
+            fi
+            ;;
+        nightly)
+            local commit_sha
+            log_verbose "Fetching latest commit hash for ${HY_NIGHTLY_BRANCH}..."
+            commit_sha=$(get_commit_sha "$HY_NIGHTLY_BRANCH" || true)
+            if [ -z "$commit_sha" ]; then
+                log_error "Unable to resolve latest nightly commit; please check your network connectivity."
+                return 1
+            fi
+            local commit_short="${commit_sha:0:7}"
+
+            if [ "$check_only" = true ]; then
+                log_info "Current version: ${local_version}"
+                log_info "Latest nightly commit: ${commit_sha}"
+                if [ -n "$etag_before" ]; then
+                    log_info "Stored ETag: ${etag_before}"
+                fi
+                return 0
+            fi
+
+            local raw_url="https://raw.githubusercontent.com/${HY_REPO_OWNER}/${HY_REPO_NAME}/${HY_NIGHTLY_BRANCH}/${HY_RAW_PATH}"
+            log_info "Downloading nightly build (${commit_short})..."
+            if [ -n "$etag_before" ]; then
+                if ! download_with_mirror "$raw_url" "$tmp_file" "$header_file" "--header" "If-None-Match: ${etag_before}"; then
+                    log_error "Failed to download nightly build."
+                    return 1
+                fi
+            else
+                if ! download_with_mirror "$raw_url" "$tmp_file" "$header_file"; then
+                    log_error "Failed to download nightly build."
+                    return 1
+                fi
+            fi
+
+            if [ -f "$header_file" ] && grep -qi '^HTTP/[^ ]* 304' "$header_file"; then
+                log_success "Nightly build already up to date (ETag ${etag_before})."
+                return 0
+            fi
+
+            log_info "Verifying download integrity..."
+            verify_basic_integrity "$tmp_file" "$header_file" "$etag_file" || return 1
+            ;;
+    esac
+
+    log_info "Updating script..."
+    atomic_replace "$tmp_file" "$target_file" "$backup_file"
+
+    sync_hihy_binary "$target_file" || true
+
+    local new_version=""
+    if [ -f "$target_file" ]; then
+        new_version=$(awk -F'"' 'NR==2 {print $2}' "$target_file" 2>/dev/null)
+    fi
+    if [ -n "$new_version" ]; then
+        log_success "Update completed. New version: v${new_version}"
+    else
+        log_success "Update completed successfully."
+    fi
+    return 0
+}
+
 hihy_update_notifycation(){
-	localV=${hihyV}
-	remoteV=`curl -fsSL https://raw.githubusercontent.com/emptysuns/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
-	if [ -z $remoteV ];then
-		echoColor red "Network Error: Can't connect to Github for checking hihy version!"
-	else
-		if [ "${localV}" != "${remoteV}" ];then
-			echoColor purple "[☺] hihy需更新,version:v${remoteV},建议更新并查看日志: https://github.com/emptysuns/Hi_Hysteria/"
-		fi
-	fi
+    local local_version="v${hihyV}"
+    local remote_version
+    remote_version=$(get_latest_release_tag 2>/dev/null || true)
+    if [ -z "$remote_version" ]; then
+        echoColor red "Network Error: Can't connect to GitHub for checking hihy version!"
+        return
+    fi
+    if [ "$(normalize_version "$remote_version")" != "$(normalize_version "$local_version")" ]; then
+        echoColor purple "[☺] hihy需更新,version:${remote_version},建议更新并查看日志: https://github.com/${HY_REPO_OWNER}/${HY_REPO_NAME}/"
+    fi
 }
 
 hihyUpdate(){
-	localV=${hihyV}
-	remoteV=`curl -fsSL https://raw.githubusercontent.com/emptysuns/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
-	if [ -z $remoteV ];then
-		echoColor red "Network Error: Can't connect to Github!"
-		exit
-	fi
-	if [ "${localV}" = "${remoteV}" ];then
-		echoColor green "Already the latest version.Ignore."
-	else
-		rm /usr/bin/hihy
-		wget -q -O /usr/bin/hihy --no-check-certificate https://raw.githubusercontent.com/emptysuns/Hi_Hysteria/refs/heads/main/server/hy2.sh 2>/dev/null
-		chmod +x /usr/bin/hihy
-		echoColor green "hihy更新完成."
-	fi
-
+    if ! update_self "${HY_UPDATE_DEFAULT_CHANNEL}" "" false; then
+        echoColor red "自更新失败，已保留原版本。"
+        return 1
+    fi
 }
 
 hyCore_update_notifycation(){
-	if [ -f "/etc/hihy/bin/appS" ]; then
-  		local localV=$(echo app/$(/etc/hihy/bin/appS version | grep Version: | awk '{print $2}' | head -n 1))
+    if [ -f "/etc/hihy/bin/appS" ]; then
+          local localV=$(echo app/$(/etc/hihy/bin/appS version | grep Version: | awk '{print $2}' | head -n 1))
         local remoteV=`curl --silent --head https://github.com/apernet/hysteria/releases/latest | grep -i location | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/ //g'`
-		if [ -z $remoteV ];then
-			echoColor red "Network Error: Can't connect to Github for checking the hysteria version!"
-		else
-			if [ "${localV}" != "${remoteV}" ];then
-				echoColor purple "[!] hysteria2 core有更新,version:${remoteV}  日志: https://v2.hysteria.network/docs/Changelog/"
-			fi
-		fi
-		
-	fi
+        if [ -z $remoteV ];then
+            echoColor red "Network Error: Can't connect to Github for checking the hysteria version!"
+        else
+            if [ "${localV}" != "${remoteV}" ];then
+                echoColor purple "[!] hysteria2 core有更新,version:${remoteV}  日志: https://v2.hysteria.network/docs/Changelog/"
+            fi
+        fi
+        
+    fi
 }
 
 setup_rc_local_for_arch() {
@@ -2028,84 +2524,84 @@ generate_qr() {
     fi
 }
 
-generate_client_config(){	
+generate_client_config(){    
     if [ ! -e "/etc/rc.d/hihy" ] && [ ! -e "/etc/init.d/hihy" ]; then
         echoColor red "hysteria2 未安装!"
         exit 1
     fi
-	remarks=$(getYamlValue "/etc/hihy/conf/backup.yaml" "remarks")
-	serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
-	port=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen" | awk '{gsub(/^:/, ""); print}')
-	auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
-	tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
-	insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
+    remarks=$(getYamlValue "/etc/hihy/conf/backup.yaml" "remarks")
+    serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
+    port=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen" | awk '{gsub(/^:/, ""); print}')
+    auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
+    tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
+    insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
-	obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.salamander.password")
-	if [ "${obfs_pass}" == "" ];then
-		obfs_status="true"
-	fi
-	SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
-	CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
+    obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.salamander.password")
+    if [ "${obfs_pass}" == "" ];then
+        obfs_status="true"
+    fi
+    SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
+    CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
      max_CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxConnReceiveWindow")
      max_SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxStreamReceiveWindow")
-	download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
-	upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
-	portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
-	if [ "${portHoppingStatus}" == "true" ];then
-		portHoppingStart=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStart")
-		portHoppingEnd=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingEnd")
-	fi
-	client_configfile="./Hy2-${remarks}-v2rayN.yaml"
-	if [ -f "${client_configfile}" ]; then
-		rm -r ${client_configfile}
-	fi
-	touch ${client_configfile}
-	if [ "${portHoppingStatus}" == "true" ];then
-		addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port},${portHoppingStart}-${portHoppingEnd}/"
-	fi
-	
-	addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}"
-	if [ "${insecure}" == "true" ];then
-		addOrUpdateYaml "$client_configfile" "tls.insecure" "true"
-	elif [ "${insecure}" == "false" ];then
-		addOrUpdateYaml "$client_configfile" "tls.insecure" "false"
-	fi
-	addOrUpdateYaml  "$client_configfile" "transport.type" "udp"
-	addOrUpdateYaml  "$client_configfile" "transport.udp.hopInterval" "300s"
-	if [ "${obfs_status}" == "true" ];then
-		addOrUpdateYaml "$client_configfile" "obfs.type" "salamander"
-		addOrUpdateYaml "$client_configfile" "obfs.salamander.password" "${obfs_pass}"
-	fi
-	addOrUpdateYaml "$client_configfile" "quic.initStreamReceiveWindow" "${SRW}"
-	addOrUpdateYaml "$client_configfile" "quic.initConnReceiveWindow" "${CRW}"
+    download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
+    upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
+    portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
+    if [ "${portHoppingStatus}" == "true" ];then
+        portHoppingStart=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStart")
+        portHoppingEnd=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingEnd")
+    fi
+    client_configfile="./Hy2-${remarks}-v2rayN.yaml"
+    if [ -f "${client_configfile}" ]; then
+        rm -r ${client_configfile}
+    fi
+    touch ${client_configfile}
+    if [ "${portHoppingStatus}" == "true" ];then
+        addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port},${portHoppingStart}-${portHoppingEnd}/"
+    fi
+    
+    addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}"
+    if [ "${insecure}" == "true" ];then
+        addOrUpdateYaml "$client_configfile" "tls.insecure" "true"
+    elif [ "${insecure}" == "false" ];then
+        addOrUpdateYaml "$client_configfile" "tls.insecure" "false"
+    fi
+    addOrUpdateYaml  "$client_configfile" "transport.type" "udp"
+    addOrUpdateYaml  "$client_configfile" "transport.udp.hopInterval" "300s"
+    if [ "${obfs_status}" == "true" ];then
+        addOrUpdateYaml "$client_configfile" "obfs.type" "salamander"
+        addOrUpdateYaml "$client_configfile" "obfs.salamander.password" "${obfs_pass}"
+    fi
+    addOrUpdateYaml "$client_configfile" "quic.initStreamReceiveWindow" "${SRW}"
+    addOrUpdateYaml "$client_configfile" "quic.initConnReceiveWindow" "${CRW}"
     addOrUpdateYaml "$client_configfile" "quic.maxConnReceiveWindow" "${max_CRW}"
     addOrUpdateYaml "$client_configfile" "quic.maxStreamReceiveWindow" "${max_SRW}"
-	addOrUpdateYaml "$client_configfile" "quic.keepAlivePeriod" "60s"
-	addOrUpdateYaml	"$client_configfile" "bandwidth.down " "${download}"
-	addOrUpdateYaml	"$client_configfile" "bandwidth.up" "${upload}"
-	addOrUpdateYaml "$client_configfile" "fastOpen" "true"
+    addOrUpdateYaml "$client_configfile" "quic.keepAlivePeriod" "60s"
+    addOrUpdateYaml    "$client_configfile" "bandwidth.down " "${download}"
+    addOrUpdateYaml    "$client_configfile" "bandwidth.up" "${upload}"
+    addOrUpdateYaml "$client_configfile" "fastOpen" "true"
     addOrUpdateYaml "$client_configfile" "lazy" "true"
-	addOrUpdateYaml "$client_configfile" "socks5.listen" "127.0.0.1:20808"
-	url_base="hy2://${auth_secret}@${serverAddress}"
+    addOrUpdateYaml "$client_configfile" "socks5.listen" "127.0.0.1:20808"
+    url_base="hy2://${auth_secret}@${serverAddress}"
     
-	
-	if [ "${portHoppingStatus}" == "true" ];then
-		url_base="${url_base}:${port}/?mport=${portHoppingStart}-${portHoppingEnd}&"
-	else
-		url_base="${url_base}:${port}/?"
-	fi
-	
-	if [ "${insecure}" == "true" ];then
-		url_base="${url_base}insecure=1"
-	else
-		url_base="${url_base}insecure=0"
-	fi
-	
-	if [ "${obfs_status}" == "true" ];then
-		url_base="${url_base}&obfs=salamander&obfs-password=${obfs_pass}"
-	fi
-	url="${url_base}&sni=${tls_sni}#Hy2-${remarks}"
-	 # 在生成配置前添加分隔线
+    
+    if [ "${portHoppingStatus}" == "true" ];then
+        url_base="${url_base}:${port}/?mport=${portHoppingStart}-${portHoppingEnd}&"
+    else
+        url_base="${url_base}:${port}/?"
+    fi
+    
+    if [ "${insecure}" == "true" ];then
+        url_base="${url_base}insecure=1"
+    else
+        url_base="${url_base}insecure=0"
+    fi
+    
+    if [ "${obfs_status}" == "true" ];then
+        url_base="${url_base}&obfs=salamander&obfs-password=${obfs_pass}"
+    fi
+    url="${url_base}&sni=${tls_sni}#Hy2-${remarks}"
+     # 在生成配置前添加分隔线
     echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo -e "📝 生成客户端配置文件..."
     
@@ -2152,7 +2648,7 @@ generateMetaYaml(){
     fi
     touch ${metaFile}
 
-	cat <<EOF > ${metaFile}
+    cat <<EOF > ${metaFile}
 mixed-port: 7890
 allow-lan: true
 mode: rule
@@ -2290,25 +2786,25 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 EOF
-	serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
+    serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
     port=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen" | awk '{gsub(/^:/, ""); print}')
-	auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
-	tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
-	insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
+    auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
+    tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
+    insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
-	obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.salamander.password")
-	if [ "${obfs_pass}" == "" ];then
-		obfs_status="true"
-	fi
-	SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
-	CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
+    obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.salamander.password")
+    if [ "${obfs_pass}" == "" ];then
+        obfs_status="true"
+    fi
+    SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
+    CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
     max_CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxConnReceiveWindow")
     max_SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxStreamReceiveWindow")
-	download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
+    download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
     download=$(echo ${download} | sed 's/[^0-9]//g')
-	upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
+    upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
     upload=$(echo ${upload} | sed 's/[^0-9]//g')
-	portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
+    portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
     addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}"
     addOrUpdateYaml "${metaFile}" "proxies[0].type" "hysteria2"
     addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}"
@@ -2659,17 +3155,17 @@ changeIp64(){
 }
 
 changeServerConfig(){
-	if [ ! -e "/etc/rc.d/hihy" ] && [ ! -e "/etc/init.d/hihy" ]; then
-		echoColor red "请先安装hysteria2,再去修改配置..."
-		exit
-	fi
+    if [ ! -e "/etc/rc.d/hihy" ] && [ ! -e "/etc/init.d/hihy" ]; then
+        echoColor red "请先安装hysteria2,再去修改配置..."
+        exit
+    fi
     portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
     if [ "${portHoppingStatus}" == "true" ];then
         portHoppingStart=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStart")
         portHoppingEnd=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingEnd")
     fi
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
-	stop
+    stop
     if [ "${portHoppingStatus}" == "true" ];then
         delPortHoppingNat
     fi
@@ -2679,12 +3175,12 @@ changeServerConfig(){
     else
         delHihyFirewallPort udp
     fi
-	updateHysteriaCore
-	setHysteriaConfig
+    updateHysteriaCore
+    setHysteriaConfig
     start
-	generate_client_config
+    generate_client_config
     echoColor green "配置修改成功"
-	
+    
 }
 
 aclControl(){
@@ -2911,6 +3407,61 @@ wait_for_continue() {
     read -n 1 -s
 }
 
+
+parse_cli_args(){
+    HY_CLI_CHANNEL="${HY_UPDATE_DEFAULT_CHANNEL}"
+    HY_CLI_VERSION=""
+    HY_CLI_CHECK_ONLY=false
+    HY_CLI_REQUESTED=false
+    HY_POSITIONAL_ARGS=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --update|update)
+                HY_CLI_REQUESTED=true
+                shift
+                ;;
+            --check-update)
+                HY_CLI_REQUESTED=true
+                HY_CLI_CHECK_ONLY=true
+                shift
+                ;;
+            --channel)
+                if [ $# -lt 2 ]; then
+                    echoColor red "--channel requires an argument"
+                    exit 1
+                fi
+                HY_CLI_CHANNEL=$(hy_lower "$2")
+                shift 2
+                ;;
+            --version)
+                if [ $# -lt 2 ]; then
+                    echoColor red "--version requires an argument"
+                    exit 1
+                fi
+                HY_CLI_VERSION="$2"
+                shift 2
+                ;;
+            --verbose)
+                HY_VERBOSE=true
+                shift
+                ;;
+            --)
+                shift
+                while [ $# -gt 0 ]; do
+                    HY_POSITIONAL_ARGS+=("$1")
+                    shift
+                done
+                break
+                ;;
+            *)
+                HY_POSITIONAL_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+
 menu() {
     while true; do
         show_menu
@@ -2936,6 +3487,30 @@ menu() {
         esac
     done
 }
+
+parse_cli_args "$@"
+if [ ${#HY_POSITIONAL_ARGS[@]} -gt 0 ]; then
+    set -- "${HY_POSITIONAL_ARGS[@]}"
+else
+    set --
+fi
+if [ "${HY_CLI_REQUESTED}" = true ]; then
+if [ "${HY_CLI_CHANNEL}" = "nightly" ] && [ -n "${HY_CLI_VERSION}" ]; then
+    echoColor red "--version is only supported for the stable channel."
+    exit 1
+fi
+    if [ "${HY_CLI_CHECK_ONLY}" = true ]; then
+        if ! update_self "${HY_CLI_CHANNEL}" "${HY_CLI_VERSION}" true; then
+            exit 1
+        fi
+        exit 0
+    fi
+    checkRoot
+    if ! update_self "${HY_CLI_CHANNEL}" "${HY_CLI_VERSION}" false; then
+        exit 1
+    fi
+    exit 0
+fi
 
 checkRoot
 case "$1" in
