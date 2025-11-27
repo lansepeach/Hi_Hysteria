@@ -7,7 +7,8 @@
 1、兼容支持lxc与openvz虚拟化的服务器使用hihy安装hy2
 2、修复本地证书路径错误
 3、修复使用arch时hy2状态检测错误
-4、使用sniff嗅探域名来防止acl分流失败
+4、
+使用sniff嗅探域名来防止acl分流失败
 5、mode auto出站时禁用fastOpen, 会导致ipv4 only无法解析到v4的ip
 ```
 
@@ -95,7 +96,7 @@
 
 ```
 su - root #switch to root user.
-bash <(curl -fsSL https://git.io/hysteria.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh)
 ```
 
 ### 配置过程
@@ -420,3 +421,4 @@ Hysteria2在高延迟，高丢包网络环境下表现良好，得益于它自�
 [@MetaCubeX/Clash.Meta](https://github.com/MetaCubeX/Clash.Meta)
 
 [@fscarmen/warp](https://gitlab.com/fscarmen/warp)
+
