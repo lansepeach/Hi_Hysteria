@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="1.0.4"
+hihyV="1.0.5"
 
 # 检测虚拟化类型的函数
 detectVirtualization() {
@@ -2870,7 +2870,7 @@ show_menu() {
     clear
     echo -e " -------------------------------------------"
     echo -e "|********** Hi Hysteria       **********|"
-    echo -e "|********** Author: lansepeach    **********|"
+    echo -e "|********** Author: emptysuns/lansepeach    **********|"
     echo -e "|********** Version: $(echoColor red "${hihyV}")    **********|"
     echo -e " -------------------------------------------"
     echo -e "Tips: $(echoColor green "hihy") 命令再次运行本脚本."
