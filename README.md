@@ -94,8 +94,12 @@
 
 ### 拉取安装
 
+## 切换到完整环境的root用户
 ```
-su - root #switch to root user.
+su - root 
+```
+## 执行安装命令
+```
 bash <(curl -fsSL https://github.com/lansepeach/Hi_Hysteria/raw/refs/heads/main/server/install.sh)
 ```
 
