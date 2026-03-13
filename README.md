@@ -96,7 +96,7 @@
 
 ```
 su - root #switch to root user.
-bash <(curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh)
+bash <(curl -fsSL https://github.com/lansepeach/Hi_Hysteria/raw/refs/heads/main/server/install.sh)
 ```
 
 ### 配置过程
