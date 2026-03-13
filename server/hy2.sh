@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="1.0.5"
+hihyV="1.0.6"
 
 # 检测虚拟化类型的函数
 detectVirtualization() {
