@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="1.0.3"
+hihyV="1.0.4"
 
 # 检测虚拟化类型的函数
 detectVirtualization() {
@@ -1290,7 +1290,7 @@ downloadHysteriaCore(){
             download_url="${url_base}loong64"
             ;;
         *)
-            echoColor yellowBlack "Error[OS Message]:${arch}\nPlease open an issue at https://github.com/emptysuns/Hi_Hysteria/issues !"
+            echoColor yellowBlack "Error[OS Message]:${arch}\nPlease open an issue at https://github.com/lansepeach/Hi_Hysteria/issues !"
             exit 1
             ;;
     esac
@@ -1342,19 +1342,19 @@ updateHysteriaCore(){
 
 hihy_update_notifycation(){
 	localV=${hihyV}
-	remoteV=`curl -fsSL https://raw.githubusercontent.com/emptysuns/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
+	remoteV=`curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
 	if [ -z $remoteV ];then
 		echoColor red "Network Error: Can't connect to Github for checking hihy version!"
 	else
 		if [ "${localV}" != "${remoteV}" ];then
-			echoColor purple "[☺] hihy需更新,version:v${remoteV},建议更新并查看日志: https://github.com/emptysuns/Hi_Hysteria/"
+			echoColor purple "[☺] hihy需更新,version:v${remoteV},建议更新并查看日志: https://github.com/lansepeach/Hi_Hysteria/"
 		fi
 	fi
 }
 
 hihyUpdate(){
 	localV=${hihyV}
-	remoteV=`curl -fsSL https://raw.githubusercontent.com/emptysuns/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
+	remoteV=`curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
 	if [ -z $remoteV ];then
 		echoColor red "Network Error: Can't connect to Github!"
 		exit
@@ -1363,7 +1363,7 @@ hihyUpdate(){
 		echoColor green "Already the latest version.Ignore."
 	else
 		rm /usr/bin/hihy
-		wget -q -O /usr/bin/hihy --no-check-certificate https://raw.githubusercontent.com/emptysuns/Hi_Hysteria/refs/heads/main/server/hy2.sh 2>/dev/null
+		wget -q -O /usr/bin/hihy --no-check-certificate https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh 2>/dev/null
 		chmod +x /usr/bin/hihy
 		echoColor green "hihy更新完成."
 	fi
@@ -2869,9 +2869,9 @@ addSocks5Outbound(){
 show_menu() {
     clear
     echo -e " -------------------------------------------"
-    echo -e "|**********      Hi Hysteria       **********|"
-    echo -e "|**********    Author: emptysuns   **********|"
-    echo -e "|**********     Version: $(echoColor red "${hihyV}")    **********|"
+    echo -e "|********** Hi Hysteria       **********|"
+    echo -e "|********** Author: lansepeach    **********|"
+    echo -e "|********** Version: $(echoColor red "${hihyV}")    **********|"
     echo -e " -------------------------------------------"
     echo -e "Tips: $(echoColor green "hihy") 命令再次运行本脚本."
     echo -e "$(echoColor skyBlue ".............................................")"
