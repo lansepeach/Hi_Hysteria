@@ -1295,7 +1295,7 @@ downloadHysteriaCore(){
             ;;
     esac
 
-    wget -q -O /etc/hihy/bin/appS --no-check-certificate "$download_url"
+    wget -q -O /etc/hihy/bin/appS  "$download_url"
     
     if [ -f "/etc/hihy/bin/appS" ]; then
         chmod 755 /etc/hihy/bin/appS
@@ -1363,7 +1363,7 @@ hihyUpdate(){
 		echoColor green "Already the latest version.Ignore."
 	else
 		rm /usr/bin/hihy
-		wget -q -O /usr/bin/hihy --no-check-certificate https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh 2>/dev/null
+		wget -q -O /usr/bin/hihy  https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh 2>/dev/null
 		chmod +x /usr/bin/hihy
 		echoColor green "hihy更新完成."
 	fi
