@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="1.0.7"
+hihyV="1.0.8"
 
 HIHY_ROOT_DIR="${HIHY_ROOT_DIR:-/etc/hihy}"
 HIHY_BIN_LINK="${HIHY_BIN_LINK:-/usr/bin/hihy}"
@@ -2156,10 +2156,13 @@ EOF
 # 输出ufw端口开放状态
 checkUFWAllowPort() {
     local port=$1
-    if ufw status | grep -qw "$port"; then
-        echoColor purple "UFW OPEN: ${port}"
+    local protocol=$2
+    local rule="${port}/${protocol}"
+
+    if ufw status | grep -qw "$rule"; then
+        echoColor purple "UFW OPEN: ${rule}"
     else
-        echoColor red "UFW OPEN FAIL: ${port}"
+        echoColor red "UFW OPEN FAIL: ${rule}"
         exit 1
     fi
 }
@@ -2237,9 +2240,9 @@ allowPort() {
         # 检查 UFW
         if command -v ufw >/dev/null 2>&1; then
             if ufw status | grep -qw "active"; then
-                if ! ufw status | grep -qw "${2}"; then
-                    ufw allow ${2}
-                    checkUFWAllowPort ${2}
+                if ! ufw status | grep -qw "${2}/${1}"; then
+                    ufw allow "${2}/${1}"
+                    checkUFWAllowPort "${2}" "${1}"
                 fi
                 return 0
             fi
@@ -3174,9 +3177,9 @@ delHihyFirewallPort() {
 
     # 检查并处理不同的防火墙管理工具
     if command -v ufw > /dev/null && ufw status | grep -qw "active"; then
-        if ufw status | grep -qw "${port}"; then
-            ufw delete allow "${port}" 2> /dev/null
-            echoColor purple "UFW DELETE: ${port}"
+        if ufw status | grep -qw "${port}/${protocol}"; then
+            ufw delete allow "${port}/${protocol}" 2> /dev/null
+            echoColor purple "UFW DELETE: ${port}/${protocol}"
         fi
         if [ -n "${port_range}" ] && ufw status | grep -qw "${port_range}/${protocol}"; then
             ufw delete allow "${port_range}/${protocol}" 2> /dev/null
