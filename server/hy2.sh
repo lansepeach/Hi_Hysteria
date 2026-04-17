@@ -1,5 +1,262 @@
 #!/bin/bash
-hihyV="1.0.6"
+hihyV="1.0.7"
+
+HIHY_ROOT_DIR="${HIHY_ROOT_DIR:-/etc/hihy}"
+HIHY_BIN_LINK="${HIHY_BIN_LINK:-/usr/bin/hihy}"
+HIHY_PID_FILE="${HIHY_PID_FILE:-/var/run/hihy.pid}"
+HIHY_RC_LOCAL="${HIHY_RC_LOCAL:-/etc/rc.local}"
+HIHY_REMOTE_SCRIPT_URL="${HIHY_REMOTE_SCRIPT_URL:-https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh}"
+HIHY_REMOTE_SCRIPT_MIRROR_URL="${HIHY_REMOTE_SCRIPT_MIRROR_URL:-https://cdn.jsdelivr.net/gh/lansepeach/Hi_Hysteria@main/server/hy2.sh}"
+HIHY_VERSION_STATUS_FILE="${HIHY_VERSION_STATUS_FILE:-$HIHY_ROOT_DIR/result/version-check.state}"
+HIHY_VERSION_CHECK_LOCK_FILE="${HIHY_VERSION_CHECK_LOCK_FILE:-$HIHY_ROOT_DIR/result/version-check.lock}"
+HIHY_VERSION_CHECK_TTL="${HIHY_VERSION_CHECK_TTL:-21600}"
+HIHY_REMOTE_CONNECT_TIMEOUT="${HIHY_REMOTE_CONNECT_TIMEOUT:-2}"
+HIHY_REMOTE_MAX_TIME="${HIHY_REMOTE_MAX_TIME:-5}"
+
+installHihyLauncher() {
+    local source_path="${1:-${BASH_SOURCE[0]}}"
+    local bin_link="${2:-$HIHY_BIN_LINK}"
+    local bin_dir
+
+    bin_dir="$(dirname "$bin_link")"
+    mkdir -p "$bin_dir"
+
+    if [ -f "$source_path" ] && [ "$source_path" != "$bin_link" ]; then
+        cp "$source_path" "$bin_link"
+    elif [ ! -f "$bin_link" ]; then
+        wget -q -O "$bin_link" "$HIHY_REMOTE_SCRIPT_URL" 2>/dev/null
+    fi
+
+    if [ -f "$bin_link" ]; then
+        chmod +x "$bin_link"
+        return 0
+    fi
+
+    return 1
+}
+
+startInstallValidationProcess() {
+    local yaml_file="$1"
+    local debug_file="${2:-./hihy_debug.info}"
+
+    env HYSTERIA_FIREWALL_BACKEND="iptables" /etc/hihy/bin/appS -c "$yaml_file" server > "$debug_file" 2>&1 &
+}
+
+fetchRemoteBodyFromSources() {
+    local url
+    local response
+
+    for url in "$@"; do
+        if response=$(curl -fsSL --connect-timeout "$HIHY_REMOTE_CONNECT_TIMEOUT" --max-time "$HIHY_REMOTE_MAX_TIME" "$url" 2>/dev/null); then
+            printf '%s' "$response"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+fetchRemoteHeadersFromSources() {
+    local url
+    local response
+
+    for url in "$@"; do
+        if response=$(curl -fsSI --connect-timeout "$HIHY_REMOTE_CONNECT_TIMEOUT" --max-time "$HIHY_REMOTE_MAX_TIME" "$url" 2>/dev/null); then
+            printf '%s' "$response"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+getLatestHihyVersion() {
+    local content
+
+    content=$(fetchRemoteBodyFromSources "$HIHY_REMOTE_SCRIPT_URL" "$HIHY_REMOTE_SCRIPT_MIRROR_URL") || return 1
+    printf '%s\n' "$content" | sed -n '2p' | cut -d '"' -f 2 | head -n 1
+}
+
+getLatestHysteriaVersion() {
+    local headers
+
+    headers=$(fetchRemoteHeadersFromSources "https://github.com/apernet/hysteria/releases/latest") || return 1
+    printf '%s\n' "$headers" | grep -i '^location:' | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/\r//;s/ //g' | head -n 1
+}
+
+getLocalHysteriaVersion() {
+    local core_bin="${1:-$HIHY_ROOT_DIR/bin/appS}"
+
+    if [ ! -x "$core_bin" ]; then
+        return 1
+    fi
+
+    local version
+    version=$(echo app/$("$core_bin" version 2>/dev/null | grep Version: | awk '{print $2}' | head -n 1))
+    if [ -z "$version" ] || [ "$version" = "app/" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$version"
+}
+
+ensureVersionCheckStateDir() {
+    mkdir -p "$(dirname "$HIHY_VERSION_STATUS_FILE")" "$(dirname "$HIHY_VERSION_CHECK_LOCK_FILE")"
+}
+
+readVersionCheckValue() {
+    local file_path="$1"
+    local key="$2"
+
+    if [ ! -f "$file_path" ]; then
+        return 1
+    fi
+
+    grep -E "^${key}=" "$file_path" 2>/dev/null | head -n 1 | cut -d '=' -f 2-
+}
+
+writeVersionCheckState() {
+    local checked_at="$1"
+    local hihy_status="$2"
+    local hihy_remote="$3"
+    local core_status="$4"
+    local core_remote="$5"
+    local state_file="$HIHY_VERSION_STATUS_FILE"
+    local temp_file="${state_file}.tmp.$$"
+
+    ensureVersionCheckStateDir
+    cat > "$temp_file" <<EOF
+checked_at=${checked_at}
+hihy_status=${hihy_status}
+hihy_remote=${hihy_remote}
+core_status=${core_status}
+core_remote=${core_remote}
+EOF
+    mv "$temp_file" "$state_file"
+}
+
+acquireVersionCheckLock() {
+    local lock_file="$HIHY_VERSION_CHECK_LOCK_FILE"
+    local lock_pid=""
+
+    ensureVersionCheckStateDir
+
+    if [ -f "$lock_file" ]; then
+        lock_pid=$(readVersionCheckValue "$lock_file" "pid")
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            return 1
+        fi
+        rm -f "$lock_file"
+    fi
+
+    cat > "$lock_file" <<EOF
+pid=${BASHPID:-$$}
+started_at=$(date +%s)
+EOF
+}
+
+releaseVersionCheckLock() {
+    rm -f "$HIHY_VERSION_CHECK_LOCK_FILE"
+}
+
+shouldStartVersionCheck() {
+    local now
+    local checked_at
+    local lock_pid
+
+    now=$(date +%s)
+
+    if [ -f "$HIHY_VERSION_CHECK_LOCK_FILE" ]; then
+        lock_pid=$(readVersionCheckValue "$HIHY_VERSION_CHECK_LOCK_FILE" "pid")
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            return 1
+        fi
+        rm -f "$HIHY_VERSION_CHECK_LOCK_FILE"
+    fi
+
+    checked_at=$(readVersionCheckValue "$HIHY_VERSION_STATUS_FILE" "checked_at")
+    if [ -n "$checked_at" ] && [ $((now - checked_at)) -lt "$HIHY_VERSION_CHECK_TTL" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+refreshVersionCheckState() {
+    local checked_at
+    local local_hihy_version="$hihyV"
+    local remote_hihy_version=""
+    local hihy_status="unknown"
+    local local_core_version=""
+    local remote_core_version=""
+    local core_status="missing"
+
+    if ! acquireVersionCheckLock; then
+        return 0
+    fi
+
+    checked_at=$(date +%s)
+
+    remote_hihy_version=$(getLatestHihyVersion || true)
+    if [ -n "$remote_hihy_version" ]; then
+        if [ "$local_hihy_version" != "$remote_hihy_version" ]; then
+            hihy_status="update"
+        else
+            hihy_status="current"
+        fi
+    else
+        hihy_status="error"
+    fi
+
+    local_core_version=$(getLocalHysteriaVersion || true)
+    if [ -n "$local_core_version" ]; then
+        remote_core_version=$(getLatestHysteriaVersion || true)
+        if [ -n "$remote_core_version" ]; then
+            if [ "$local_core_version" != "$remote_core_version" ]; then
+                core_status="update"
+            else
+                core_status="current"
+            fi
+        else
+            core_status="error"
+        fi
+    fi
+
+    writeVersionCheckState "$checked_at" "$hihy_status" "$remote_hihy_version" "$core_status" "$remote_core_version"
+    releaseVersionCheckLock
+}
+
+startBackgroundVersionCheck() {
+    if ! shouldStartVersionCheck; then
+        return 0
+    fi
+
+    (refreshVersionCheckState) >/dev/null 2>&1 &
+}
+
+displayCachedVersionNotifications() {
+    local hihy_status
+    local hihy_remote
+    local core_status
+    local core_remote
+
+    if [ ! -f "$HIHY_VERSION_STATUS_FILE" ]; then
+        return 0
+    fi
+
+    hihy_status=$(readVersionCheckValue "$HIHY_VERSION_STATUS_FILE" "hihy_status")
+    hihy_remote=$(readVersionCheckValue "$HIHY_VERSION_STATUS_FILE" "hihy_remote")
+    core_status=$(readVersionCheckValue "$HIHY_VERSION_STATUS_FILE" "core_status")
+    core_remote=$(readVersionCheckValue "$HIHY_VERSION_STATUS_FILE" "core_remote")
+
+    if [ "$hihy_status" = "update" ] && [ -n "$hihy_remote" ]; then
+        echoColor purple "[☺] hihy需更新,version:v${hihy_remote},建议更新并查看日志: https://github.com/lansepeach/Hi_Hysteria/"
+    fi
+
+    if [ "$core_status" = "update" ] && [ -n "$core_remote" ]; then
+        echoColor purple "[!] hysteria2 core有更新,version:${core_remote}  日志: https://v2.hysteria.network/docs/Changelog/"
+    fi
+}
 
 # 检测虚拟化类型的函数
 detectVirtualization() {
@@ -73,6 +330,7 @@ cronTask(){
     fi
 }
 echoColor() {
+    local printN="${printN:-}"
     case $1 in
         # 红色
         "red") echo -e "\033[31m${printN}$2 \033[0m" ;;
@@ -351,6 +609,162 @@ generate_uuid() {
     echo "$uuid"
 }
 
+getListenPrimaryPort() {
+    local listen_value="$1"
+
+    if [ -z "$listen_value" ] || [ "$listen_value" = "null" ]; then
+        echo ""
+        return
+    fi
+
+    listen_value=${listen_value#*:}
+    listen_value=$(echo "$listen_value" | awk -F',' '{print $1}')
+    echo "$listen_value" | awk -F'-' '{print $1}'
+}
+
+getListenRangePart() {
+    local listen_value="$1"
+
+    if [ -z "$listen_value" ] || [ "$listen_value" = "null" ]; then
+        echo ""
+        return
+    fi
+
+    listen_value=${listen_value#*:}
+    if echo "$listen_value" | grep -q ','; then
+        echo "$listen_value" | awk -F',' '{print $2}'
+    else
+        echo ""
+    fi
+}
+
+getBackupValueOrDefault() {
+    local file=$1
+    local key=$2
+    local default_value=$3
+    local value
+
+    value=$(getYamlValue "$file" "$key" 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$value" ] || [ "$value" = "null" ]; then
+        echo "$default_value"
+    else
+        echo "$value"
+    fi
+}
+
+cleanupLegacyPortHoppingNatIfPresent() {
+    if command -v iptables-save >/dev/null 2>&1 && iptables-save 2>/dev/null | grep -q "PortHopping-hihysteria"; then
+        delPortHoppingNat >/dev/null 2>&1 || true
+        return
+    fi
+
+    if command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save 2>/dev/null | grep -q "PortHopping-hihysteria"; then
+        delPortHoppingNat >/dev/null 2>&1 || true
+    fi
+}
+
+getInstallFailureMarker() {
+    local root_dir="${1:-$HIHY_ROOT_DIR}"
+    echo "${root_dir}/result/install.failed"
+}
+
+getHihyServiceScriptPrimary() {
+    echo "${1:-/etc/init.d/hihy}"
+}
+
+getHihyServiceScriptFallback() {
+    echo "${1:-/etc/rc.d/hihy}"
+}
+
+classifyInstallState() {
+    local root_dir="${1:-$HIHY_ROOT_DIR}"
+    local bin_link="${2:-$HIHY_BIN_LINK}"
+    local service_primary="${3:-$(getHihyServiceScriptPrimary)}"
+    local service_fallback="${4:-$(getHihyServiceScriptFallback)}"
+    local failure_marker="${5:-$(getInstallFailureMarker "$root_dir")}"
+    local owned_paths=(
+        "$root_dir/bin/appS"
+        "$root_dir/conf/config.yaml"
+        "$root_dir/conf/backup.yaml"
+        "$service_primary"
+        "$service_fallback"
+        "$bin_link"
+    )
+    local has_any_artifact="false"
+    local has_core_assets="false"
+    local has_service_assets="false"
+    local path
+
+    for path in "${owned_paths[@]}"; do
+        if [ -e "$path" ]; then
+            has_any_artifact="true"
+            case "$path" in
+                "$root_dir/bin/appS"|"$root_dir/conf/config.yaml"|"$root_dir/conf/backup.yaml")
+                    has_core_assets="true"
+                    ;;
+                "$service_primary"|"$service_fallback")
+                    has_service_assets="true"
+                    ;;
+            esac
+        fi
+    done
+
+    if [ -f "$failure_marker" ]; then
+        echo "partially-installed"
+        return
+    fi
+
+    if [ "$has_core_assets" = "true" ] && [ "$has_service_assets" = "true" ] && [ -f "$bin_link" ]; then
+        echo "installed"
+        return
+    fi
+
+    if [ "$has_any_artifact" = "true" ]; then
+        echo "partially-installed"
+        return
+    fi
+
+    echo "not-installed"
+}
+
+markInstallFailed() {
+    local phase="$1"
+    local details="$2"
+    local failure_marker
+
+    failure_marker="$(getInstallFailureMarker)"
+    mkdir -p "$(dirname "$failure_marker")"
+    printf 'phase=%s\ndetails=%s\n' "$phase" "$details" > "$failure_marker"
+}
+
+clearInstallFailureMarker() {
+    local failure_marker
+    failure_marker="$(getInstallFailureMarker)"
+    rm -f "$failure_marker"
+}
+
+recoverPartialInstallState() {
+    local root_dir="${1:-$HIHY_ROOT_DIR}"
+    local bin_link="${2:-$HIHY_BIN_LINK}"
+    local service_primary="${3:-$(getHihyServiceScriptPrimary)}"
+    local service_fallback="${4:-$(getHihyServiceScriptFallback)}"
+    local failure_marker="${5:-$(getInstallFailureMarker "$root_dir")}"
+    local rc_local="${6:-$HIHY_RC_LOCAL}"
+    local pid_file="${7:-$HIHY_PID_FILE}"
+
+    rm -f "$service_primary" "$service_fallback" "$pid_file"
+    rm -f "$root_dir/conf/config.yaml" "$root_dir/conf/backup.yaml"
+    rm -f "$failure_marker"
+
+    if [ -f "$rc_local" ]; then
+        sed -i '/\/etc\/rc\.d\/hihy start/d' "$rc_local"
+        sed -i '/\/etc\/rc\.d\/allow-port start/d' "$rc_local"
+        sed -i '/\/etc\/rc\.d\/port-hopping start/d' "$rc_local"
+    fi
+
+    rm -f "$bin_link"
+}
+
 
 addOrUpdateYaml() {
     local file=$1
@@ -433,7 +847,6 @@ setHysteriaConfig(){
     acl_file="/etc/hihy/acl/acl.txt"
     if [ -f "${acl_file}" ];then
         rm -r ${acl_file}
-        
     fi
     touch $acl_file
 	echoColor yellowBlack "开始配置:"
@@ -446,7 +859,6 @@ setHysteriaConfig(){
 		rm -f ${yaml_file}
 	fi
 	touch $yaml_file
-	
 
 	if [ -z "${certNum}" ] || [ "${certNum}" == "3" ];then
 		echoColor green "请输入自签证书的域名(默认:helloworld.com):"
@@ -461,7 +873,7 @@ setHysteriaConfig(){
 		fi
 		echoColor green "判断客户端连接所使用的地址是否正确?公网ip:"`echoColor red ${ip}`"\n"
 		while true
-		do	
+		do
 			echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、正确(默认)\n2、不正确,手动输入ip\033[0m\033[32m\n\n输入序号:\033[0m"
 			read ipNum
 			if [ -z "${ipNum}" ] || [ "${ipNum}" == "1" ];then
@@ -477,7 +889,7 @@ setHysteriaConfig(){
 			else
 				echoColor red "\n->输入错误,请重新输入:"
 			fi
-		done		
+		done
 		cert="/etc/hihy/cert/${domain}.crt"
 		key="/etc/hihy/cert/${domain}.key"
 		useAcme=false
@@ -546,7 +958,6 @@ setHysteriaConfig(){
             dns="cloudflare"
             echo -e "\n\n->您选择Cloudflare DNS验证\n"
             echoColor green "请输入cloudflare_api_token:"
-            
             while :
             do
                 read cloudflare_api_token
@@ -557,7 +968,6 @@ setHysteriaConfig(){
                     break
                 fi
             done
-                    
         elif [ "${dnsNum}" == "2" ];then
             dns="duckdns"
             echo -e "\n\n->您选择Duck DNS DNS验证\n"
@@ -579,10 +989,10 @@ setHysteriaConfig(){
                 if [ -z "${duckdns_override_domain}" ];then
                     echoColor red "\n\n->此选项不能为空,请重新输入!"
                     echoColor green "请输入Duck DNS duckdns_override_domain:"
+                else
                     break
                 fi
             done
-
         elif [ "${dnsNum}" == "3" ];then
             dns="gandi"
             echo -e "\n\n->您选择Gandi.net DNS验证\n"
@@ -609,7 +1019,7 @@ setHysteriaConfig(){
                     echoColor green "请输入 Godaddy godaddy_api_token:"
                 else
                     break
-                fi 
+                fi
             done
         elif [ "${dnsNum}" == "5" ];then
             dns="namedotcom"
@@ -626,7 +1036,6 @@ setHysteriaConfig(){
                 fi
             done
             echoColor green "请输入Name.com namedotcom_user:"
-            
             while :
             do
                 read namedotcom_user
@@ -637,7 +1046,6 @@ setHysteriaConfig(){
                     break
                 fi
             done
-
             echoColor green "请输入Name.com namedotcom_server:"
             while :
             do
@@ -672,7 +1080,7 @@ setHysteriaConfig(){
 		fi
 		echoColor green "判断客户端连接所使用的地址是否正确?公网ip:"`echoColor red ${ip}`"\n"
 		while true
-		do	
+		do
 			echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、正确(默认)\n2、不正确,手动输入ip\033[0m\033[32m\n\n输入序号:\033[0m"
 			read ipNum
 			if [ -z "${ipNum}" ] || [ "${ipNum}" == "1" ];then
@@ -688,13 +1096,13 @@ setHysteriaConfig(){
 			else
 				echoColor red "\n->输入错误,请重新输入:"
 			fi
-		done		
+		done
         echo -e "\n\n->您选择使用acme dns验证申请证书: "`echoColor red ${domain}`"\n"
         echo -e "\n ->dns验证方式: "`echoColor red ${dns}`"\n"
         echo -e "\n ->公网ip: "`echoColor red ${ip}`"\n"
         useAcme=true
         useDns=true
-    else 
+    else
     	echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
 		read domain
 		while :
@@ -708,7 +1116,7 @@ setHysteriaConfig(){
 			fi
 		done
 		while :
-		do	
+		do
 			echoColor purple "\n->检测${domain},DNS解析..."
 			ip_resolv=`dig +short ${domain} A`
 			if [ -z "${ip_resolv}" ];then
@@ -721,7 +1129,7 @@ setHysteriaConfig(){
 				continue
 			fi
 			remoteip=`echo ${ip_resolv} | awk -F " " '{print $1}'`
-			v6str=":" #Is ipv6?
+			v6str=":"
 			result=$(echo ${remoteip} | grep ${v6str})
 			if [ "${result}" != "" ];then
 				localip=`curl -6 -s -m 8 ip.sb`
@@ -729,7 +1137,7 @@ setHysteriaConfig(){
 				localip=`curl -4 -s -m 8 ip.sb`
 			fi
 			if [ -z "${localip}" ];then
-				localip=`curl -s -m 8 ip.sb` #如果上面的ip.sb都失败了,最后检测一次
+				localip=`curl -s -m 8 ip.sb`
 				if [ -z "${localip}" ];then
 					echoColor red "\n\n->获取本机ip失败,请检查网络连接!curl -s -m 8 ip.sb"
 					exit 1
@@ -780,36 +1188,28 @@ setHysteriaConfig(){
 			echo -e "\n->使用随机端口:"`echoColor red udp/${port}`"\n"
 		else
 			echo -e "\n->您输入的端口:"`echoColor red udp/${port}`"\n"
-
 		fi
 		if [ "${port}" -gt 65535 ];then
 			echoColor red "端口范围错误,请重新输入!"
 			continue
 		fi
-		if [ "${ut}" != "udp" ];then
-			pIDa=`lsof -i ${ut}:${port} | grep "LISTEN" | grep -v "PID" | awk '{print $2}'`
-		else
-			pIDa=`lsof -i ${ut}:${port} | grep -v "PID" | awk '{print $2}'`
-		fi
-		if [ "$pIDa" != "" ];
-		then
+		pIDa=`lsof -i udp:${port} | grep -v "PID" | awk '{print $2}'`
+		if [ "$pIDa" != "" ]; then
 			echoColor red "\n->端口${port}被占用,PID:${pIDa}!请重新输入或者运行kill -9 ${pIDa}后重新安装!"
 		else
 			break
 		fi
-		
 	done
-	
 
-	echoColor green "\n->(3/11)是否使用端口跳跃(Port Hopping),推荐使用"
+	echoColor green "\n->(3/13)是否使用端口跳跃(Port Hopping),推荐使用"
 	echo -e "Tip: 长时间单端口 UDP 连接容易被运营商封锁/QoS/断流,启动此功能可以有效避免此问题."
 	echo -e "更加详细介绍请参考: https://v2.hysteria.network/zh/docs/advanced/Port-Hopping/\n"
 	echo -e "\033[32m选择是否启用:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、跳过\033[0m\033[32m\n\n输入序号:\033[0m"
 	read portHoppingStatus
-	if [ -z "${portHoppingStatus}" ] || [ $portHoppingStatus == "1" ];then
+	if [ -z "${portHoppingStatus}" ] || [ "${portHoppingStatus}" == "1" ];then
 		portHoppingStatus="true"
 		echoColor purple "\n->您选择启用端口跳跃/多端口(Port Hopping)功能"
-		echo -e "端口跳跃/多端口(Port Hopping)功能需要占用多个端口,请保证这些端口没有监听其他服务\nTip: 端口选择数量不宜过多,推荐1000个左右,范围1-65535,建议选择连续的端口范围.\n"
+		echo -e "端口跳跃/多端口(Port Hopping)功能需要占用多个端口,请保证这些端口没有监听其他服务\nTip: 将使用 Hysteria2 原生范围监听,服务端会自动处理范围内端口的转发规则.\n"
 		while :
 		do
 			echoColor green "请输入起始端口(默认47000):"
@@ -817,7 +1217,7 @@ setHysteriaConfig(){
 			if [ -z "${portHoppingStart}" ];then
 				portHoppingStart=47000
 			fi
-			if [ $portHoppingStart -gt 65535 ];then
+			if [ ${portHoppingStart} -gt 65535 ];then
 				echoColor red "\n->端口范围错误,请重新输入!"
 				continue
 			fi
@@ -827,51 +1227,154 @@ setHysteriaConfig(){
 			if [ -z "${portHoppingEnd}" ];then
 				portHoppingEnd=48000
 			fi
-			if [ $portHoppingEnd -gt 65535 ];then
+			if [ ${portHoppingEnd} -gt 65535 ];then
 				echoColor red "\n->端口范围错误,请重新输入!"
 				continue
 			fi
 			echo -e "\n->结束端口:"`echoColor red ${portHoppingEnd}`"\n"
-			if [ $portHoppingStart -ge $portHoppingEnd ];then
+			if [ ${portHoppingStart} -ge ${portHoppingEnd} ];then
 				echoColor red "\n->起始端口必须小于结束端口,请重新输入!"
 			else
 				break
 			fi
 		done
-		clientPort="${port},${portHoppingStart}-${portHoppingEnd}"
-		echo -e "\n->您选择的端口跳跃/多端口(Port Hopping)参数为: "`echoColor red ${portHoppingStart}:${portHoppingEnd}`"\n"
+		echo -e "\033[32m请选择端口跳跃时间模式:\n\n\033[0m\033[33m\033[01m1、固定跳跃时间(默认)\n2、随机跳跃时间\033[0m\033[32m\n\n输入序号:\033[0m"
+		read portHoppingIntervalModeNum
+		if [ -z "${portHoppingIntervalModeNum}" ] || [ "${portHoppingIntervalModeNum}" == "1" ];then
+			portHoppingIntervalMode="fixed"
+			while :
+			do
+				echoColor green "请输入固定跳跃间隔(默认30s, 不能低于5s):"
+				read portHoppingHopInterval
+				if [ -z "${portHoppingHopInterval}" ];then
+					portHoppingHopInterval="30s"
+				fi
+				echo -e "\n->固定跳跃间隔:"`echoColor red ${portHoppingHopInterval}`"\n"
+				hopSeconds=$(echo "${portHoppingHopInterval}" | sed 's/s$//')
+				if ! echo "${hopSeconds}" | grep -Eq '^[0-9]+$' || [ "${hopSeconds}" -lt 5 ];then
+					echoColor red "\n->固定跳跃间隔格式错误,请输入不小于5s的秒数,例如30s"
+					continue
+				fi
+				break
+			done
+			portHoppingMinHopInterval=""
+			portHoppingMaxHopInterval=""
+		else
+			portHoppingIntervalMode="random"
+			portHoppingHopInterval=""
+			while :
+			do
+				echoColor green "请输入最小跳跃间隔(默认10s, 不能低于5s):"
+				read portHoppingMinHopInterval
+				if [ -z "${portHoppingMinHopInterval}" ];then
+					portHoppingMinHopInterval="10s"
+				fi
+				echo -e "\n->最小跳跃间隔:"`echoColor red ${portHoppingMinHopInterval}`"\n"
+				minHopSeconds=$(echo "${portHoppingMinHopInterval}" | sed 's/s$//')
+				if ! echo "${minHopSeconds}" | grep -Eq '^[0-9]+$' || [ "${minHopSeconds}" -lt 5 ];then
+					echoColor red "\n->最小跳跃间隔格式错误,请输入不小于5s的秒数,例如10s"
+					continue
+				fi
+				echoColor green "请输入最大跳跃间隔(默认30s, 需大于等于最小间隔):"
+				read portHoppingMaxHopInterval
+				if [ -z "${portHoppingMaxHopInterval}" ];then
+					portHoppingMaxHopInterval="30s"
+				fi
+				echo -e "\n->最大跳跃间隔:"`echoColor red ${portHoppingMaxHopInterval}`"\n"
+				maxHopSeconds=$(echo "${portHoppingMaxHopInterval}" | sed 's/s$//')
+				if ! echo "${maxHopSeconds}" | grep -Eq '^[0-9]+$' || [ "${maxHopSeconds}" -lt "${minHopSeconds}" ];then
+					echoColor red "\n->最大跳跃间隔格式错误,请输入大于等于最小间隔的秒数,例如30s"
+					continue
+				fi
+				break
+			done
+		fi
+		clientPort="${portHoppingStart}-${portHoppingEnd}"
+		echo -e "\n->您选择的端口跳跃/多端口(Port Hopping)参数为: "`echoColor red ${portHoppingStart}-${portHoppingEnd}`"\n"
+		if [ "${portHoppingIntervalMode}" == "fixed" ];then
+			echo -e "\n->固定跳跃间隔: "`echoColor red ${portHoppingHopInterval}`"\n"
+		else
+			echo -e "\n->随机跳跃间隔范围: "`echoColor red ${portHoppingMinHopInterval}~${portHoppingMaxHopInterval}`"\n"
+		fi
 	else
 		portHoppingStatus="false"
+		portHoppingIntervalMode=""
+		portHoppingHopInterval=""
+		portHoppingMinHopInterval=""
+		portHoppingMaxHopInterval=""
 		echoColor red "\n->您选择不使用端口跳跃功能"
 	fi
 
-    echoColor green "(4/11)请输入您到此服务器的平均延迟,关系到转发速度(默认200,单位:ms):"
-    read  delay
-    if [ -z "${delay}" ];then
-		delay=200
+    echoColor green "(4/13)请选择拥塞控制模式:"
+    echo -e "Reno: 更保守、更稳，适合优先考虑兼容性和稳定性的场景"
+    echo -e "BBR: 更积极，通常吞吐更高，适合追求速度的场景"
+    echo -e "Brutal: Hysteria 2 独享特色，固定速率模型，在恶劣网络环境下通常更值得优先尝试，尤其适合已知链路真实带宽、希望获得更强抗抖动和抢带宽能力的场景"
+    echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、Brutal(默认)\n2、Reno(更稳)\n3、BBR(更快)\033[0m\033[32m\n\n输入序号:\033[0m"
+    read congestion_num
+    if [ -z "${congestion_num}" ] || [ "${congestion_num}" == "1" ];then
+        congestion_mode="brutal"
+        congestion_type=""
+        congestion_bbr_profile=""
+        ignore_client_bandwidth="false"
+        echo -e "\n->您选择的拥塞控制模式: "`echoColor red Brutal`"\n"
+    elif [ "${congestion_num}" == "2" ];then
+        congestion_mode="reno"
+        congestion_type="reno"
+        congestion_bbr_profile=""
+        ignore_client_bandwidth="true"
+        echo -e "\n->您选择的拥塞控制模式: "`echoColor red Reno`"\n"
+    else
+        congestion_mode="bbr"
+        congestion_type="bbr"
+        ignore_client_bandwidth="true"
+        echoColor green "BBR 提供三档调节方式，适合不同网络环境："
+        echo -e "1、初级 / conservative：更保守，收敛更稳，适合链路波动较大、网络质量一般、优先稳定性的场景"
+        echo -e "2、中级 / standard(默认)：官方默认预设，速度与稳定性更均衡，适合大多数 VPS 和家庭宽带环境"
+        echo -e "3、高级 / aggressive：更激进，更积极抢占带宽，适合链路质量较好、追求更高吞吐的场景，但波动时可能更敏感"
+        echo -e "\033[32m请选择 BBR 预设等级:\n\n\033[0m\033[33m\033[01m1、初级(conservative)\n2、中级(standard，默认)\n3、高级(aggressive)\033[0m\033[32m\n\n输入序号:\033[0m"
+        read bbr_profile_num
+        case ${bbr_profile_num} in
+            1) congestion_bbr_profile="conservative" ;;
+            3) congestion_bbr_profile="aggressive" ;;
+            *) congestion_bbr_profile="standard" ;;
+        esac
+        echo -e "\n->您选择的拥塞控制模式: "`echoColor red BBR`" / BBR预设: "`echoColor red ${congestion_bbr_profile}`"\n"
     fi
-	echo -e "\n->延迟:`echoColor red ${delay}`ms\n"
-    echo -e "\n期望速度,这是客户端的峰值速度,服务端默认不受限。"`echoColor red Tips:脚本会自动*1.10做冗余，您期望过低或者过高会影响速度,请如实填写!`
-    echoColor green "(5/11)请输入客户端期望的下行速度:(默认50,单位:mbps):"
-    read  download
-    if [ -z "${download}" ];then
-        download=50
+
+    if [ "${congestion_mode}" == "brutal" ];then
+        echoColor green "(5/13)请输入您到此服务器的平均延迟,用于 Brutal 模式下估算 QUIC 窗口(默认200,单位:ms):"
+        read  delay
+        if [ -z "${delay}" ];then
+			delay=200
+        fi
+		echo -e "\n->延迟:`echoColor red ${delay}`ms\n"
+        echo -e "\n期望速度,这是客户端在 Brutal 模式下使用的目标带宽。"`echoColor red Tips:脚本会自动*1.10做冗余，带宽不要高于真实链路极限，否则反而可能更不稳定!`
+        echoColor green "(6/13)请输入客户端期望的下行速度:(默认50,单位:mbps):"
+        read  download
+        if [ -z "${download}" ];then
+            download=50
+        fi
+		echo -e "\n->客户端下行速度："`echoColor red ${download}`"mbps\n"
+        echo -e "\033[32m(7/13)请输入客户端期望的上行速度(默认10,单位:mbps):\033[0m"
+        read  upload
+        if [ -z "${upload}" ];then
+            upload=10
+        fi
+		echo -e "\n->客户端上行速度："`echoColor red ${upload}`"mbps\n"
+    else
+        delay=""
+        download=""
+        upload=""
+        echoColor lightYellow "(5-7/13)当前选择的是非 Brutal 模式，已跳过延时与上下行带宽输入，改用拥塞控制器本地配置。"
     fi
-	echo -e "\n->客户端下行速度："`echoColor red ${download}`"mbps\n"
-    echo -e "\033[32m(6/11)请输入客户端期望的上行速度(默认10,单位:mbps):\033[0m" 
-    read  upload
-    if [ -z "${upload}" ];then
-        upload=10
-    fi
-	echo -e "\n->客户端上行速度："`echoColor red ${upload}`"mbps\n"
-	echoColor green "(7/11)请输入认证口令(默认随机生成UUID作为密码,建议使用强密码):"
+	echoColor green "(8/13)请输入认证口令(默认随机生成UUID作为密码,建议使用强密码):"
 	read auth_secret
 	if [ -z "${auth_secret}" ]; then
     	auth_secret=$(generate_uuid)
     fi
     echo -e "\n->认证口令:"`echoColor red ${auth_secret}`"\n"
 	echo -e "Tips: 如果使用obfs混淆,抗封锁能力更强,能被识别为未知udp流量。\n但是会增加cpu负载导致峰值速度下降,如果您追求性能且未被针对封锁建议不使用"
-	echo -e "\033[32m(8/11)是否使用salamander进行流量混淆:\n\n\033[0m\033[33m\033[01m1、不使用(推荐)\n2、使用\033[0m\033[32m\n\n输入序号:\033[0m"
+	echo -e "\033[32m(9/13)是否使用salamander进行流量混淆:\n\n\033[0m\033[33m\033[01m1、不使用(推荐)\n2、使用\033[0m\033[32m\n\n输入序号:\033[0m"
 	read obfs_num
 	if [ -z "${obfs_num}" ] || [ ${obfs_num} == "1" ];then
 		obfs_status="false"
@@ -879,14 +1382,12 @@ setHysteriaConfig(){
 		obfs_status="true"
 		obfs_pass=${auth_secret}
 	fi
-
     if [ "${obfs_status}" == "true" ];then
         echo -e "\n->您将使用salamander混淆加密流量\n"
     else
         echo -e "\n->您将不使用混淆\n"
     fi
-
-    echo -e "\033[32m(9/11)请选择伪装类型:\n\n\033[0m\033[33m\033[01m1、string(默认、返回一个固定的字符串)\n2、proxy(作为一个反向代理，从另一个网站提供内容。)\n3、file(作为一个静态文件服务器，从一个目录提供内容。目录内必须含有index.html)\033[0m\033[32m\n\n输入序号:\033[0m"
+    echo -e "\033[32m(10/13)请选择伪装类型:\n\n\033[0m\033[33m\033[01m1、string(默认、返回一个固定的字符串)\n2、proxy(作为一个反向代理，从另一个网站提供内容。)\n3、file(作为一个静态文件服务器，从一个目录提供内容。目录内必须含有index.html)\033[0m\033[32m\n\n输入序号:\033[0m"
 	read masquerade_type
     if [ -z "${masquerade_type}" ] || [ ${masquerade_type} == "1" ];then
         masquerade_type="string"
@@ -911,8 +1412,17 @@ setHysteriaConfig(){
             masquerade_proxy="https://www.helloworld.org"
         fi
         echo -e "\n->伪装代理地址:"`echoColor red ${masquerade_proxy}`"\n"
+        echo -e "\033[32m是否附加 X-Forwarded-For / Host / Proto 请求头:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、关闭\033[0m\033[32m\n\n输入序号:\033[0m"
+        read masquerade_xforwarded
+        if [ -z "${masquerade_xforwarded}" ] || [ "${masquerade_xforwarded}" == "1" ];then
+            masquerade_xforwarded="true"
+        else
+            masquerade_xforwarded="false"
+        fi
+        echo -e "\n->X-Forwarded请求头: "`echoColor red ${masquerade_xforwarded}`"\n"
     else
         masquerade_type="file"
+        masquerade_xforwarded="false"
         echoColor green "请输入伪装网站文件目录(默认:/etc/hihy/file,将自动下载mikutap部署):"
         echo -e "默认预览: https://hfiprogramming.github.io/mikutap/"
         read masquerade_file
@@ -921,11 +1431,12 @@ setHysteriaConfig(){
         fi
         echo -e "\n->伪装网站文件目录:"`echoColor red ${masquerade_file}`"\n"
     fi
-
-    echoColor green "(10/11)是否同时监听tcp/${port}端口来增强伪装行为(做戏做全套):"
+    if [ "${masquerade_type}" != "proxy" ];then
+        masquerade_xforwarded="false"
+    fi
+    echoColor green "(11/13)是否同时监听tcp/${port}端口来增强伪装行为(做戏做全套):"
     echoColor lightYellow "通常网站支持 HTTP/3 的只是将其作为一个升级选项"
     echo -e "监听一个tcp端口来提供伪装内容,使伪装更加自然,如果不启用此选项,浏览器将在不启用H3功能下访问不了伪装内容"
-
     echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、跳过\033[0m\033[32m\n\n输入序号:\033[0m"
     read masquerade_tcp
     if [ -z "${masquerade_tcp}" ] || [ ${masquerade_tcp} == "1" ];then
@@ -935,10 +1446,9 @@ setHysteriaConfig(){
         masquerade_tcp="false"
         echo -e "\n->您选择不监听tcp/${port}端口\n"
     fi
-
-    echoColor green "\n(11/11)是否在服务器屏蔽http3流量(hysteria对udp流量拥塞控制无增强效果，导致访问youtube等使用QUIC连接的网站效果不佳):"
+    echoColor green "\n(12/13)是否在服务器屏蔽http3流量(hysteria对udp流量拥塞控制无增强效果，导致访问youtube等使用QUIC连接的网站效果不佳):"
     echoColor lightYellow "如果开启此选项，hysteria2将不会代理udp/443，无法使用QUIC连接访问网站，并且需要在客户端配置中禁用QUIC连接，否则会导致连接失败。\n"
-    echo -e "也可以仅在客户端屏蔽QUIC/HTTP3/UDP 443连接，服务器不做屏蔽，效果一样\n"    
+    echo -e "也可以仅在客户端屏蔽QUIC/HTTP3/UDP 443连接，服务器不做屏蔽，效果一样\n"
     echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、启用(推荐)\n2、跳过(默认)\033[0m\033[32m\n\n输入序号:\033[0m"
     read block_http3
     if [ -z "${block_http3}" ] || [ ${block_http3} == "2" ];then
@@ -949,40 +1459,61 @@ setHysteriaConfig(){
         block_http3="true"
         echoColor red "\n->您选择屏蔽http3流量，请根据自己使用的客户端，屏蔽QUIC/HTTP3流量，否则会导致对使用QUIC的网站连接失败\n"
     fi
-
-
-    echoColor green "请输入客户端名称备注(默认使用域名或IP区分,例如输入test,则名称为Hy2-test):"
+    echoColor green "(13/13)请输入客户端名称备注(默认使用域名或IP区分,例如输入test,则名称为Hy2-test):"
 	read remarks
     echoColor green "\n配置录入完成!\n"
     echoColor yellowBlack "执行配置..."
-    download=$(($download + $download / 10))
-    upload=$(($upload + $upload / 10))
-    CRW=$(($delay * $download * 1000000 / 1000 * 2))
-    SRW=$(($CRW / 5 * 2))
-    max_CRW=$(($CRW * 3 / 2))
-    max_SRW=$(($SRW * 3 / 2))
+    max_CRW=0
+    if [ "${congestion_mode}" == "brutal" ];then
+        download=$(($download + $download / 10))
+        upload=$(($upload + $upload / 10))
+        CRW=$(($delay * $download * 1000000 / 1000 * 2))
+        SRW=$(($CRW / 5 * 2))
+        max_CRW=$(($CRW * 3 / 2))
+        max_SRW=$(($SRW * 3 / 2))
+        server_upload=${download}
+        server_download=${upload}
+    fi
 
-    server_upload=${download}
-    server_download=${upload}
-    
-	addOrUpdateYaml "$yaml_file" "listen" ":${port}"
+	if [ "${portHoppingStatus}" == "true" ];then
+		addOrUpdateYaml "$yaml_file" "listen" ":${port},${portHoppingStart}-${portHoppingEnd}"
+	else
+		addOrUpdateYaml "$yaml_file" "listen" ":${port}"
+	fi
     addOrUpdateYaml "$yaml_file" "auth.type" "password"
 	addOrUpdateYaml "$yaml_file" "auth.password" "${auth_secret}"
+    addOrUpdateYaml "$yaml_file" "ignoreClientBandwidth" "${ignore_client_bandwidth}"
+    if [ "${congestion_mode}" != "brutal" ];then
+        addOrUpdateYaml "$yaml_file" "congestion.type" "${congestion_type}"
+    else
+        yq eval 'del(.congestion)' -i "$yaml_file"
+    fi
+    if [ "${congestion_type}" == "bbr" ];then
+        addOrUpdateYaml "$yaml_file" "congestion.bbrProfile" "${congestion_bbr_profile}"
+    fi
     if [ "${obfs_status}" == "true" ];then
         addOrUpdateYaml "$yaml_file" "obfs.type" "salamander"
         addOrUpdateYaml "$yaml_file" "obfs.salamander.password" "${obfs_pass}"
     fi
-	addOrUpdateYaml "$yaml_file" "quic.initStreamReceiveWindow" "${SRW}"
-	addOrUpdateYaml "$yaml_file" "quic.maxStreamReceiveWindow" "${max_SRW}"
-	addOrUpdateYaml "$yaml_file" "quic.initConnReceiveWindow" "${CRW}"
-	addOrUpdateYaml "$yaml_file" "quic.maxConnReceiveWindow" "${max_CRW}"
+    if [ "${congestion_mode}" == "brutal" ];then
+		addOrUpdateYaml "$yaml_file" "quic.initStreamReceiveWindow" "${SRW}"
+		addOrUpdateYaml "$yaml_file" "quic.maxStreamReceiveWindow" "${max_SRW}"
+		addOrUpdateYaml "$yaml_file" "quic.initConnReceiveWindow" "${CRW}"
+		addOrUpdateYaml "$yaml_file" "quic.maxConnReceiveWindow" "${max_CRW}"
+    else
+		yq eval 'del(.quic.initStreamReceiveWindow, .quic.maxStreamReceiveWindow, .quic.initConnReceiveWindow, .quic.maxConnReceiveWindow)' -i "$yaml_file"
+    fi
 	addOrUpdateYaml "$yaml_file" "quic.maxIdleTimeout" "30s"
 	addOrUpdateYaml "$yaml_file" "quic.maxIncomingStreams" "1024"
 	addOrUpdateYaml "$yaml_file" "quic.disablePathMTUDiscovery" "false"
-	addOrUpdateYaml "$yaml_file" "bandwidth.up" "${server_upload}mbps"
-	addOrUpdateYaml "$yaml_file" "bandwidth.down" "${server_download}mbps"
+	if [ "${congestion_mode}" == "brutal" ];then
+		addOrUpdateYaml "$yaml_file" "bandwidth.up" "${server_upload}mbps"
+		addOrUpdateYaml "$yaml_file" "bandwidth.down" "${server_download}mbps"
+	else
+		yq eval 'del(.bandwidth)' -i "$yaml_file"
+	fi
     addOrUpdateYaml "$yaml_file" "acl.file" "${acl_file}"
-    case ${masquerade_type} in 
+    case ${masquerade_type} in
         "string")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "string"
             addOrUpdateYaml "$yaml_file" "masquerade.string.content" "${masquerade_string}"
@@ -995,7 +1526,7 @@ setHysteriaConfig(){
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.url" "${masquerade_proxy}"
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.rewriteHost" "true"
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.insecure" "true"
-
+            addOrUpdateYaml "$yaml_file" "masquerade.proxy.xForwarded" "${masquerade_xforwarded}"
         ;;
         "file")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "file"
@@ -1008,17 +1539,16 @@ setHysteriaConfig(){
             fi
         ;;
     esac
-
     if [ "${masquerade_tcp}" == "true" ];then
         addOrUpdateYaml "$yaml_file" "masquerade.listenHTTPS" ":${port}"
     fi
     addOrUpdateYaml "$yaml_file" "speedTest" "true"
     if echo "${useAcme}" | grep -q "false";then
 		if echo "${useLocalCert}" | grep -q "false";then
-			v6str=":" #Is ipv6?
+			v6str=":"
 			result=$(echo ${ip} | grep ${v6str})
 			if [ "${result}" != "" ];then
-				ip="[${ip}]" 
+				ip="[${ip}]"
 			fi
 			u_host=${ip}
 			u_domain=${domain}
@@ -1026,37 +1556,21 @@ setHysteriaConfig(){
 				remarks="${ip}"
 			fi
 			insecure="1"
-            days=3650  # 替换为实际的有效天数
+            days=3650
             mail="no-reply@qq.com"
-
-            # 开始生成证书
             echoColor purple "开始生成自签名证书...\n"
-
-            # 生成 CA 私钥
             echoColor green "生成 CA 私钥..."
             openssl genrsa -out /etc/hihy/cert/${domain}.ca.key 2048
-
-            # 生成 CA 证书
             echoColor green "生成 CA 证书..."
             openssl req -new -x509 -days ${days} -key /etc/hihy/cert/${domain}.ca.key -subj "/C=CN/ST=GuangDong/L=ShenZhen/O=PonyMa/OU=Tecent/emailAddress=${mail}/CN=Tencent Root CA" -out /etc/hihy/cert/${domain}.ca.crt
-
-            # 生成服务器私钥和 CSR
             echoColor green "生成服务器私钥和 CSR..."
             openssl req -newkey rsa:2048 -nodes -keyout /etc/hihy/cert/${domain}.key -subj "/C=CN/ST=GuangDong/L=ShenZhen/O=PonyMa/OU=Tecent/emailAddress=${mail}/CN=${domain}" -out /etc/hihy/cert/${domain}.csr
-
-            # 使用 CA 签署服务器证书
             echoColor green "使用 CA 签署服务器证书..."
             openssl x509 -req -extfile <(printf "subjectAltName=DNS:${domain},DNS:${domain}") -days ${days} -in /etc/hihy/cert/${domain}.csr -CA /etc/hihy/cert/${domain}.ca.crt -CAkey /etc/hihy/cert/${domain}.ca.key -CAcreateserial -out /etc/hihy/cert/${domain}.crt
-
-            # 清理临时文件
             echoColor green "清理临时文件..."
             rm /etc/hihy/cert/${domain}.ca.key /etc/hihy/cert/${domain}.ca.srl /etc/hihy/cert/${domain}.csr
-
-            # 移动 CA 证书到结果目录
             echoColor green "移动 CA 证书到结果目录..."
             mv /etc/hihy/cert/${domain}.ca.crt /etc/hihy/result
-
-            # 完成
             echoColor purple "证书生成成功！\n"
 			addOrUpdateYaml "$yaml_file" "tls.cert" "/etc/hihy/cert/${domain}.crt"
 			addOrUpdateYaml "$yaml_file" "tls.key" "/etc/hihy/cert/${domain}.key"
@@ -1071,9 +1585,7 @@ setHysteriaConfig(){
 			addOrUpdateYaml "$yaml_file" "tls.cert" "${local_cert}"
 			addOrUpdateYaml "$yaml_file" "tls.key" "${local_key}"
             addOrUpdateYaml "$yaml_file" "tls.sniGuard" "strict"
-		fi		
-
-
+		fi
     else
 		u_host=${domain}
 		u_domain=${domain}
@@ -1088,7 +1600,7 @@ setHysteriaConfig(){
         if [ "${useDns}" == "true" ];then
             u_host=${ip}
             addOrUpdateYaml "$yaml_file" "acme.type" "dns"
-            case ${dns} in 
+            case ${dns} in
                 "cloudflare")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "cloudflare"
                     addOrUpdateYaml "$yaml_file" "acme.dns.config.cloudflare_api_token" "${cloudflare_api_token}"
@@ -1122,9 +1634,7 @@ setHysteriaConfig(){
 		    allowPort tcp 80
             addOrUpdateYaml "$yaml_file" "acme.type" "http"
             addOrUpdateYaml "$yaml_file" "acme.listenHost" "0.0.0.0"
-
         fi
-		
     fi
     addOrUpdateYaml "$yaml_file" "sniff.enabled" "true"
     addOrUpdateYaml "$yaml_file" "sniff.timeout" "2s"
@@ -1145,17 +1655,17 @@ setHysteriaConfig(){
     addOrUpdateYaml "$yaml_file" "outbounds[2].direct.fastOpen" "false" "bool"
     trafficPort=$(($(od -An -N2 -i /dev/random) % (65534 - 10001) + 10001))
     if [ "$trafficPort" == "${port}" ];then
-        trafficPort=$(${port} + 1)
+        trafficPort=$((${port} + 1))
     fi
     addOrUpdateYaml "$yaml_file" "trafficStats.listen" "127.0.0.1:${trafficPort}"
     addOrUpdateYaml "$yaml_file" "trafficStats.secret" "${auth_secret}"
-
-    if [ $block_http3 == "true" ];then
+    if [ ${block_http3} == "true" ];then
         echo -e "reject(all, udp/443)" > ${acl_file}
     fi
-    
-    sysctl -w net.core.rmem_max=${max_CRW}
-    sysctl -w net.core.wmem_max=${max_CRW}
+    if [ ${max_CRW} -gt 0 ];then
+        sysctl -w net.core.rmem_max=${max_CRW}
+        sysctl -w net.core.wmem_max=${max_CRW}
+    fi
 	if echo "${portHoppingStatus}" | grep -q "true";then
 		sysctl -w net.ipv4.ip_forward=1
 		sysctl -w net.ipv6.conf.all.forwarding=1
@@ -1165,67 +1675,59 @@ setHysteriaConfig(){
     fi
     sysctl -p
 	echo -e "\033[1;;35m\nTest config...\n\033[0m"
-	/etc/hihy/bin/appS -c ${yaml_file} server > ./hihy_debug.info 2>&1 &
-
+	startInstallValidationProcess "${yaml_file}" "./hihy_debug.info"
     if [ "${useAcme}" == "true" ];then
         countdown 20
     else
         countdown 5
     fi
-	
-	
 	msg=`cat ./hihy_debug.info`
-    case ${msg} in 
+    case ${msg} in
         *"failed to get a certificate with ACME"*)
+            markInstallFailed "certificate" "failed to get a certificate with ACME"
             echoColor red "域名:${u_host},申请证书失败!请重新安装使用自签证书."
             rm /etc/hihy/conf/config.yaml
             rm /etc/hihy/result/backup.yaml
             delHihyFirewallPort
-            if echo ${portHoppingStatus} | grep -q "true";then
-                delPortHoppingNat
-            fi
             rm ./hihy_debug.info
+            echoColor yellow "当前安装处于未完成状态，可修正问题后重新执行安装，或执行卸载进行清理。"
             exit
             ;;
         *"bind: address already in use"*)
+            markInstallFailed "port-bind" "bind: address already in use"
             rm /etc/hihy/conf/config.yaml
             rm /etc/hihy/result/backup.yaml
             delHihyFirewallPort
-            if echo ${portHoppingStatus} | grep -q "true";then
-                delPortHoppingNat
-            fi
             echoColor red "端口被占用,请更换端口!"
             rm ./hihy_debug.info
+            echoColor yellow "当前安装处于未完成状态，可更换端口后重新执行安装，或执行卸载进行清理。"
             exit
             ;;
         *"server up and running"*)
             echoColor green "Test success!"
-            # 使用 pkill 终止进程
             echoColor purple "Stop test program..."
             pkill -f "/etc/hihy/bin/appS"
             rm ./hihy_debug.info
-            # 配置防火墙
             allowPort udp ${port}
+            if [ "${portHoppingStatus}" == "true" ];then
+                allowPort udp ${portHoppingStart}:${portHoppingEnd}
+            fi
             if [ "${masquerade_tcp}" == "true" ];then
                 getPortBindMsg TCP ${port}
                 allowPort tcp ${port}
             fi
-            if echo ${portHoppingStatus} | grep -q "true";then
-                addPortHoppingNat ${portHoppingStart} ${portHoppingEnd} ${port}
-            fi
             echoColor purple "Generating config..."
             ;;
-        *) 	
-            # 确保有 pkill 命令
+        *)
+            markInstallFailed "config-test" "unknown error while validating generated config"
             if ! command -v pkill >/dev/null 2>&1; then
                 apk add --no-cache procps
             fi
-            # 使用 pkill 终止进程
             pkill -f "/etc/hihy/bin/appS"
             echoColor red "未知错误: 请查看下方错误信息,并提交issue到github"
+            echoColor yellow "已保留未完成安装状态，修正问题后可重新执行安装，或执行卸载进行清理。"
             cat ./hihy_debug.info
             rm ./hihy_debug.info
-            rm -r /etc/hihy/
             exit
             ;;
     esac
@@ -1237,27 +1739,45 @@ setHysteriaConfig(){
 	addOrUpdateYaml ${backup_file} "remarks" "${remarks}"
 	addOrUpdateYaml ${backup_file} "serverAddress" "${u_host}" "string"
 	addOrUpdateYaml ${backup_file} "serverPort" "${port}"
+	addOrUpdateYaml ${backup_file} "congestionMode" "${congestion_mode}"
+	addOrUpdateYaml ${backup_file} "congestionType" "${congestion_type}"
+	addOrUpdateYaml ${backup_file} "ignoreClientBandwidth" "${ignore_client_bandwidth}"
+	if [ "${congestion_type}" == "bbr" ];then
+		addOrUpdateYaml ${backup_file} "congestionBbrProfile" "${congestion_bbr_profile}"
+	fi
 	addOrUpdateYaml ${backup_file} "portHoppingStatus" "${portHoppingStatus}"
 	addOrUpdateYaml ${backup_file} "portHoppingStart" "${portHoppingStart}"
 	addOrUpdateYaml ${backup_file} "portHoppingEnd" "${portHoppingEnd}"
+	addOrUpdateYaml ${backup_file} "portHoppingIntervalMode" "${portHoppingIntervalMode}"
+	addOrUpdateYaml ${backup_file} "portHoppingHopInterval" "${portHoppingHopInterval}"
+	addOrUpdateYaml ${backup_file} "portHoppingMinHopInterval" "${portHoppingMinHopInterval}"
+	addOrUpdateYaml ${backup_file} "portHoppingMaxHopInterval" "${portHoppingMaxHopInterval}"
 	addOrUpdateYaml ${backup_file} "domain" "${domain}"
     addOrUpdateYaml ${backup_file} "trafficPort" "${trafficPort}"
     addOrUpdateYaml ${backup_file} "socks5_status" "false"
+    addOrUpdateYaml ${backup_file} "masquerade_xforwarded" "${masquerade_xforwarded}"
     if [ "$masquerade_tcp" == "true" ];then
         addOrUpdateYaml ${backup_file} "masquerade_tcp" "true"
     else
         addOrUpdateYaml ${backup_file} "masquerade_tcp" "false"
     fi
-	if [ $insecure == "1" ];then
+	if [ ${insecure} == "1" ];then
 		addOrUpdateYaml ${backup_file} "insecure" "true"
 	else
 		addOrUpdateYaml ${backup_file} "insecure" "false"
 	fi
+	if ! installHihyLauncher; then
+		markInstallFailed "launcher" "failed to install hihy launcher"
+		echoColor red "hihy 命令安装失败,请检查网络或写入权限后重试."
+		exit 1
+	fi
+	clearInstallFailureMarker
 	echoColor greenWhite "安装成功,请查看下方配置详细信息"
 }
 
 downloadHysteriaCore(){
-    local version=`curl --silent --head https://github.com/apernet/hysteria/releases/latest | grep -i location | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/ //g'`
+    local version
+    version=$(getLatestHysteriaVersion)
     
     echo -e "The Latest hysteria version: $(echoColor red "${version}")\nDownload..."
     
@@ -1295,7 +1815,7 @@ downloadHysteriaCore(){
             ;;
     esac
 
-    wget -q -O /etc/hihy/bin/appS  "$download_url"
+    wget -q -O /etc/hihy/bin/appS "$download_url"
     
     if [ -f "/etc/hihy/bin/appS" ]; then
         chmod 755 /etc/hihy/bin/appS
@@ -1309,7 +1829,8 @@ downloadHysteriaCore(){
 updateHysteriaCore(){
     if [ -f "/etc/hihy/bin/appS" ]; then
         local localV=$(echo app/$(/etc/hihy/bin/appS version | grep Version: | awk '{print $2}' | head -n 1))
-        local remoteV=`curl --silent --head https://github.com/apernet/hysteria/releases/latest | grep -i location | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/ //g'`
+	        local remoteV
+	        remoteV=$(getLatestHysteriaVersion || true)
         echo -e "Local core version: $(echoColor red "${localV}")"
         echo -e "Remote core version: $(echoColor red "${remoteV}")"
         if [ "${localV}" = "${remoteV}" ]; then
@@ -1341,20 +1862,12 @@ updateHysteriaCore(){
 }
 
 hihy_update_notifycation(){
-	localV=${hihyV}
-	remoteV=`curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
-	if [ -z $remoteV ];then
-		echoColor red "Network Error: Can't connect to Github for checking hihy version!"
-	else
-		if [ "${localV}" != "${remoteV}" ];then
-			echoColor purple "[☺] hihy需更新,version:v${remoteV},建议更新并查看日志: https://github.com/lansepeach/Hi_Hysteria/"
-		fi
-	fi
+	displayCachedVersionNotifications
 }
 
 hihyUpdate(){
 	localV=${hihyV}
-	remoteV=`curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh | sed  -n 2p | cut -d '"' -f 2`
+	remoteV=$(getLatestHihyVersion || true)
 	if [ -z $remoteV ];then
 		echoColor red "Network Error: Can't connect to Github!"
 		exit
@@ -1362,27 +1875,18 @@ hihyUpdate(){
 	if [ "${localV}" = "${remoteV}" ];then
 		echoColor green "Already the latest version.Ignore."
 	else
-		rm /usr/bin/hihy
-		wget -q -O /usr/bin/hihy  https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh 2>/dev/null
-		chmod +x /usr/bin/hihy
+		rm -f "$HIHY_BIN_LINK"
+		if ! installHihyLauncher /dev/null "$HIHY_BIN_LINK"; then
+			echoColor red "hihy更新失败,请检查网络或写入权限."
+			exit 1
+		fi
 		echoColor green "hihy更新完成."
 	fi
 
 }
 
 hyCore_update_notifycation(){
-	if [ -f "/etc/hihy/bin/appS" ]; then
-  		local localV=$(echo app/$(/etc/hihy/bin/appS version | grep Version: | awk '{print $2}' | head -n 1))
-        local remoteV=`curl --silent --head https://github.com/apernet/hysteria/releases/latest | grep -i location | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/ //g'`
-		if [ -z $remoteV ];then
-			echoColor red "Network Error: Can't connect to Github for checking the hysteria version!"
-		else
-			if [ "${localV}" != "${remoteV}" ];then
-				echoColor purple "[!] hysteria2 core有更新,version:${remoteV}  日志: https://v2.hysteria.network/docs/Changelog/"
-			fi
-		fi
-		
-	fi
+	displayCachedVersionNotifications
 }
 
 setup_rc_local_for_arch() {
@@ -1435,17 +1939,30 @@ uninstall_rc_local_for_arch() {
 
 
 install() {
-    if [ -f "/etc/init.d/hihy" ] || [ -f "/etc/rc.d/hihy" ]; then
+    local install_state
+    install_state=$(classifyInstallState)
+
+    if [ "$install_state" = "installed" ]; then
         echoColor green "你已经成功安装hysteria,如需修改配置请使用选项9/12"
         exit 0
     fi
 
+    if [ "$install_state" = "partially-installed" ]; then
+        echoColor yellow "检测到未完成的安装残留，正在清理脚本管理的文件后继续安装..."
+        cleanupLegacyPortHoppingNatIfPresent >/dev/null 2>&1 || true
+        delHihyFirewallPort udp >/dev/null 2>&1 || true
+        delHihyFirewallPort tcp >/dev/null 2>&1 || true
+        recoverPartialInstallState
+        echoColor purple "已完成部分安装状态恢复，继续执行安装。"
+    fi
+
     # 创建必要目录
     mkdir -p /etc/hihy/{bin,conf,cert,result,logs}
+    markInstallFailed "install-start" "installation started but not completed"
     echoColor purple "Ready to install.\n"
 
     # 获取版本并下载核心
-    version=$(curl --silent --head https://github.com/apernet/hysteria/releases/latest | grep -i location | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/ //g')
+    version=$(getLatestHysteriaVersion || true)
     checkSystemForUpdate
     downloadHysteriaCore
     setHysteriaConfig
@@ -1467,6 +1984,7 @@ command_background="yes"
 pidfile="/var/run/hihy.pid"
 output_log="/etc/hihy/logs/hihy.log"
 error_log="/etc/hihy/logs/hihy.log"
+export HYSTERIA_FIREWALL_BACKEND="iptables"
 
 extra_started_commands="log status"
 
@@ -1540,6 +2058,7 @@ HIHY_PATH="/etc/hihy"
 PID_FILE="/var/run/hihy.pid"
 LOG_FILE="\$HIHY_PATH/logs/hihy.log"
 START_CMD_PREFIX="${start_cmd_prefix}"
+export HYSTERIA_FIREWALL_BACKEND="iptables"
 
 start() {
     if [ -f "\$PID_FILE" ] && kill -0 \$(cat "\$PID_FILE") 2>/dev/null; then
@@ -1549,9 +2068,9 @@ start() {
     
     echo "Starting hihy..."
     if [ -n "\$START_CMD_PREFIX" ]; then
-        nohup \$START_CMD_PREFIX \$HIHY_PATH/bin/appS --log-level info -c \$HIHY_PATH/conf/config.yaml server > "\$LOG_FILE" 2>&1 &
+        nohup env HYSTERIA_FIREWALL_BACKEND="\$HYSTERIA_FIREWALL_BACKEND" \$START_CMD_PREFIX \$HIHY_PATH/bin/appS --log-level info -c \$HIHY_PATH/conf/config.yaml server > "\$LOG_FILE" 2>&1 &
     else
-        nohup \$HIHY_PATH/bin/appS --log-level info -c \$HIHY_PATH/conf/config.yaml server > "\$LOG_FILE" 2>&1 &
+        nohup env HYSTERIA_FIREWALL_BACKEND="\$HYSTERIA_FIREWALL_BACKEND" \$HIHY_PATH/bin/appS --log-level info -c \$HIHY_PATH/conf/config.yaml server > "\$LOG_FILE" 2>&1 &
     fi
     echo \$! > "\$PID_FILE"
 }
@@ -1941,34 +2460,48 @@ checkRoot() {
 }
 
 uninstall() {
-    portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
-    if [ ! -f "/etc/hihy/bin/appS" ]; then
+    local install_state
+    install_state=$(classifyInstallState)
+    portHoppingStatus=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingStatus" "false")
+    if [ "$install_state" = "not-installed" ]; then
         echoColor red "Hysteria 未安装!"
         exit 1
+    fi
+
+    if [ "$install_state" = "partially-installed" ]; then
+        echoColor yellow "检测到未完成的安装残留，正在按部分安装状态执行卸载清理..."
     fi
 
     # 停止服务
     if [ -f "/etc/alpine-release" ]; then
         if [ -f "/etc/init.d/hihy" ]; then
-            rc-service hihy stop
-            rc-update del hihy default
+            rc-service hihy stop >/dev/null 2>&1 || true
+            rc-update del hihy default >/dev/null 2>&1 || true
             rm -f /etc/init.d/hihy
         fi
     else
         if [ -f "/etc/rc.d/hihy" ]; then
-            /etc/rc.d/hihy stop
+            /etc/rc.d/hihy stop >/dev/null 2>&1 || true
             rm -f /etc/rc.d/hihy
         fi
     fi
 
     # 删除 iptables 规则
-    iptables-save | grep -v "hihysteria" | iptables-restore
-    ip6tables-save | grep -v "hihysteria" | ip6tables-restore
+    if command -v iptables-save >/dev/null 2>&1 && command -v iptables-restore >/dev/null 2>&1; then
+        iptables-save 2>/dev/null | grep -v "hihysteria" | iptables-restore >/dev/null 2>&1 || true
+    fi
+    if command -v ip6tables-save >/dev/null 2>&1 && command -v ip6tables-restore >/dev/null 2>&1; then
+        ip6tables-save 2>/dev/null | grep -v "hihysteria" | ip6tables-restore >/dev/null 2>&1 || true
+    fi
 
     # 保存 iptables 规则
     if [ -d "/etc/iptables" ]; then
-        iptables-save > /etc/iptables/rules.v4
-        ip6tables-save > /etc/iptables/rules.v6
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4
+        fi
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            ip6tables-save > /etc/iptables/rules.v6
+        fi
     fi
 
     # 删除定时任务
@@ -1976,9 +2509,7 @@ uninstall() {
 
     delHihyFirewallPort udp
     delHihyFirewallPort tcp
-    if echo ${portHoppingStatus} | grep -q "true"; then
-        delPortHoppingNat
-    fi
+    cleanupLegacyPortHoppingNatIfPresent
 
     # 删除相关目录和文件
     rm -rf /etc/hihy
@@ -1991,9 +2522,11 @@ uninstall() {
         fi
     fi
 
-    if [ -f "/usr/bin/hihy" ]; then
-        rm /usr/bin/hihy
+    if [ -f "$HIHY_BIN_LINK" ]; then
+        rm "$HIHY_BIN_LINK"
     fi
+
+    clearInstallFailureMarker
 
 
     # 删除 Arch Linux 的 rc.local systemd 服务
@@ -2035,25 +2568,53 @@ generate_client_config(){
     fi
 	remarks=$(getYamlValue "/etc/hihy/conf/backup.yaml" "remarks")
 	serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
-	port=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen" | awk '{gsub(/^:/, ""); print}')
+	listen_value=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen")
+	port=$(getListenPrimaryPort "${listen_value}")
 	auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
 	tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
 	insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
+	obfs_status="false"
 	obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.salamander.password")
-	if [ "${obfs_pass}" == "" ];then
+	if [ -n "${obfs_pass}" ] && [ "${obfs_pass}" != "null" ];then
 		obfs_status="true"
 	fi
 	SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
 	CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
-     max_CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxConnReceiveWindow")
-     max_SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxStreamReceiveWindow")
+	max_CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxConnReceiveWindow")
+	max_SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxStreamReceiveWindow")
+	if [ "${SRW}" = "null" ];then
+		SRW=""
+	fi
+	if [ "${CRW}" = "null" ];then
+		CRW=""
+	fi
+	if [ "${max_CRW}" = "null" ];then
+		max_CRW=""
+	fi
+	if [ "${max_SRW}" = "null" ];then
+		max_SRW=""
+	fi
+	congestion_mode=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "congestionMode" "brutal")
+	congestion_type=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "congestionType" "")
+	congestion_bbr_profile=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "congestionBbrProfile" "standard")
 	download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
 	upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
+	if [ "${download}" = "null" ];then
+		download=""
+	fi
+	if [ "${upload}" = "null" ];then
+		upload=""
+	fi
 	portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
 	if [ "${portHoppingStatus}" == "true" ];then
-		portHoppingStart=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStart")
-		portHoppingEnd=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingEnd")
+		portHoppingStart=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingStart" "${port}")
+		portHoppingEnd=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingEnd" "${port}")
+		portHoppingIntervalMode=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingIntervalMode" "fixed")
+		portHoppingHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingHopInterval" "30s")
+		portHoppingMinHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingMinHopInterval" "10s")
+		portHoppingMaxHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingMaxHopInterval" "30s")
+		serverPortRange="${portHoppingStart}-${portHoppingEnd}"
 	fi
 	client_configfile="./Hy2-${remarks}-v2rayN.yaml"
 	if [ -f "${client_configfile}" ]; then
@@ -2061,7 +2622,9 @@ generate_client_config(){
 	fi
 	touch ${client_configfile}
 	if [ "${portHoppingStatus}" == "true" ];then
-		addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port},${portHoppingStart}-${portHoppingEnd}/"
+		addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port},${serverPortRange}/"
+	else
+		addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port}/"
 	fi
 	
 	addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}"
@@ -2071,18 +2634,41 @@ generate_client_config(){
 		addOrUpdateYaml "$client_configfile" "tls.insecure" "false"
 	fi
 	addOrUpdateYaml  "$client_configfile" "transport.type" "udp"
-	addOrUpdateYaml  "$client_configfile" "transport.udp.hopInterval" "300s"
+	if [ "${portHoppingStatus}" == "true" ];then
+		if [ "${portHoppingIntervalMode}" == "random" ];then
+			addOrUpdateYaml  "$client_configfile" "transport.udp.minHopInterval" "${portHoppingMinHopInterval}"
+			addOrUpdateYaml  "$client_configfile" "transport.udp.maxHopInterval" "${portHoppingMaxHopInterval}"
+			yq eval 'del(.transport.udp.hopInterval)' -i "$client_configfile"
+		else
+			addOrUpdateYaml  "$client_configfile" "transport.udp.hopInterval" "${portHoppingHopInterval}"
+			yq eval 'del(.transport.udp.minHopInterval, .transport.udp.maxHopInterval)' -i "$client_configfile"
+		fi
+	fi
 	if [ "${obfs_status}" == "true" ];then
 		addOrUpdateYaml "$client_configfile" "obfs.type" "salamander"
 		addOrUpdateYaml "$client_configfile" "obfs.salamander.password" "${obfs_pass}"
 	fi
-	addOrUpdateYaml "$client_configfile" "quic.initStreamReceiveWindow" "${SRW}"
-	addOrUpdateYaml "$client_configfile" "quic.initConnReceiveWindow" "${CRW}"
-    addOrUpdateYaml "$client_configfile" "quic.maxConnReceiveWindow" "${max_CRW}"
-    addOrUpdateYaml "$client_configfile" "quic.maxStreamReceiveWindow" "${max_SRW}"
+	if [ "${congestion_mode}" != "brutal" ];then
+		addOrUpdateYaml "$client_configfile" "congestion.type" "${congestion_type}"
+		if [ "${congestion_type}" == "bbr" ];then
+			addOrUpdateYaml "$client_configfile" "congestion.bbrProfile" "${congestion_bbr_profile}"
+		fi
+	fi
+	if [ "${congestion_mode}" == "brutal" ];then
+		addOrUpdateYaml "$client_configfile" "quic.initStreamReceiveWindow" "${SRW}"
+		addOrUpdateYaml "$client_configfile" "quic.initConnReceiveWindow" "${CRW}"
+        addOrUpdateYaml "$client_configfile" "quic.maxConnReceiveWindow" "${max_CRW}"
+        addOrUpdateYaml "$client_configfile" "quic.maxStreamReceiveWindow" "${max_SRW}"
+    else
+        yq eval 'del(.quic.initStreamReceiveWindow, .quic.initConnReceiveWindow, .quic.maxConnReceiveWindow, .quic.maxStreamReceiveWindow)' -i "$client_configfile"
+    fi
 	addOrUpdateYaml "$client_configfile" "quic.keepAlivePeriod" "60s"
-	addOrUpdateYaml	"$client_configfile" "bandwidth.down " "${download}"
-	addOrUpdateYaml	"$client_configfile" "bandwidth.up" "${upload}"
+	if [ "${congestion_mode}" == "brutal" ];then
+		addOrUpdateYaml "$client_configfile" "bandwidth.down" "${download}"
+		addOrUpdateYaml "$client_configfile" "bandwidth.up" "${upload}"
+	else
+		yq eval 'del(.bandwidth)' -i "$client_configfile"
+	fi
 	addOrUpdateYaml "$client_configfile" "fastOpen" "true"
     addOrUpdateYaml "$client_configfile" "lazy" "true"
 	addOrUpdateYaml "$client_configfile" "socks5.listen" "127.0.0.1:20808"
@@ -2090,7 +2676,7 @@ generate_client_config(){
     
 	
 	if [ "${portHoppingStatus}" == "true" ];then
-		url_base="${url_base}:${port}/?mport=${portHoppingStart}-${portHoppingEnd}&"
+		url_base="${url_base}:${port}/?mport=${serverPortRange}&"
 	else
 		url_base="${url_base}:${port}/?"
 	fi
@@ -2291,13 +2877,15 @@ rules:
   - MATCH,PROXY
 EOF
 	serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
-    port=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen" | awk '{gsub(/^:/, ""); print}')
+    listen_value=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen")
+    port=$(getListenPrimaryPort "${listen_value}")
 	auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
 	tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
 	insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
+	obfs_status="false"
 	obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.salamander.password")
-	if [ "${obfs_pass}" == "" ];then
+	if [ -n "${obfs_pass}" ] && [ "${obfs_pass}" != "null" ];then
 		obfs_status="true"
 	fi
 	SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
@@ -2309,6 +2897,10 @@ EOF
 	upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
     upload=$(echo ${upload} | sed 's/[^0-9]//g')
 	portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
+    if [ "${portHoppingStatus}" == "true" ];then
+        portHoppingStart=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingStart" "${port}")
+        portHoppingEnd=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingEnd" "${port}")
+    fi
     addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}"
     addOrUpdateYaml "${metaFile}" "proxies[0].type" "hysteria2"
     addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}"
@@ -2575,7 +3167,9 @@ format_time_display() {
 
 delHihyFirewallPort() {
     # 如果防火墙启动状态则删除之前的规则
-    local port=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen" | awk '{gsub(/^:/, ""); print}')
+    local listen_value=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen")
+    local port=$(getListenPrimaryPort "${listen_value}")
+    local port_range=$(getListenRangePart "${listen_value}")
     local protocol=$1
 
     # 检查并处理不同的防火墙管理工具
@@ -2584,11 +3178,20 @@ delHihyFirewallPort() {
             ufw delete allow "${port}" 2> /dev/null
             echoColor purple "UFW DELETE: ${port}"
         fi
+        if [ -n "${port_range}" ] && ufw status | grep -qw "${port_range}/${protocol}"; then
+            ufw delete allow "${port_range}/${protocol}" 2> /dev/null
+            echoColor purple "UFW DELETE: ${port_range}/${protocol}"
+        fi
     elif command -v firewall-cmd > /dev/null && systemctl is-active --quiet firewalld; then
         if firewall-cmd --list-ports --permanent | grep -qw "${port}/${protocol}"; then
             firewall-cmd --zone=public --remove-port="${port}/${protocol}" --permanent 2> /dev/null
             firewall-cmd --reload 2> /dev/null
             echoColor purple "FIREWALLD DELETE: ${port}/${protocol}"
+        fi
+        if [ -n "${port_range}" ] && firewall-cmd --list-ports --permanent | grep -qw "${port_range}/${protocol}"; then
+            firewall-cmd --zone=public --remove-port="${port_range}/${protocol}" --permanent 2> /dev/null
+            firewall-cmd --reload 2> /dev/null
+            echoColor purple "FIREWALLD DELETE: ${port_range}/${protocol}"
         fi
     elif command -v iptables > /dev/null; then
         iptables-save | sed -e "/hihysteria/d" | iptables-restore
@@ -2601,9 +3204,16 @@ delHihyFirewallPort() {
         fi
         if [ -f "/etc/rc.d/allow-port" ]; then
             sed -i "/${protocol}\/${port}(hihysteria)/d" /etc/rc.d/allow-port
+            if [ -n "${port_range}" ];then
+                local port_range_comment=$(echo "${port_range}" | sed 's/:/\\:/g')
+                sed -i "/${protocol}\/${port_range_comment}(hihysteria)/d" /etc/rc.d/allow-port
+            fi
         fi
 
         echoColor purple "IPTABLES DELETE: ${port}/${protocol}"
+        if [ -n "${port_range}" ];then
+            echoColor purple "IPTABLES DELETE: ${port_range}/${protocol}"
+        fi
     fi
 }
 
@@ -2670,9 +3280,7 @@ changeServerConfig(){
     fi
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
 	stop
-    if [ "${portHoppingStatus}" == "true" ];then
-        delPortHoppingNat
-    fi
+    cleanupLegacyPortHoppingNatIfPresent
     if [ "${masquerade_tcp}" == "true" ];then
         delHihyFirewallPort tcp
         delHihyFirewallPort udp
@@ -2836,9 +3444,9 @@ addSocks5Outbound(){
         fi
         local server_config="/etc/hihy/conf/config.yaml"
         if [ -n "${socks5_user}" ]; then
-            yq eval '.outbounds = [{"name": "warp", "type": "socks5", "socks5": {"addr": "127.0.0.1:'$port'", "username": "'$socks5_user'", "password": "'$socks5_pass'"}}] + .outbounds' -i "${server_config}"
+            yq eval '.outbounds = [{"name": "custom", "type": "socks5", "socks5": {"addr": "'$socks5_addr'", "username": "'$socks5_user'", "password": "'$socks5_pass'"}}] + .outbounds' -i "${server_config}"
         else
-            yq eval '.outbounds = [{"name": "warp", "type": "socks5", "socks5": {"addr": "127.0.0.1:'$port'"}}] + .outbounds' -i "${server_config}"
+            yq eval '.outbounds = [{"name": "custom", "type": "socks5", "socks5": {"addr": "'$socks5_addr'"}}] + .outbounds' -i "${server_config}"
 
         fi
         restart
@@ -2869,9 +3477,9 @@ addSocks5Outbound(){
 show_menu() {
     clear
     echo -e " -------------------------------------------"
-    echo -e "|********** Hi Hysteria       **********|"
-    echo -e "|********** Author: emptysuns/lansepeach    **********|"
-    echo -e "|********** Version: $(echoColor red "${hihyV}")    **********|"
+    echo -e "|**********      Hi Hysteria       **********|"
+    echo -e "|********** Author: emptysuns/lansepeach **********|"
+    echo -e "|**********     Version: $(echoColor red "${hihyV}")    **********|"
     echo -e " -------------------------------------------"
     echo -e "Tips: $(echoColor green "hihy") 命令再次运行本脚本."
     echo -e "$(echoColor skyBlue ".............................................")"
@@ -2902,8 +3510,8 @@ show_menu() {
     echo -e "$(echoColor skyBlue ".............................................")"
     echo -e ""
     hihy_update_notifycation
-    hyCore_update_notifycation
     echo -e "\n"
+    startBackgroundVersionCheck
 }
 
 wait_for_continue() {
@@ -2937,23 +3545,25 @@ menu() {
     done
 }
 
-checkRoot
-case "$1" in
-    install|1) echoColor purple "-> 1) 安装 hysteria"; install ;;
-    uninstall|2) echoColor purple "-> 2) 卸载 hysteria"; uninstall ;;
-    start|3) echoColor purple "-> 3) 启动 hysteria"; start ;;
-    stop|4) echoColor purple "-> 4) 暂停 hysteria"; stop ;;
-    restart|5) echoColor purple "-> 5) 重新启动 hysteria"; restart ;;
-    checkStatus|6) echoColor purple "-> 6) 运行状态"; checkStatus ;;
-    updateHysteriaCore|7) echoColor purple "-> 7) 更新Core"; updateHysteriaCore ;;
-    generate_client_config|8) echoColor purple "-> 8) 查看当前配置"; generate_client_config ;;
-    changeServerConfig|9) echoColor purple "-> 9) 重新配置"; changeServerConfig ;;
-    changeIp64|10) echoColor purple "-> 10) 切换ipv4/ipv6优先级"; changeIp64 ;;
-    hihyUpdate|11) echoColor purple "-> 11) 更新hihy"; hihyUpdate ;;
-    aclControl|12) echoColor purple "-> 12) ACL管理"; aclControl ;;
-    getHysteriaTrafic|13) echoColor purple "-> 13) 查看hysteria统计信息"; getHysteriaTrafic ;;
-    checkLogs|14) echoColor purple "-> 14) 查看实时日志"; checkLogs ;;
-    addSocks5Outbound|15) echoColor purple "-> 15) 添加socks5出站"; addSocks5Outbound ;;
-    cronTask) cronTask ;;
-    *) menu ;;
-esac
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    checkRoot
+    case "$1" in
+        install|1) echoColor purple "-> 1) 安装 hysteria"; install ;;
+        uninstall|2) echoColor purple "-> 2) 卸载 hysteria"; uninstall ;;
+        start|3) echoColor purple "-> 3) 启动 hysteria"; start ;;
+        stop|4) echoColor purple "-> 4) 暂停 hysteria"; stop ;;
+        restart|5) echoColor purple "-> 5) 重新启动 hysteria"; restart ;;
+        checkStatus|6) echoColor purple "-> 6) 运行状态"; checkStatus ;;
+        updateHysteriaCore|7) echoColor purple "-> 7) 更新Core"; updateHysteriaCore ;;
+        generate_client_config|8) echoColor purple "-> 8) 查看当前配置"; generate_client_config ;;
+        changeServerConfig|9) echoColor purple "-> 9) 重新配置"; changeServerConfig ;;
+        changeIp64|10) echoColor purple "-> 10) 切换ipv4/ipv6优先级"; changeIp64 ;;
+        hihyUpdate|11) echoColor purple "-> 11) 更新hihy"; hihyUpdate ;;
+        aclControl|12) echoColor purple "-> 12) ACL管理"; aclControl ;;
+        getHysteriaTrafic|13) echoColor purple "-> 13) 查看hysteria统计信息"; getHysteriaTrafic ;;
+        checkLogs|14) echoColor purple "-> 14) 查看实时日志"; checkLogs ;;
+        addSocks5Outbound|15) echoColor purple "-> 15) 添加socks5出站"; addSocks5Outbound ;;
+        cronTask) cronTask ;;
+        *) menu ;;
+    esac
+fi
