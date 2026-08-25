@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.13"
+hihyV="ver1.14"
 
 umask 077
 
@@ -1168,35 +1168,38 @@ setHysteriaConfig() {
     echo -e "适用: NAT/家庭宽带/CGNAT/无公网IP环境。详情: https://hysteria.network/zh/docs/advanced/Realms/"
     echo -e "\033[33m\033[01m⚠ 目前仅支持使用hysteria core直接运行\033[0m\033[32m\n"
     echo -e "\033[33m\033[01m1、不使用(默认)\n2、使用Realm模式\033[0m\033[32m\n\n输入序号:\033[0m"
-    read -r realmChoice
+    read -r realmChoice || return 1
     if [ -z "${realmChoice}" ] || [ "${realmChoice}" == "1" ]; then
         realmMode="false"
-    else
+    elif [ "${realmChoice}" == "2" ]; then
         realmMode="true"
         realmName=$(generate_uuid)
         echo -e "\n->您的Realm名(请勿泄露,知道此名称的人可以获得你的服务器ip地址): "$(echoColor red ${realmName})"\n"
         echoColor green "\n请选择牵手(rendezvous)服务器:"
         echo -e "官方服务器地址为 realm.hy2.io, 使用默认密码 public 即可,无需修改"
         echo -e "\033[33m\033[01m1、官方牵手服务器(默认): realm.hy2.io\n2、自建牵手服务器\033[0m\033[32m\n\n输入序号:\033[0m"
-        read -r realmServerChoice
+        read -r realmServerChoice || return 1
         if [ -z "${realmServerChoice}" ] || [ "${realmServerChoice}" == "1" ]; then
             realmAddress="realm.hy2.io"
             realmPassword="public"
-        else
+        elif [ "${realmServerChoice}" == "2" ]; then
             echoColor green "请输入牵手服务器地址(格式: host:port 或 host):"
-            read -r realmAddressInput
+            read -r realmAddressInput || return 1
             while [ -z "${realmAddressInput}" ]; do
                 echoColor red "地址不能为空,请重新输入:"
-                read -r realmAddressInput
+                read -r realmAddressInput || return 1
             done
             realmAddress="${realmAddressInput}"
             echoColor green "请输入牵手服务器密码(默认: public):"
-            read -r realmPasswordInput
+            read -r realmPasswordInput || return 1
             if [ -z "${realmPasswordInput}" ]; then
                 realmPassword="public"
             else
                 realmPassword="${realmPasswordInput}"
             fi
+        else
+            echoColor red "牵手服务器选项输入错误。"
+            return 1
         fi
         realmURI="realm://${realmPassword}@${realmAddress}/${realmName}"
         echo -e "\n->牵手地址: "$(echoColor red ${realmURI})"\n"
@@ -1210,7 +1213,7 @@ setHysteriaConfig() {
         echo -e "注意: 由于cloudflare warp是nat4, 所以客户端必须得是有公网ip或者nat1/2才能使用(一般可以直接用无需担心)"
         echo -e ""
         echo -e "\033[33m\033[01m1、跳过(默认)\n2、安装WARP\033[0m\033[32m\n\n输入序号:\033[0m"
-        read -r warpChoice
+        read -r warpChoice || return 1
         if [ "${warpChoice}" == "2" ]; then
             echoColor purple "\n->开始安装WARP,请稍候..."
             echoColor purple "请在WARP安装菜单中选择 [全局] 工作模式(出现菜单时手动选择全局)"
@@ -1241,9 +1244,12 @@ setHysteriaConfig() {
             warpEnabled="false"
             echoColor purple "\n->跳过WARP安装,直接使用服务器真实IP"
         fi
+    else
+        echoColor red "Realm 模式选项输入错误。"
+        return 1
     fi
     echo -e "\033[32m(1/11)请选择证书方式:\n\n\033[0m\033[33m\033[01m1、ACME HTTP 自动申请(需开放 TCP/80)\n2、使用已有证书文件\n3、自签证书\n4、ACME DNS 自动申请\n5、使用多服务器证书管理已发布的证书(主菜单 16)\033[0m\033[32m\n\n输入序号:\033[0m"
-    read -r certNum
+    read -r certNum || return 1
     useAcme=false
     useLocalCert=false
     yaml_file="$HIHY_CONFIG_FILE"
@@ -4324,11 +4330,17 @@ changeIp64() {
 }
 
 changeServerConfig() {
-    local previous_port
-    if [ ! -e "/etc/rc.d/hihy" ] && [ ! -e "/etc/init.d/hihy" ]; then
+    local previous_port backup_dir was_running="false"
+    if [ "$(classifyInstallState)" != "installed" ]; then
         echoColor red "请先安装hysteria2,再去修改配置..."
-        exit
+        return 1
     fi
+    backup_dir=$(mktemp -d "$HIHY_ROOT_DIR/result/reconfigure.XXXXXX") || return 1
+    cp -a "$HIHY_CONFIG_FILE" "$backup_dir/config.yaml" || { rm -rf "$backup_dir"; return 1; }
+    cp -a "$HIHY_BACKUP_FILE" "$backup_dir/backup.yaml" || { rm -rf "$backup_dir"; return 1; }
+    [ -f "$HIHY_ACL_FILE" ] && cp -a "$HIHY_ACL_FILE" "$backup_dir/acl.txt"
+    [ -f "$HIHY_FIREWALL_STATE_FILE" ] && cp -a "$HIHY_FIREWALL_STATE_FILE" "$backup_dir/firewall-owned.state"
+    serviceIsActive && was_running="true"
     portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
     if [ "${portHoppingStatus}" == "true" ]; then
         portHoppingStart=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStart")
@@ -4336,7 +4348,7 @@ changeServerConfig() {
     fi
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
     previous_port=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverPort")
-    stop
+    stop || { rm -rf "$backup_dir"; return 1; }
     cleanupLegacyPortHoppingNatIfPresent
     if [ "${masquerade_tcp}" == "true" ]; then
         delHihyFirewallPort tcp
@@ -4344,21 +4356,48 @@ changeServerConfig() {
     else
         delHihyFirewallPort udp
     fi
-    updateHysteriaCore
     if ! setHysteriaConfig; then
-        echoColor yellow "重新配置已取消，正在恢复原服务。"
+        echoColor yellow "重新配置未完成，正在恢复原配置和服务。"
+        removeOwnedFirewallRules >/dev/null 2>&1 || true
+        cp -a "$backup_dir/config.yaml" "$HIHY_CONFIG_FILE"
+        cp -a "$backup_dir/backup.yaml" "$HIHY_BACKUP_FILE"
+        [ -f "$backup_dir/acl.txt" ] && cp -a "$backup_dir/acl.txt" "$HIHY_ACL_FILE"
+        rm -f "$HIHY_FIREWALL_STATE_FILE"
         allowPort udp "$previous_port" >/dev/null 2>&1 || true
-        if [ "${portHoppingStatus}" == "true" ]; then
-            allowPort udp "${portHoppingStart}:${portHoppingEnd}" >/dev/null 2>&1 || true
+        [ "${portHoppingStatus}" = "true" ] && allowPort udp "${portHoppingStart}:${portHoppingEnd}" >/dev/null 2>&1 || true
+        [ "${masquerade_tcp}" = "true" ] && allowPort tcp "$previous_port" >/dev/null 2>&1 || true
+        if [ -f "$backup_dir/firewall-owned.state" ]; then
+            cp -a "$backup_dir/firewall-owned.state" "$HIHY_FIREWALL_STATE_FILE"
+        else
+            rm -f "$HIHY_FIREWALL_STATE_FILE"
         fi
-        if [ "${masquerade_tcp}" == "true" ]; then
-            allowPort tcp "$previous_port" >/dev/null 2>&1 || true
-        fi
-        start
+        [ "$was_running" = "true" ] && start >/dev/null 2>&1 || true
+        secureHihyPermissions
+        rm -rf "$backup_dir"
         return 1
     fi
-    start
+    if ! start || ! serviceIsActive; then
+        echoColor red "新配置正式启动失败，正在恢复原配置和服务。"
+        removeOwnedFirewallRules >/dev/null 2>&1 || true
+        cp -a "$backup_dir/config.yaml" "$HIHY_CONFIG_FILE"
+        cp -a "$backup_dir/backup.yaml" "$HIHY_BACKUP_FILE"
+        [ -f "$backup_dir/acl.txt" ] && cp -a "$backup_dir/acl.txt" "$HIHY_ACL_FILE"
+        rm -f "$HIHY_FIREWALL_STATE_FILE"
+        allowPort udp "$previous_port" >/dev/null 2>&1 || true
+        [ "${portHoppingStatus}" = "true" ] && allowPort udp "${portHoppingStart}:${portHoppingEnd}" >/dev/null 2>&1 || true
+        [ "${masquerade_tcp}" = "true" ] && allowPort tcp "$previous_port" >/dev/null 2>&1 || true
+        if [ -f "$backup_dir/firewall-owned.state" ]; then
+            cp -a "$backup_dir/firewall-owned.state" "$HIHY_FIREWALL_STATE_FILE"
+        else
+            rm -f "$HIHY_FIREWALL_STATE_FILE"
+        fi
+        [ "$was_running" = "true" ] && start >/dev/null 2>&1 || true
+        secureHihyPermissions
+        rm -rf "$backup_dir"
+        return 1
+    fi
     generate_client_config
+    rm -rf "$backup_dir"
     echoColor green "配置修改成功"
 
 }
