@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.11"
+hihyV="ver1.13"
 
 umask 077
 
@@ -16,6 +16,10 @@ HIHY_SERVICE_FILE="${HIHY_SERVICE_FILE:-/etc/systemd/system/hihy.service}"
 HIHY_LEGACY_SERVICE="${HIHY_LEGACY_SERVICE:-/etc/rc.d/hihy}"
 HIHY_INIT_SERVICE="${HIHY_INIT_SERVICE:-/etc/init.d/hihy}"
 HIHY_FIREWALL_STATE_FILE="${HIHY_FIREWALL_STATE_FILE:-$HIHY_ROOT_DIR/result/firewall-owned.state}"
+HIHY_NFT_DIR="${HIHY_NFT_DIR:-$HIHY_ROOT_DIR/firewall}"
+HIHY_NFT_RULESET_FILE="${HIHY_NFT_RULESET_FILE:-$HIHY_NFT_DIR/hihy-firewall.nft}"
+HIHY_NFT_LOADER="${HIHY_NFT_LOADER:-$HIHY_NFT_DIR/apply.sh}"
+HIHY_NFT_SERVICE_FILE="${HIHY_NFT_SERVICE_FILE:-/etc/systemd/system/hihy-firewall.service}"
 HIHY_MIGRATION_STATE_FILE="${HIHY_MIGRATION_STATE_FILE:-$HIHY_ROOT_DIR/result/service-migration.state}"
 HIHY_CERT_MANAGER_DIR="${HIHY_CERT_MANAGER_DIR:-$HIHY_ROOT_DIR/cert-manager}"
 HIHY_CERT_MANAGER_CONFIG="${HIHY_CERT_MANAGER_CONFIG:-$HIHY_CERT_MANAGER_DIR/config/manager.conf}"
@@ -45,10 +49,10 @@ HIHY_REMOTE_MAX_TIME="${HIHY_REMOTE_MAX_TIME:-30}"
 
 ensureHihyDirectories() {
     mkdir -p "$HIHY_ROOT_DIR/bin" "$HIHY_ROOT_DIR/conf" "$HIHY_ROOT_DIR/cert" \
-        "$HIHY_ROOT_DIR/result" "$HIHY_ROOT_DIR/acl" "$HIHY_ROOT_DIR/logs"
+        "$HIHY_ROOT_DIR/result" "$HIHY_ROOT_DIR/acl" "$HIHY_ROOT_DIR/logs" "$HIHY_NFT_DIR"
     chmod 755 "$HIHY_ROOT_DIR/bin"
     chmod 700 "$HIHY_ROOT_DIR/conf" "$HIHY_ROOT_DIR/cert" "$HIHY_ROOT_DIR/result" \
-        "$HIHY_ROOT_DIR/acl" "$HIHY_ROOT_DIR/logs"
+        "$HIHY_ROOT_DIR/acl" "$HIHY_ROOT_DIR/logs" "$HIHY_NFT_DIR"
 }
 
 secureHihyPermissions() {
@@ -59,6 +63,8 @@ secureHihyPermissions() {
     [ -f "$HIHY_ACL_FILE" ] && chmod 600 "$HIHY_ACL_FILE"
     [ -f "$HIHY_LOG_FILE" ] && chmod 600 "$HIHY_LOG_FILE"
     [ -f "$HIHY_FIREWALL_STATE_FILE" ] && chmod 600 "$HIHY_FIREWALL_STATE_FILE"
+    [ -f "$HIHY_NFT_RULESET_FILE" ] && chmod 600 "$HIHY_NFT_RULESET_FILE"
+    [ -f "$HIHY_NFT_LOADER" ] && chmod 700 "$HIHY_NFT_LOADER"
     [ -f "$HIHY_MIGRATION_STATE_FILE" ] && chmod 600 "$HIHY_MIGRATION_STATE_FILE"
     [ -f "$HIHY_ROOT_DIR/bin/appS" ] && chmod 755 "$HIHY_ROOT_DIR/bin/appS"
     [ -f "$HIHY_BIN_LINK" ] && chmod 755 "$HIHY_BIN_LINK"
@@ -615,6 +621,8 @@ detectVirtualization() {
 getStartCommand() {
     local virt_type=$(detectVirtualization)
     local command_prefix=""
+
+    [ "${HIHY_DISABLE_CHRT:-false}" = "true" ] && return 0
 
     case "$virt_type" in
         "openvz" | "lxc" | "docker")
@@ -2479,6 +2487,7 @@ Description=Hysteria 2 Server managed by Hi_Hysteria
 Documentation=${HIHY_REPO_URL}
 Wants=network-online.target
 After=network-online.target
+$(if grep -q '^backend=nft|' "$HIHY_FIREWALL_STATE_FILE" 2>/dev/null; then printf '%s\n' 'Requires=hihy-firewall.service' 'After=hihy-firewall.service'; fi)
 
 [Service]
 Type=simple
@@ -2509,6 +2518,7 @@ EOF
         fi
     fi
     [ -n "$backup_file" ] && rm -f "$backup_file"
+    return 0
 }
 
 writeOpenRcService() {
@@ -2605,31 +2615,79 @@ EOF
 
 installHihyService() {
     local manager
+    local service_log="$HIHY_ROOT_DIR/result/service-install.log"
     manager=$(detectServiceManager)
+    ensureHihyDirectories || return 1
+    : >"$service_log"
+    chmod 600 "$service_log"
 
     case "$manager" in
         systemd)
-            writeSystemdService || return 1
-            systemctl daemon-reload || return 1
-            systemctl enable hihy.service >/dev/null 2>&1 || return 1
-            systemctl restart hihy.service || return 1
-            systemctl is-active --quiet hihy.service || return 1
+            if ! writeSystemdService; then
+                echoColor red "systemd unit 文件生成失败。"
+                return 1
+            fi
+            if ! systemctl daemon-reload >>"$service_log" 2>&1; then
+                echoColor red "systemd daemon-reload 失败。"
+                tail -n 30 "$service_log"
+                return 1
+            fi
+            if ! systemctl enable hihy.service >>"$service_log" 2>&1; then
+                echoColor red "hihy.service 启用失败。"
+                tail -n 30 "$service_log"
+                return 1
+            fi
+            if systemctl restart hihy.service >>"$service_log" 2>&1 && systemctl is-active --quiet hihy.service; then
+                rm -f "$service_log"
+                return 0
+            fi
+
+            if grep -q '^ExecStart=.*/chrt ' "$HIHY_SERVICE_FILE"; then
+                echoColor yellow "实时调度启动失败，正在移除 chrt 优先级并重试。"
+                systemctl stop hihy.service >>"$service_log" 2>&1 || true
+                if HIHY_DISABLE_CHRT=true writeSystemdService && \
+                    systemctl daemon-reload >>"$service_log" 2>&1 && \
+                    systemctl restart hihy.service >>"$service_log" 2>&1 && \
+                    systemctl is-active --quiet hihy.service; then
+                    echoColor green "已使用普通调度模式启动 hihy.service。"
+                    rm -f "$service_log"
+                    return 0
+                fi
+            fi
+
+            systemctl status hihy.service --no-pager -l >>"$service_log" 2>&1 || true
+            journalctl -u hihy.service -n 30 --no-pager >>"$service_log" 2>&1 || true
+            echoColor red "hihy.service 启动失败，详细日志如下："
+            tail -n 40 "$service_log"
+            echoColor yellow "完整日志: $service_log"
+            return 1
             ;;
         openrc)
             writeOpenRcService || return 1
-            rc-update add hihy default >/dev/null 2>&1 || return 1
-            rc-service hihy restart >/dev/null 2>&1 || rc-service hihy start || return 1
+            rc-update add hihy default >>"$service_log" 2>&1 || return 1
+            rc-service hihy restart >>"$service_log" 2>&1 || rc-service hihy start >>"$service_log" 2>&1 || return 1
             ;;
         *)
             writeLegacyService || return 1
-            "$HIHY_LEGACY_SERVICE" restart || return 1
+            "$HIHY_LEGACY_SERVICE" restart >>"$service_log" 2>&1 || return 1
             ;;
     esac
+    rm -f "$service_log"
 }
 
 serviceStart() {
     if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = "systemd" ]; then
-        systemctl start hihy.service
+        if systemctl start hihy.service && systemctl is-active --quiet hihy.service; then
+            return 0
+        fi
+        if grep -q '^ExecStart=.*/chrt ' "$HIHY_SERVICE_FILE"; then
+            echoColor yellow "实时调度启动失败，正在改用普通调度模式。"
+            systemctl stop hihy.service >/dev/null 2>&1 || true
+            HIHY_DISABLE_CHRT=true writeSystemdService && systemctl daemon-reload && \
+                systemctl start hihy.service && systemctl is-active --quiet hihy.service
+        else
+            return 1
+        fi
     elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
         rc-service hihy start
     else
@@ -2649,7 +2707,17 @@ serviceStop() {
 
 serviceRestart() {
     if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = "systemd" ]; then
-        systemctl restart hihy.service
+        if systemctl restart hihy.service && systemctl is-active --quiet hihy.service; then
+            return 0
+        fi
+        if grep -q '^ExecStart=.*/chrt ' "$HIHY_SERVICE_FILE"; then
+            echoColor yellow "实时调度启动失败，正在改用普通调度模式。"
+            systemctl stop hihy.service >/dev/null 2>&1 || true
+            HIHY_DISABLE_CHRT=true writeSystemdService && systemctl daemon-reload && \
+                systemctl restart hihy.service && systemctl is-active --quiet hihy.service
+        else
+            return 1
+        fi
     elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
         rc-service hihy restart
     else
@@ -2835,6 +2903,169 @@ recordOwnedFirewallRule() {
     fi
 }
 
+nftOwnedTableExists() {
+    nft list table inet hihy_firewall >/dev/null 2>&1
+}
+
+nftOwnedTableIsManaged() {
+    nft list table inet hihy_firewall 2>/dev/null | grep -q 'hihy-owned:v1'
+}
+
+writeNftOwnedRuleset() {
+    local line backend protocol port nft_port temp_file check_file
+    ensureHihyDirectories || return 1
+    temp_file=$(mktemp "$HIHY_NFT_RULESET_FILE.tmp.XXXXXX") || return 1
+    cat >"$temp_file" <<'EOF'
+table inet hihy_firewall {
+    comment "hihy-owned:v1"
+    chain hihy_input {
+        type filter hook input priority -10; policy accept;
+EOF
+    if [ -f "$HIHY_FIREWALL_STATE_FILE" ]; then
+        while IFS= read -r line; do
+            backend=$(printf '%s' "$line" | cut -d'|' -f1 | cut -d= -f2)
+            protocol=$(printf '%s' "$line" | cut -d'|' -f2 | cut -d= -f2)
+            port=$(printf '%s' "$line" | cut -d'|' -f3 | cut -d= -f2)
+            [ "$backend" = "nft" ] || continue
+            validate_protocol "$protocol" || continue
+            if [[ "$port" == *:* ]]; then
+                validate_port_range "${port%%:*}" "${port##*:}" || continue
+                nft_port="${port/:/-}"
+            else
+                validate_port "$port" || continue
+                nft_port="$port"
+            fi
+            printf '        %s dport %s accept comment "hihy-owned:%s:%s"\n' \
+                "$protocol" "$nft_port" "$protocol" "$port" >>"$temp_file"
+        done <"$HIHY_FIREWALL_STATE_FILE"
+    fi
+    cat >>"$temp_file" <<'EOF'
+    }
+}
+EOF
+    chmod 600 "$temp_file"
+    if nftOwnedTableExists; then
+        check_file=$(mktemp "$HIHY_NFT_RULESET_FILE.check.XXXXXX") || { rm -f "$temp_file"; return 1; }
+        printf 'delete table inet hihy_firewall\n' >"$check_file"
+        cat "$temp_file" >>"$check_file"
+        nft -c -f "$check_file" >/dev/null 2>&1 || { rm -f "$temp_file" "$check_file"; return 1; }
+        rm -f "$check_file"
+    else
+        nft -c -f "$temp_file" >/dev/null 2>&1 || { rm -f "$temp_file"; return 1; }
+    fi
+    mv -f "$temp_file" "$HIHY_NFT_RULESET_FILE"
+}
+
+writeNftLoader() {
+    cat >"$HIHY_NFT_LOADER" <<EOF
+#!/bin/sh
+set -eu
+if nft list table inet hihy_firewall >/dev/null 2>&1; then
+    nft list table inet hihy_firewall | grep -q 'hihy-owned:v1' || {
+        echo 'Refusing to replace unowned nftables table inet hihy_firewall' >&2
+        exit 1
+    }
+    batch=\$(mktemp '${HIHY_NFT_DIR}/apply.XXXXXX')
+    trap 'rm -f "\$batch"' EXIT
+    printf '%s\n' 'delete table inet hihy_firewall' >"\$batch"
+    cat '$HIHY_NFT_RULESET_FILE' >>"\$batch"
+    nft -f "\$batch"
+else
+    nft -f '$HIHY_NFT_RULESET_FILE'
+fi
+EOF
+    chmod 700 "$HIHY_NFT_LOADER"
+}
+
+installNftPersistence() {
+    writeNftLoader || return 1
+    case "$(detectServiceManager)" in
+        systemd)
+            cat >"$HIHY_NFT_SERVICE_FILE" <<EOF
+[Unit]
+Description=Hi_Hysteria-owned nftables rules
+Documentation=${HIHY_REPO_URL}
+After=nftables.service
+Before=hihy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${HIHY_NFT_LOADER}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            chmod 644 "$HIHY_NFT_SERVICE_FILE"
+            systemctl daemon-reload >/dev/null 2>&1 || return 1
+            systemctl enable hihy-firewall.service >/dev/null 2>&1 || return 1
+            ;;
+        openrc)
+            cat >"${HIHY_INIT_SERVICE}-firewall" <<EOF
+#!/sbin/openrc-run
+name="hihy-firewall"
+description="Hi_Hysteria-owned nftables rules"
+command="${HIHY_NFT_LOADER}"
+command_background="no"
+depend() {
+    need localmount
+    after nftables
+    before hihy
+}
+EOF
+            chmod 755 "${HIHY_INIT_SERVICE}-firewall"
+            rc-update add hihy-firewall default >/dev/null 2>&1 || return 1
+            ;;
+        *)
+            if [ ! -f "$HIHY_RC_LOCAL" ]; then
+                printf '#!/bin/bash\n' >"$HIHY_RC_LOCAL"
+                chmod 755 "$HIHY_RC_LOCAL"
+            fi
+            sed -i "\|${HIHY_NFT_LOADER}|d" "$HIHY_RC_LOCAL"
+            if grep -qF "$HIHY_LEGACY_SERVICE start" "$HIHY_RC_LOCAL"; then
+                sed -i "\|${HIHY_LEGACY_SERVICE} start|i ${HIHY_NFT_LOADER}" "$HIHY_RC_LOCAL"
+            else
+                printf '%s\n' "$HIHY_NFT_LOADER" >>"$HIHY_RC_LOCAL"
+            fi
+            ;;
+    esac
+}
+
+applyNftOwnedRuleset() {
+    if nftOwnedTableExists && ! nftOwnedTableIsManaged; then
+        echoColor red "检测到同名但不属于 Hi_Hysteria 的 nftables 表，拒绝修改。"
+        return 1
+    fi
+    writeNftOwnedRuleset || return 1
+    installNftPersistence || return 1
+    "$HIHY_NFT_LOADER"
+}
+
+removeNftOwnedFirewall() {
+    local result=0
+    if nftOwnedTableExists; then
+        if nftOwnedTableIsManaged; then
+            nft delete table inet hihy_firewall >/dev/null 2>&1 || result=1
+        else
+            echoColor yellow "保留同名但不属于 Hi_Hysteria 的 nftables 表。"
+        fi
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable hihy-firewall.service >/dev/null 2>&1 || true
+        rm -f "$HIHY_NFT_SERVICE_FILE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del hihy-firewall default >/dev/null 2>&1 || true
+    fi
+    rm -f "${HIHY_INIT_SERVICE}-firewall"
+    if [ -f "$HIHY_RC_LOCAL" ]; then
+        sed -i "\|${HIHY_NFT_LOADER}|d" "$HIHY_RC_LOCAL"
+    fi
+    rm -f "$HIHY_NFT_RULESET_FILE" "$HIHY_NFT_LOADER"
+    return "$result"
+}
+
 firewallRuleExists() {
     local backend="$1"
     local protocol="$2"
@@ -2845,8 +3076,9 @@ firewallRuleExists() {
         ufw) ufw status | grep -Eq "(^|[[:space:]])${port}/${protocol}([[:space:]]|$)" ;;
         firewalld)
             zone=$(firewall-cmd --get-default-zone)
-            firewall-cmd --zone="$zone" --query-port="${port}/${protocol}" --permanent >/dev/null 2>&1
+            firewall-cmd --zone="$zone" --query-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1
             ;;
+        nft) grep -qF "backend=nft|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE" 2>/dev/null ;;
         iptables) iptables -w 5 -C INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT >/dev/null 2>&1 ;;
         *) return 1 ;;
     esac
@@ -2880,7 +3112,7 @@ allowPort() {
         ufw) ufw allow "${port}/${protocol}" >/dev/null || return 1 ;;
         firewalld)
             zone=$(firewall-cmd --get-default-zone)
-            firewall-cmd --zone="$zone" --add-port="${port}/${protocol}" --permanent >/dev/null || return 1
+            firewall-cmd --zone="$zone" --add-port="${port/:/-}/${protocol}" --permanent >/dev/null || return 1
             firewall-cmd --reload >/dev/null || return 1
             ;;
         iptables)
@@ -2888,7 +3120,13 @@ allowPort() {
             command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
             ;;
         nft)
-            echoColor yellow "检测到原生 nftables，但没有活动 UFW/firewalld。为避免覆盖全局规则，请手动开放 ${port}/${protocol}。"
+            recordOwnedFirewallRule "$backend" "$protocol" "$port" || return 1
+            if ! applyNftOwnedRuleset; then
+                sed -i "\|^backend=nft|protocol=${protocol}|port=${port}$|d" "$HIHY_FIREWALL_STATE_FILE"
+                echoColor red "nftables 自动放行失败。"
+                return 1
+            fi
+            echoColor purple "已自动开放: ${port}/${protocol} (${backend})"
             return 0
             ;;
     esac
@@ -2897,8 +3135,11 @@ allowPort() {
 }
 
 removeOwnedFirewallRules() {
-    local line backend protocol port zone
-    [ -f "$HIHY_FIREWALL_STATE_FILE" ] || return 0
+    local line backend protocol port zone has_nft="false"
+    if [ ! -f "$HIHY_FIREWALL_STATE_FILE" ]; then
+        removeNftOwnedFirewall
+        return $?
+    fi
 
     while IFS= read -r line; do
         backend=$(printf '%s' "$line" | cut -d'|' -f1 | cut -d= -f2)
@@ -2909,17 +3150,21 @@ removeOwnedFirewallRules() {
             ufw) ufw delete allow "${port}/${protocol}" >/dev/null 2>&1 || true ;;
             firewalld)
                 zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
-                firewall-cmd --zone="$zone" --remove-port="${port}/${protocol}" --permanent >/dev/null 2>&1 || true
+                firewall-cmd --zone="$zone" --remove-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1 || true
                 ;;
             iptables)
                 while iptables -w 5 -C INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT >/dev/null 2>&1; do
                     iptables -w 5 -D INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT || break
                 done
                 ;;
+            nft) has_nft="true" ;;
         esac
     done <"$HIHY_FIREWALL_STATE_FILE"
     command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+    if [ "$has_nft" = "true" ] || nftOwnedTableExists || [ -f "$HIHY_NFT_RULESET_FILE" ] || [ -f "$HIHY_NFT_SERVICE_FILE" ]; then
+        removeNftOwnedFirewall || true
+    fi
     rm -f "$HIHY_FIREWALL_STATE_FILE"
 }
 
@@ -4966,6 +5211,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
                 exit 1
             fi
             ;;
+        firewall-apply) applyNftOwnedRuleset ;;
         cronTask) cronTask ;;
         *) menu ;;
     esac
