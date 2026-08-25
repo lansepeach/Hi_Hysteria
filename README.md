@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.10`
+当前脚本版本：`1.0.11`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -18,7 +18,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 
 - 安装、卸载、启动、停止、重启 Hysteria2
 - 支持 ACME HTTP、ACME DNS、本地证书、自签证书
-- 支持单一证书中心申请通配符证书，并通过受限 SSH 自动分发到多台服务器
+- 支持中心端申请通配符证书，并通过受限 SSH 自动分发给多台接收端服务器
 - 支持 Brutal / BBR / Reno 拥塞控制模式
 - 支持 Hysteria2 原生端口跳跃/多端口范围监听
 - 支持 masquerade：string / proxy / file
@@ -73,7 +73,7 @@ hihy 12           # ACL 域名分流管理
 hihy 13           # 查看统计信息
 hihy 14           # 查看实时日志
 hihy 15           # 添加 socks5 出站
-hihy 16           # 证书中心、共享证书与节点分发管理
+hihy 16           # 多服务器证书管理（中心端申请、接收端部署）
 hihy cert status  # 查看通配符证书和节点部署状态
 hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 ```

@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.10"
+hihyV="ver1.11"
 
 umask 077
 
@@ -1234,15 +1234,11 @@ setHysteriaConfig() {
             echoColor purple "\n->跳过WARP安装,直接使用服务器真实IP"
         fi
     fi
-    echo -e "\033[32m(1/11)请选择证书申请方式:\n\n\033[0m\033[33m\033[01m1、使用ACME申请(推荐,需打开tcp/80端口)\n2、使用本地证书文件\n3、自签证书\n4、dns验证\033[0m\033[32m\n\n输入序号:\033[0m"
+    echo -e "\033[32m(1/11)请选择证书方式:\n\n\033[0m\033[33m\033[01m1、ACME HTTP 自动申请(需开放 TCP/80)\n2、使用已有证书文件\n3、自签证书\n4、ACME DNS 自动申请\n5、使用多服务器证书管理已发布的证书(主菜单 16)\033[0m\033[32m\n\n输入序号:\033[0m"
     read -r certNum
     useAcme=false
     useLocalCert=false
     yaml_file="$HIHY_CONFIG_FILE"
-    if [ -f "${yaml_file}" ]; then
-        rm -f ${yaml_file}
-    fi
-    touch $yaml_file
 
     if [ -z "${certNum}" ] || [ "${certNum}" == "3" ]; then
         echoColor green "请输入自签证书的域名(默认:helloworld.com):"
@@ -1327,6 +1323,28 @@ setHysteriaConfig() {
         useAcme=false
         useLocalCert=true
         echoColor purple "\n\n->您已选择本地证书加密.域名:"$(echoColor red ${domain})"\n"
+    elif [ "${certNum}" == "5" ]; then
+        local shared_domain
+        shared_domain=$(getCertificateReceiverDomain 2>/dev/null || true)
+        local_cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
+        local_key="$HIHY_SHARED_CERT_DIR/current/privkey.pem"
+        if [ -z "$shared_domain" ] || ! validateCertificateBundle "$local_cert" "$local_key" "$shared_domain"; then
+            echoColor red "尚未找到证书管理功能发布的有效共享证书。"
+            echoColor yellow "请先完成基础安装，再从主菜单 16『多服务器证书管理』初始化中心端或接收端。"
+            return 1
+        fi
+        echoColor green "请输入本机客户端连接域名(必须属于 *.${shared_domain}):"
+        read -r domain
+        case "$domain" in
+            *."$shared_domain") ;;
+            *)
+                echoColor red "域名不在 *.${shared_domain} 证书覆盖范围内。"
+                return 1
+                ;;
+        esac
+        useAcme=false
+        useLocalCert=true
+        echoColor purple "\n\n->使用多服务器证书管理已发布的证书，连接域名:"$(echoColor red "${domain}")"\n"
     elif [ "${certNum}" == "4" ]; then
         echoColor green "请输入域名:"
         read -r domain
@@ -1480,7 +1498,7 @@ setHysteriaConfig() {
         echo -e "\n ->公网ip: "$(echoColor red ${ip})"\n"
         useAcme=true
         useDns=true
-    else
+    elif [ "${certNum}" == "1" ]; then
         echoColor green "请输入域名(需正确解析到本机,关闭CDN):"
         read -r domain
         while :; do
@@ -1551,7 +1569,13 @@ setHysteriaConfig() {
         useAcme=true
         useDns=false
         echoColor purple "\n\n->解析正确,使用hysteria内置ACME申请证书.域名:"$(echoColor red ${domain})"\n"
+    else
+        echoColor red "证书方式输入错误。"
+        return 1
     fi
+
+    rm -f "$yaml_file"
+    touch "$yaml_file"
 
     if [ "${realmMode}" == "true" ]; then
         port=""
@@ -2966,7 +2990,7 @@ install() {
     version=$(getLatestHysteriaVersion || true)
     checkSystemForUpdate
     downloadHysteriaCore
-    setHysteriaConfig
+    setHysteriaConfig || return 1
 
     if ! installHihyService; then
         markInstallFailed "service" "failed to install or start service"
@@ -4055,6 +4079,7 @@ changeIp64() {
 }
 
 changeServerConfig() {
+    local previous_port
     if [ ! -e "/etc/rc.d/hihy" ] && [ ! -e "/etc/init.d/hihy" ]; then
         echoColor red "请先安装hysteria2,再去修改配置..."
         exit
@@ -4065,6 +4090,7 @@ changeServerConfig() {
         portHoppingEnd=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingEnd")
     fi
     masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
+    previous_port=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverPort")
     stop
     cleanupLegacyPortHoppingNatIfPresent
     if [ "${masquerade_tcp}" == "true" ]; then
@@ -4074,7 +4100,18 @@ changeServerConfig() {
         delHihyFirewallPort udp
     fi
     updateHysteriaCore
-    setHysteriaConfig
+    if ! setHysteriaConfig; then
+        echoColor yellow "重新配置已取消，正在恢复原服务。"
+        allowPort udp "$previous_port" >/dev/null 2>&1 || true
+        if [ "${portHoppingStatus}" == "true" ]; then
+            allowPort udp "${portHoppingStart}:${portHoppingEnd}" >/dev/null 2>&1 || true
+        fi
+        if [ "${masquerade_tcp}" == "true" ]; then
+            allowPort tcp "$previous_port" >/dev/null 2>&1 || true
+        fi
+        start
+        return 1
+    fi
     start
     generate_client_config
     echoColor green "配置修改成功"
@@ -4407,13 +4444,20 @@ initCertificateManager() {
     if printf '%s' "$current_domain" | grep -q '\.'; then
         domain=$(printf '%s' "$current_domain" | awk -F. '{print $(NF-1)"."$NF}')
     fi
-    [ -n "$domain" ] || domain="example.com"
     email=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.email" 2>/dev/null)
-    [ -n "$email" ] && [ "$email" != "null" ] || email="admin@${domain}"
 
-    echoColor green "主域名(默认:${domain}):"
+    if [ -n "$domain" ]; then
+        echoColor green "主域名(默认:${domain}):"
+    else
+        echoColor green "请输入用于通配符证书的主域名(例如 example.com):"
+    fi
     read -r input_domain
     [ -n "$input_domain" ] && domain="$input_domain"
+    printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' || {
+        echoColor red "请输入有效的主域名。"
+        return 1
+    }
+    [ -n "$email" ] && [ "$email" != "null" ] || email="admin@${domain}"
     echoColor green "ACME 邮箱(默认:${email}):"
     read -r input_email
     [ -n "$input_email" ] && email="$input_email"
@@ -4452,7 +4496,7 @@ ensureCertificateDeployKey() {
 initCertificateReceiver() {
     local domain="$1"
     if [ -z "$domain" ]; then
-        echoColor green "请输入共享通配符证书的主域名，例如 example.com:"
+        echoColor green "请输入共享通配符证书的主域名(例如 example.com):"
         read -r domain
     fi
     printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' || return 1
@@ -4681,9 +4725,10 @@ showCertificateManagerStatus() {
 }
 
 certificateManagerMenu() {
-    echoColor purple "证书中心与共享通配符证书"
-    echoColor yellow "1) 初始化本机为证书中心"
-    echoColor yellow "2) 初始化本机为接收节点"
+    echoColor purple "多服务器证书管理"
+    echoColor purple "中心端负责申请通配符证书并分发；接收端负责接收并供本机 Hysteria 使用。"
+    echoColor yellow "1) 设置本机为中心端(申请和分发证书)"
+    echoColor yellow "2) 设置本机为接收端(接收中心端证书)"
     echoColor yellow "3) 申请/续期并发布通配符证书"
     echoColor yellow "4) 添加并初始化 SSH 节点"
     echoColor yellow "5) 删除节点"
@@ -4739,7 +4784,7 @@ show_menu() {
     echo -e "$(echoColor skyBlue "13) 查看hysteria2统计信息")"
     echo -e "$(echoColor yellow "14) 查看实时日志")"
     echo -e "$(echoColor yellow "15) 添加socks5出站[支持自动配置warp]")"
-    echo -e "$(echoColor lightCyan "16) 证书中心与共享通配符证书")"
+    echo -e "$(echoColor lightCyan "16) 多服务器证书管理")"
 
     echo -e "$(echoColor purple "###############################")"
 
