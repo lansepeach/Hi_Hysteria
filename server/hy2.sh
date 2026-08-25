@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.09"
+hihyV="ver1.10"
 
 umask 077
 
@@ -2436,6 +2436,7 @@ writeSystemdService() {
     local exec_start
     local temp_file
     local backup_file=""
+    local verify_log="$HIHY_ROOT_DIR/result/service-migration.verify.log"
 
     start_cmd_prefix=$(getStartCommand)
     if [ -n "$start_cmd_prefix" ]; then
@@ -2474,13 +2475,14 @@ EOF
         cp -a "$HIHY_SERVICE_FILE" "$backup_file" || return 1
     fi
     mv -f "$temp_file" "$HIHY_SERVICE_FILE"
-    if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze verify "$HIHY_SERVICE_FILE" >/dev/null 2>&1; then
-        if [ -n "$backup_file" ]; then
-            mv -f "$backup_file" "$HIHY_SERVICE_FILE"
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        if ! systemd-analyze verify "$HIHY_SERVICE_FILE" >"$verify_log" 2>&1; then
+            chmod 600 "$verify_log"
+            echoColor yellow "systemd-analyze 预检查返回警告，将继续用实际加载和启动结果验证。"
+            echoColor yellow "诊断日志: $verify_log"
         else
-            rm -f "$HIHY_SERVICE_FILE"
+            rm -f "$verify_log"
         fi
-        return 1
     fi
     [ -n "$backup_file" ] && rm -f "$backup_file"
 }
@@ -2645,8 +2647,12 @@ migrateLegacyService() {
     local was_running="false"
     local backup_dir
     local had_init_service="false"
+    local migration_log="$HIHY_ROOT_DIR/result/service-migration.log"
 
     [ "$(detectServiceManager)" = "systemd" ] || return 1
+    ensureHihyDirectories || return 1
+    : >"$migration_log"
+    chmod 600 "$migration_log"
     if isNativeHihySystemdService; then
         systemctl enable hihy.service >/dev/null 2>&1 || true
         if [ -f "$HIHY_RC_LOCAL" ]; then
@@ -2668,14 +2674,23 @@ migrateLegacyService() {
     fi
 
     if ! writeSystemdService; then
-        echoColor red "systemd unit 生成或校验失败。"
+        echoColor red "systemd unit 文件生成失败。"
         rm -f "$HIHY_SERVICE_FILE"
         [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
         systemctl daemon-reload >/dev/null 2>&1 || true
         return 1
     fi
-    if ! systemctl daemon-reload || ! systemctl enable hihy.service >/dev/null 2>&1; then
-        echoColor red "systemd unit 加载或启用失败。"
+    if ! systemctl daemon-reload >>"$migration_log" 2>&1; then
+        echoColor red "systemd daemon-reload 失败。"
+        tail -n 20 "$migration_log"
+        rm -f "$HIHY_SERVICE_FILE"
+        [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! systemctl enable hihy.service >>"$migration_log" 2>&1; then
+        echoColor red "systemd unit 启用失败。"
+        tail -n 20 "$migration_log"
         rm -f "$HIHY_SERVICE_FILE"
         [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -2683,7 +2698,10 @@ migrateLegacyService() {
     fi
 
     "$HIHY_LEGACY_SERVICE" stop >/dev/null 2>&1 || true
-    if ! systemctl start hihy.service || ! systemctl is-active --quiet hihy.service; then
+    if ! systemctl start hihy.service >>"$migration_log" 2>&1 || ! systemctl is-active --quiet hihy.service; then
+        echoColor red "原生 hihy.service 启动失败，正在恢复旧启动方式。"
+        systemctl status hihy.service --no-pager >>"$migration_log" 2>&1 || true
+        tail -n 30 "$migration_log"
         systemctl disable --now hihy.service >/dev/null 2>&1 || true
         rm -f "$HIHY_SERVICE_FILE"
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -2710,6 +2728,7 @@ EOF
     chmod 755 "$HIHY_LEGACY_SERVICE"
     printf 'manager=systemd\nmigrated_at=%s\nbackup_dir=%s\n' "$(date +%s)" "$backup_dir" >"$HIHY_MIGRATION_STATE_FILE"
     chmod 600 "$HIHY_MIGRATION_STATE_FILE"
+    rm -f "$migration_log"
 }
 
 promptLegacyServiceMigration() {
