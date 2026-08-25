@@ -521,7 +521,7 @@ downloadHysteriaCore() {
     local arch
     arch=$(uname -m)
 
-    local url_base="https://github.com/apernet/hysteria/releases/download/${version}/hysteria-linux-"
+    local url_base="https://github.com/HyNetworks/hysteria/releases/download/${version}/hysteria-linux-"
     local download_url=""
 
     case "$arch" in

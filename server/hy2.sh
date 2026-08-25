@@ -1,11 +1,30 @@
 #!/bin/bash
-hihyV="ver1.07"
+hihyV="ver1.08"
+
+umask 077
 
 HIHY_ROOT_DIR="${HIHY_ROOT_DIR:-/etc/hihy}"
 HIHY_BIN_LINK="${HIHY_BIN_LINK:-/usr/bin/hihy}"
 HIHY_YQ_BIN="${HIHY_YQ_BIN:-/usr/bin/yq}"
 HIHY_PID_FILE="${HIHY_PID_FILE:-/var/run/hihy.pid}"
 HIHY_RC_LOCAL="${HIHY_RC_LOCAL:-/etc/rc.local}"
+HIHY_CONFIG_FILE="${HIHY_CONFIG_FILE:-$HIHY_ROOT_DIR/conf/config.yaml}"
+HIHY_BACKUP_FILE="${HIHY_BACKUP_FILE:-$HIHY_ROOT_DIR/conf/backup.yaml}"
+HIHY_ACL_FILE="${HIHY_ACL_FILE:-$HIHY_ROOT_DIR/acl/acl.txt}"
+HIHY_LOG_FILE="${HIHY_LOG_FILE:-$HIHY_ROOT_DIR/logs/hihy.log}"
+HIHY_SERVICE_FILE="${HIHY_SERVICE_FILE:-/etc/systemd/system/hihy.service}"
+HIHY_LEGACY_SERVICE="${HIHY_LEGACY_SERVICE:-/etc/rc.d/hihy}"
+HIHY_INIT_SERVICE="${HIHY_INIT_SERVICE:-/etc/init.d/hihy}"
+HIHY_FIREWALL_STATE_FILE="${HIHY_FIREWALL_STATE_FILE:-$HIHY_ROOT_DIR/result/firewall-owned.state}"
+HIHY_MIGRATION_STATE_FILE="${HIHY_MIGRATION_STATE_FILE:-$HIHY_ROOT_DIR/result/service-migration.state}"
+HIHY_CERT_MANAGER_DIR="${HIHY_CERT_MANAGER_DIR:-$HIHY_ROOT_DIR/cert-manager}"
+HIHY_CERT_MANAGER_CONFIG="${HIHY_CERT_MANAGER_CONFIG:-$HIHY_CERT_MANAGER_DIR/config/manager.conf}"
+HIHY_CERT_TOKEN_FILE="${HIHY_CERT_TOKEN_FILE:-$HIHY_CERT_MANAGER_DIR/credentials/cloudflare.token}"
+HIHY_CERT_DEPLOY_KEY="${HIHY_CERT_DEPLOY_KEY:-$HIHY_CERT_MANAGER_DIR/credentials/deploy_ed25519}"
+HIHY_CERT_KNOWN_HOSTS="${HIHY_CERT_KNOWN_HOSTS:-$HIHY_CERT_MANAGER_DIR/known_hosts}"
+HIHY_SHARED_CERT_DIR="${HIHY_SHARED_CERT_DIR:-$HIHY_ROOT_DIR/cert/shared}"
+HIHY_LEGO_BIN="${HIHY_LEGO_BIN:-$HIHY_CERT_MANAGER_DIR/bin/lego}"
+HIHY_LEGO_VERSION="${HIHY_LEGO_VERSION:-5.4.0}"
 # ===== 自维护仓库配置 =====
 HIHY_REPO_OWNER="${HIHY_REPO_OWNER:-lansepeach}"
 HIHY_REPO_NAME="${HIHY_REPO_NAME:-Hi_Hysteria}"
@@ -21,6 +40,179 @@ HIHY_VERSION_CHECK_LOCK_FILE="${HIHY_VERSION_CHECK_LOCK_FILE:-$HIHY_ROOT_DIR/res
 HIHY_VERSION_CHECK_TTL="${HIHY_VERSION_CHECK_TTL:-21600}"
 HIHY_REMOTE_CONNECT_TIMEOUT="${HIHY_REMOTE_CONNECT_TIMEOUT:-2}"
 HIHY_REMOTE_MAX_TIME="${HIHY_REMOTE_MAX_TIME:-5}"
+
+ensureHihyDirectories() {
+    mkdir -p "$HIHY_ROOT_DIR/bin" "$HIHY_ROOT_DIR/conf" "$HIHY_ROOT_DIR/cert" \
+        "$HIHY_ROOT_DIR/result" "$HIHY_ROOT_DIR/acl" "$HIHY_ROOT_DIR/logs"
+    chmod 755 "$HIHY_ROOT_DIR/bin"
+    chmod 700 "$HIHY_ROOT_DIR/conf" "$HIHY_ROOT_DIR/cert" "$HIHY_ROOT_DIR/result" \
+        "$HIHY_ROOT_DIR/acl" "$HIHY_ROOT_DIR/logs"
+}
+
+secureHihyPermissions() {
+    ensureHihyDirectories || return 1
+
+    [ -f "$HIHY_CONFIG_FILE" ] && chmod 600 "$HIHY_CONFIG_FILE"
+    [ -f "$HIHY_BACKUP_FILE" ] && chmod 600 "$HIHY_BACKUP_FILE"
+    [ -f "$HIHY_ACL_FILE" ] && chmod 600 "$HIHY_ACL_FILE"
+    [ -f "$HIHY_LOG_FILE" ] && chmod 600 "$HIHY_LOG_FILE"
+    [ -f "$HIHY_FIREWALL_STATE_FILE" ] && chmod 600 "$HIHY_FIREWALL_STATE_FILE"
+    [ -f "$HIHY_MIGRATION_STATE_FILE" ] && chmod 600 "$HIHY_MIGRATION_STATE_FILE"
+    [ -f "$HIHY_ROOT_DIR/bin/appS" ] && chmod 755 "$HIHY_ROOT_DIR/bin/appS"
+    [ -f "$HIHY_BIN_LINK" ] && chmod 755 "$HIHY_BIN_LINK"
+
+    if [ -d "$HIHY_ROOT_DIR/cert" ]; then
+        find "$HIHY_ROOT_DIR/cert" -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
+        find "$HIHY_ROOT_DIR/cert" -type f -name '*.crt' -exec chmod 644 {} + 2>/dev/null || true
+    fi
+    if [ -d "$HIHY_CERT_MANAGER_DIR" ]; then
+        chmod 700 "$HIHY_CERT_MANAGER_DIR" "$HIHY_CERT_MANAGER_DIR/config" \
+            "$HIHY_CERT_MANAGER_DIR/credentials" "$HIHY_CERT_MANAGER_DIR/lego" \
+            "$HIHY_CERT_MANAGER_DIR/releases" "$HIHY_CERT_MANAGER_DIR/nodes" \
+            "$HIHY_CERT_MANAGER_DIR/logs" "$HIHY_CERT_MANAGER_DIR/state" 2>/dev/null || true
+        find "$HIHY_CERT_MANAGER_DIR" -type f -name '*.key' -exec chmod 600 {} + 2>/dev/null || true
+        [ -f "$HIHY_CERT_TOKEN_FILE" ] && chmod 600 "$HIHY_CERT_TOKEN_FILE"
+        [ -f "$HIHY_CERT_MANAGER_CONFIG" ] && chmod 600 "$HIHY_CERT_MANAGER_CONFIG"
+    fi
+}
+
+validate_protocol() {
+    [ "$1" = "tcp" ] || [ "$1" = "udp" ]
+}
+
+validate_port_range() {
+    validate_port "$1" && validate_port "$2" && [ "$1" -lt "$2" ]
+}
+
+sanitizeFileComponent() {
+    local value="$1"
+    value=$(printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_')
+    value=${value#.}
+    value=${value#-}
+    [ -n "$value" ] || value="hihy"
+    printf '%s\n' "$value"
+}
+
+validateDownloadedShell() {
+    local file="$1"
+
+    [ -s "$file" ] || return 1
+    bash -n "$file" || return 1
+    grep -qE '^[[:space:]]*hihyV=' "$file" || return 1
+    grep -qF 'checkRoot()' "$file" || return 1
+    grep -qF 'menu()' "$file" || return 1
+}
+
+ensureCertificateManagerDirectories() {
+    mkdir -p "$HIHY_CERT_MANAGER_DIR/bin" "$HIHY_CERT_MANAGER_DIR/config" \
+        "$HIHY_CERT_MANAGER_DIR/credentials" "$HIHY_CERT_MANAGER_DIR/lego" \
+        "$HIHY_CERT_MANAGER_DIR/releases" "$HIHY_CERT_MANAGER_DIR/nodes" \
+        "$HIHY_CERT_MANAGER_DIR/logs" "$HIHY_CERT_MANAGER_DIR/state" \
+        "$HIHY_SHARED_CERT_DIR/releases"
+    chmod 700 "$HIHY_CERT_MANAGER_DIR" "$HIHY_CERT_MANAGER_DIR/config" \
+        "$HIHY_CERT_MANAGER_DIR/credentials" "$HIHY_CERT_MANAGER_DIR/lego" \
+        "$HIHY_CERT_MANAGER_DIR/releases" "$HIHY_CERT_MANAGER_DIR/nodes" \
+        "$HIHY_CERT_MANAGER_DIR/logs" "$HIHY_CERT_MANAGER_DIR/state" \
+        "$HIHY_SHARED_CERT_DIR" "$HIHY_SHARED_CERT_DIR/releases"
+    chmod 755 "$HIHY_CERT_MANAGER_DIR/bin"
+}
+
+getCertificateManagerValue() {
+    local key="$1"
+    [ -f "$HIHY_CERT_MANAGER_CONFIG" ] || return 1
+    grep -E "^${key}=" "$HIHY_CERT_MANAGER_CONFIG" | head -n 1 | cut -d= -f2-
+}
+
+writeCertificateManagerConfig() {
+    local domain="$1"
+    local email="$2"
+    local temp_file
+
+    printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' || return 1
+    printf '%s' "$email" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || return 1
+    ensureCertificateManagerDirectories || return 1
+    temp_file=$(mktemp "$HIHY_CERT_MANAGER_DIR/config/.manager.conf.XXXXXX") || return 1
+    cat >"$temp_file" <<EOF
+mode=manager
+domain=${domain}
+wildcard=*.${domain}
+email=${email}
+provider=cloudflare
+renew_days=30
+EOF
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$HIHY_CERT_MANAGER_CONFIG"
+}
+
+certificateMatchesKey() {
+    local cert="$1"
+    local key="$2"
+    local cert_hash key_hash
+
+    openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+    cert_hash=$(openssl x509 -in "$cert" -pubkey -noout | openssl sha256)
+    key_hash=$(openssl pkey -in "$key" -pubout | openssl sha256)
+    [ "$cert_hash" = "$key_hash" ]
+}
+
+validateCertificateBundle() {
+    local cert="$1"
+    local key="$2"
+    local domain="$3"
+
+    [ -s "$cert" ] && [ -s "$key" ] || return 1
+    certificateMatchesKey "$cert" "$key" || return 1
+    openssl x509 -in "$cert" -checkend 86400 -noout >/dev/null 2>&1 || return 1
+    openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -Fq "DNS:*.${domain}" || return 1
+}
+
+installLego() {
+    local arch asset base_url temp_dir archive checksums expected actual
+
+    if [ -x "$HIHY_LEGO_BIN" ] && "$HIHY_LEGO_BIN" --version 2>/dev/null | grep -q "version ${HIHY_LEGO_VERSION}"; then
+        return 0
+    fi
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        aarch64 | arm64) arch="arm64" ;;
+        i386 | i686) arch="386" ;;
+        armv7*) arch="armv7" ;;
+        *) echoColor red "当前架构不支持自动安装 Lego。"; return 1 ;;
+    esac
+    ensureCertificateManagerDirectories || return 1
+    asset="lego_v${HIHY_LEGO_VERSION}_linux_${arch}.tar.gz"
+    base_url="https://github.com/go-acme/lego/releases/download/v${HIHY_LEGO_VERSION}"
+    temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.lego-install.XXXXXX") || return 1
+    archive="$temp_dir/$asset"
+    checksums="$temp_dir/checksums.txt"
+    if ! downloadToFile "$base_url/$asset" "$archive" || \
+        ! downloadToFile "$base_url/lego_${HIHY_LEGO_VERSION}_checksums.txt" "$checksums"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    expected=$(grep -E "[[:space:]]${asset}$" "$checksums" | awk '{print $1}' | head -n 1)
+    actual=$(sha256sum "$archive" | awk '{print $1}')
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        rm -rf "$temp_dir"
+        echoColor red "Lego SHA-256 校验失败。"
+        return 1
+    fi
+    tar -xzf "$archive" -C "$temp_dir" lego || { rm -rf "$temp_dir"; return 1; }
+    "$temp_dir/lego" --version 2>/dev/null | grep -q "version ${HIHY_LEGO_VERSION}" || { rm -rf "$temp_dir"; return 1; }
+    command install -m 755 "$temp_dir/lego" "$HIHY_LEGO_BIN"
+    rm -rf "$temp_dir"
+}
+
+verifyCloudflareToken() {
+    local token response
+    [ -s "$HIHY_CERT_TOKEN_FILE" ] || return 1
+    token=$(cat "$HIHY_CERT_TOKEN_FILE")
+    response=$(curl -fsS --connect-timeout 5 --max-time 15 \
+        -H "Authorization: Bearer ${token}" \
+        https://api.cloudflare.com/client/v4/user/tokens/verify 2>/dev/null) || return 1
+    printf '%s' "$response" | grep -q '"status":"active"'
+}
 
 installHihyLauncher() {
     local source_path="${1:-${BASH_SOURCE[0]}}"
@@ -49,9 +241,19 @@ installHihyLauncher() {
 downloadToFile() {
     local url="$1"
     local output_path="$2"
-    local tmp_path="${output_path}.tmp.$$"
+    local output_dir
+    local output_name
+    local tmp_path
 
-    rm -f "$tmp_path"
+    output_dir=$(dirname "$output_path")
+    output_name=$(basename "$output_path")
+    mkdir -p "$output_dir" || return 1
+    tmp_path=$(mktemp "${output_dir}/.${output_name}.tmp.XXXXXX") || return 1
+
+    if [ -L "$output_path" ]; then
+        rm -f "$tmp_path"
+        return 1
+    fi
 
     if command -v curl >/dev/null 2>&1; then
         if ! curl -fL \
@@ -75,7 +277,7 @@ downloadToFile() {
         return 1
     fi
 
-    mv "$tmp_path" "$output_path"
+    mv -f "$tmp_path" "$output_path"
 }
 
 startInstallValidationProcess() {
@@ -83,6 +285,7 @@ startInstallValidationProcess() {
     local debug_file="${2:-./hihy_debug.info}"
 
     /etc/hihy/bin/appS -c "$yaml_file" server >"$debug_file" 2>&1 &
+    printf '%s\n' "$!"
 }
 
 fetchRemoteBodyFromSources() {
@@ -142,10 +345,33 @@ getLatestHihyVersion() {
 }
 
 getLatestHysteriaVersion() {
-    local headers
+    local content version headers
 
-    headers=$(fetchRemoteHeadersFromSources "https://github.com/apernet/hysteria/releases/latest") || return 1
-    printf '%s\n' "$headers" | grep -i '^location:' | grep -o 'tag/[^[:space:]]*' | sed 's/tag\///;s/\r//;s/ //g' | head -n 1
+    content=$(fetchRemoteBodyFromSources "https://api.github.com/repos/HyNetworks/hysteria/releases/latest") || true
+    if [ -n "$content" ]; then
+        version=$(printf '%s' "$content" | yq -p=json -r '.tag_name // ""' 2>/dev/null)
+        if [ -n "$version" ] && [ "$version" != "null" ]; then
+            printf '%s\n' "$version"
+            return 0
+        fi
+    fi
+
+    headers=$(curl -fsSIL --connect-timeout "$HIHY_REMOTE_CONNECT_TIMEOUT" --max-time "$HIHY_REMOTE_MAX_TIME" \
+        "https://github.com/HyNetworks/hysteria/releases/latest" 2>/dev/null) || return 1
+    version=$(printf '%s\n' "$headers" | grep -i '^location:' | grep -o 'tag/[^[:space:]]*' \
+        | sed 's/tag\///;s/\r//;s/ //g' | tail -n 1)
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+getHysteriaReleaseAsset() {
+    local version="$1"
+    local asset_name="$2"
+    local field="$3"
+    local content
+
+    content=$(fetchRemoteBodyFromSources "https://api.github.com/repos/HyNetworks/hysteria/releases/tags/${version}") || return 1
+    printf '%s' "$content" | yq -p=json -r ".assets[] | select(.name == \"${asset_name}\") | .${field} // \"\"" 2>/dev/null | head -n 1
 }
 
 getLocalHysteriaVersion() {
@@ -197,6 +423,7 @@ core_status=${core_status}
 core_remote=${core_remote}
 EOF
     mv "$temp_file" "$state_file"
+    chmod 600 "$state_file"
 }
 
 acquireVersionCheckLock() {
@@ -217,6 +444,7 @@ acquireVersionCheckLock() {
 pid=${BASHPID:-$$}
 started_at=$(date +%s)
 EOF
+    chmod 600 "$lock_file"
 }
 
 releaseVersionCheckLock() {
@@ -648,33 +876,17 @@ getPortBindMsg() {
     pid=$(echo "$msg" | awk '{print $2}')
     name=$(echo "$msg" | awk '{print $9}')
     echoColor purple "Port: ${1}/${2} 已经被 ${command}(${name}) 占用,进程pid为: ${pid}."
-    echoColor green "是否自动关闭端口占用?(y/N)"
-    read -r bindP
-
-    if [ -z "$bindP" ] || [[ ! "$bindP" =~ ^[yY]$ ]]; then
-        echoColor red "由于端口被占用，退出安装。请手动关闭或者更换端口..."
-        if [ "$1" == "TCP" ] && [ "$2" == "80" ]; then
-            echoColor yellow "如果需求上无法关闭 ${1}/${2}端口，请使用其他证书获取方式"
+    if printf '%s' "$command" | grep -q '^appS$' && serviceIsActive; then
+        echoColor green "检测到端口由当前 Hysteria 服务占用，是否停止该服务?(y/N)"
+        read -r bindP
+        if [[ "$bindP" =~ ^[yY]$ ]] && serviceStop; then
+            sleep 2
+            return 0
         fi
-        exit
     fi
-
-    pkill -f "/etc/hihy/bin/appS"
-    echoColor purple "正在解绑..."
-    sleep 3
-
-    if [ "$1" == "TCP" ]; then
-        msg=$(lsof -i "${1}:${2}" | grep LISTEN)
-    else
-        msg=$(lsof -i "${1}:${2}")
-    fi
-
-    if [ -n "$msg" ]; then
-        echoColor red "端口占用关闭失败,强制杀死进程后进程重启,请查看是否存在守护进程..."
-        exit
-    else
-        echoColor green "端口解绑成功..."
-    fi
+    echoColor red "为避免误杀其他服务，脚本不会自动终止未知进程。请手动处理端口占用或更换端口。"
+    [ "$1" = "TCP" ] && [ "$2" = "80" ] && echoColor yellow "也可以改用 DNS 验证申请证书。"
+    return 1
 }
 
 generate_uuid() {
@@ -765,6 +977,7 @@ classifyInstallState() {
         "$root_dir/bin/appS"
         "$root_dir/conf/config.yaml"
         "$root_dir/conf/backup.yaml"
+        "$HIHY_SERVICE_FILE"
         "$service_primary"
         "$service_fallback"
         "$bin_link"
@@ -781,7 +994,7 @@ classifyInstallState() {
                 "$root_dir/bin/appS" | "$root_dir/conf/config.yaml" | "$root_dir/conf/backup.yaml")
                     has_core_assets="true"
                     ;;
-                "$service_primary" | "$service_fallback")
+                "$HIHY_SERVICE_FILE" | "$service_primary" | "$service_fallback")
                     has_service_assets="true"
                     ;;
             esac
@@ -814,6 +1027,7 @@ markInstallFailed() {
     failure_marker="$(getInstallFailureMarker)"
     mkdir -p "$(dirname "$failure_marker")"
     printf 'phase=%s\ndetails=%s\n' "$phase" "$details" >"$failure_marker"
+    chmod 600 "$failure_marker"
 }
 
 clearInstallFailureMarker() {
@@ -831,6 +1045,11 @@ recoverPartialInstallState() {
     local rc_local="${6:-$HIHY_RC_LOCAL}"
     local pid_file="${7:-$HIHY_PID_FILE}"
 
+    if [ -f "$HIHY_SERVICE_FILE" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now hihy.service >/dev/null 2>&1 || true
+        rm -f "$HIHY_SERVICE_FILE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
     rm -f "$service_primary" "$service_fallback" "$pid_file"
     rm -f "$root_dir/conf/config.yaml" "$root_dir/conf/backup.yaml"
     rm -f "$failure_marker"
@@ -1011,7 +1230,7 @@ setHysteriaConfig() {
     read -r certNum
     useAcme=false
     useLocalCert=false
-    yaml_file="/etc/hihy/conf/config.yaml"
+    yaml_file="$HIHY_CONFIG_FILE"
     if [ -f "${yaml_file}" ]; then
         rm -f ${yaml_file}
     fi
@@ -1340,7 +1559,7 @@ setHysteriaConfig() {
             else
                 echo -e "\n->您输入的端口:"$(echoColor red udp/${port})"\n"
             fi
-            if [ "${port}" -gt 65535 ]; then
+            if ! validate_port "${port}"; then
                 echoColor red "端口范围错误,请重新输入!"
                 continue
             fi
@@ -1357,6 +1576,7 @@ setHysteriaConfig() {
         echoColor green "\n->(3/13)是否使用端口跳跃(Port Hopping),推荐使用"
         echo -e "Tip: 长时间单端口 UDP 连接容易被运营商封锁/QoS/断流,启动此功能可以有效避免此问题."
         echo -e "更加详细介绍请参考: https://v2.hysteria.network/zh/docs/advanced/Port-Hopping/\n"
+        explainOfficialPortHopping
         echo -e "\033[32m选择是否启用:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、跳过\033[0m\033[32m\n\n输入序号:\033[0m"
         read -r portHoppingStatus
         if [ -z "${portHoppingStatus}" ] || [ "${portHoppingStatus}" == "1" ]; then
@@ -1369,7 +1589,7 @@ setHysteriaConfig() {
                 if [ -z "${portHoppingStart}" ]; then
                     portHoppingStart=47000
                 fi
-                if [ ${portHoppingStart} -gt 65535 ]; then
+                if ! validate_port "${portHoppingStart}"; then
                     echoColor red "\n->端口范围错误,请重新输入!"
                     continue
                 fi
@@ -1379,7 +1599,7 @@ setHysteriaConfig() {
                 if [ -z "${portHoppingEnd}" ]; then
                     portHoppingEnd=48000
                 fi
-                if [ ${portHoppingEnd} -gt 65535 ]; then
+                if ! validate_port "${portHoppingEnd}"; then
                     echoColor red "\n->端口范围错误,请重新输入!"
                     continue
                 fi
@@ -1706,7 +1926,14 @@ setHysteriaConfig() {
             addOrUpdateYaml "$yaml_file" "masquerade.type" "proxy"
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.url" "${masquerade_proxy}"
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.rewriteHost" "true"
-            addOrUpdateYaml "$yaml_file" "masquerade.proxy.insecure" "true"
+            echoColor green "是否跳过伪装上游 TLS 证书验证?"
+            echoColor yellow "1、不跳过，验证证书(推荐/默认)  2、跳过验证(仅自签或特殊上游)"
+            read -r masquerade_insecure_choice
+            if [ "$masquerade_insecure_choice" = "2" ]; then
+                addOrUpdateYaml "$yaml_file" "masquerade.proxy.insecure" "true" "bool"
+            else
+                addOrUpdateYaml "$yaml_file" "masquerade.proxy.insecure" "false" "bool"
+            fi
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.xForwarded" "${masquerade_xforwarded}"
             ;;
         "file")
@@ -1860,7 +2087,7 @@ setHysteriaConfig() {
     fi
     sysctl -p
     echo -e "\033[1;;35m\nTest config...\n\033[0m"
-    startInstallValidationProcess "${yaml_file}" "./hihy_debug.info"
+    validation_pid=$(startInstallValidationProcess "${yaml_file}" "./hihy_debug.info")
     if [ "${useAcme}" == "true" ]; then
         countdown 20
     else
@@ -1872,26 +2099,29 @@ setHysteriaConfig() {
             markInstallFailed "certificate" "failed to get a certificate with ACME"
             echoColor red "域名:${u_host},申请证书失败!请重新安装使用自签证书."
             rm /etc/hihy/conf/config.yaml
-            rm /etc/hihy/result/backup.yaml
+            rm -f "$HIHY_BACKUP_FILE"
             delHihyFirewallPort
             rm ./hihy_debug.info
             echoColor yellow "当前安装处于未完成状态，可修正问题后重新执行安装，或执行卸载进行清理。"
-            exit
+            wait "$validation_pid" 2>/dev/null || true
+            return 1
             ;;
         *"bind: address already in use"*)
             markInstallFailed "port-bind" "bind: address already in use"
             rm /etc/hihy/conf/config.yaml
-            rm /etc/hihy/result/backup.yaml
+            rm -f "$HIHY_BACKUP_FILE"
             delHihyFirewallPort
             echoColor red "端口被占用,请更换端口!"
             rm ./hihy_debug.info
             echoColor yellow "当前安装处于未完成状态，可更换端口后重新执行安装，或执行卸载进行清理。"
-            exit
+            wait "$validation_pid" 2>/dev/null || true
+            return 1
             ;;
         *"server up and running"*)
             echoColor green "Test success!"
             echoColor purple "Stop test program..."
-            pkill -f "/etc/hihy/bin/appS"
+            kill "$validation_pid" 2>/dev/null || true
+            wait "$validation_pid" 2>/dev/null || true
             rm ./hihy_debug.info
             if [ "${realmMode}" != "true" ]; then
                 allowPort udp ${port}
@@ -1910,18 +2140,19 @@ setHysteriaConfig() {
             if ! command -v pkill >/dev/null 2>&1; then
                 apk add --no-cache procps
             fi
-            pkill -f "/etc/hihy/bin/appS"
+            kill "$validation_pid" 2>/dev/null || true
+            wait "$validation_pid" 2>/dev/null || true
             echoColor red "未知错误: 请查看下方错误信息,并提交issue到github"
             echoColor yellow "已保留未完成安装状态，修正问题后可重新执行安装，或执行卸载进行清理。"
             cat ./hihy_debug.info
             rm ./hihy_debug.info
-            exit
+            return 1
             ;;
     esac
     if [ -f "/etc/hihy/conf/backup.yaml" ]; then
         rm /etc/hihy/conf/backup.yaml
     fi
-    backup_file="/etc/hihy/conf/backup.yaml"
+    backup_file="$HIHY_BACKUP_FILE"
     touch ${backup_file}
     addOrUpdateYaml ${backup_file} "remarks" "${remarks}"
     addOrUpdateYaml ${backup_file} "serverAddress" "${u_host}" "string"
@@ -1958,18 +2189,18 @@ setHysteriaConfig() {
     else
         addOrUpdateYaml ${backup_file} "insecure" "false"
     fi
+    secureHihyPermissions
     if ! installHihyLauncher; then
         markInstallFailed "launcher" "failed to install hihy launcher"
         echoColor red "hihy 命令安装失败,请检查网络或写入权限后重试."
         exit 1
     fi
-    clearInstallFailureMarker
     echoColor greenWhite "安装成功,请查看下方配置详细信息"
 }
 
 downloadHysteriaCore() {
-    local version
-    version=$(getLatestHysteriaVersion)
+    local version="${1:-}"
+    [ -n "$version" ] || version=$(getLatestHysteriaVersion || true)
 
     echo -e "The Latest hysteria version: $(echoColor red "${version}")\nDownload..."
 
@@ -1981,27 +2212,28 @@ downloadHysteriaCore() {
     local arch
     arch=$(uname -m)
 
-    local url_base="https://github.com/apernet/hysteria/releases/download/${version}/hysteria-linux-"
+    local asset_name=""
     local download_url=""
+    local expected_digest=""
 
     case "$arch" in
         "x86_64")
-            download_url="${url_base}amd64"
+            asset_name="hysteria-linux-amd64"
             ;;
         "aarch64")
-            download_url="${url_base}arm64"
+            asset_name="hysteria-linux-arm64"
             ;;
         "mips64")
-            download_url="${url_base}mipsle"
+            asset_name="hysteria-linux-mipsle"
             ;;
         "s390x")
-            download_url="${url_base}s390x"
+            asset_name="hysteria-linux-s390x"
             ;;
         "i686" | "i386")
-            download_url="${url_base}386"
+            asset_name="hysteria-linux-386"
             ;;
         "loongarch64")
-            download_url="${url_base}loong64"
+            asset_name="hysteria-linux-loong64"
             ;;
         *)
             echoColor yellowBlack "Error[OS Message]:${arch}\nPlease open an issue at ${HIHY_REPO_URL}/issues !"
@@ -2009,14 +2241,40 @@ downloadHysteriaCore() {
             ;;
     esac
 
-    mkdir -p /etc/hihy/bin
-
-    if ! downloadToFile "$download_url" "/etc/hihy/bin/appS"; then
-        echoColor red "Network Error: Can't download Hysteria core!"
-        exit 1
+    download_url=$(getHysteriaReleaseAsset "$version" "$asset_name" "browser_download_url" || true)
+    expected_digest=$(getHysteriaReleaseAsset "$version" "$asset_name" "digest" || true)
+    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        download_url="https://github.com/HyNetworks/hysteria/releases/download/${version}/${asset_name}"
     fi
 
-    chmod 755 /etc/hihy/bin/appS
+    local staged_core="$HIHY_ROOT_DIR/bin/appS.new"
+    mkdir -p "$HIHY_ROOT_DIR/bin"
+
+    if ! downloadToFile "$download_url" "$staged_core"; then
+        echoColor red "Network Error: Can't download Hysteria core!"
+        return 1
+    fi
+
+    if [ -n "$expected_digest" ] && [ "$expected_digest" != "null" ]; then
+        local actual_digest
+        actual_digest="sha256:$(sha256sum "$staged_core" | awk '{print $1}')"
+        if [ "$actual_digest" != "$expected_digest" ]; then
+            rm -f "$staged_core"
+            echoColor red "Hysteria Core SHA-256 校验失败。"
+            return 1
+        fi
+    fi
+
+    chmod 755 "$staged_core"
+    local downloaded_version
+    downloaded_version=$("$staged_core" version 2>/dev/null | grep '^Version:' | awk '{print $2}' | head -n 1)
+    if [ "app/${downloaded_version}" != "$version" ]; then
+        rm -f "$staged_core"
+        echoColor red "下载的 Hysteria Core 版本校验失败。"
+        return 1
+    fi
+    mv -f "$staged_core" "$HIHY_ROOT_DIR/bin/appS"
+    chmod 755 "$HIHY_ROOT_DIR/bin/appS"
     echoColor purple "\nDownload completed."
 }
 
@@ -2027,28 +2285,28 @@ updateHysteriaCore() {
         remoteV=$(getLatestHysteriaVersion || true)
         echo -e "Local core version: $(echoColor red "${localV}")"
         echo -e "Remote core version: $(echoColor red "${remoteV}")"
-        if [ "${localV}" = "${remoteV}" ]; then
+        if [ -z "$remoteV" ]; then
+            echoColor red "无法获取远程 Hysteria Core 版本，请检查 GitHub API 或网络连接。"
+            return 1
+        elif [ "${localV}" = "${remoteV}" ]; then
             echoColor green "Already the latest version. Ignore."
         else
-            if [ -f "/etc/rc.d/hihy" ] || [ -f "/etc/init.d/hihy" ]; then
-                if [ -f "/etc/rc.d/hihy" ]; then
-                    msg=$(/etc/rc.d/hihy status)
-                else
-                    msg=$(/etc/init.d/hihy status)
-                fi
-                if [ "${msg}" == "hihy is running" ]; then
-                    stop
-                    downloadHysteriaCore
-                    start
-                    # 清除版本检查缓存，确保下次运行重新检查（避免显示过时的"有新版本"通知）
-                    rm -f "$HIHY_VERSION_STATUS_FILE"
-                else
-                    echoColor red "hysteria未运行"
-                fi
-
-            else
-                echoColor red "未找到启动脚本!"
+            local was_running="false"
+            local rollback_core="$HIHY_ROOT_DIR/bin/appS.rollback"
+            serviceIsActive && was_running="true"
+            cp -a "$HIHY_ROOT_DIR/bin/appS" "$rollback_core" || return 1
+            if ! downloadHysteriaCore "$remoteV"; then
+                rm -f "$rollback_core"
+                return 1
             fi
+            if [ "$was_running" = "true" ] && ! serviceRestart; then
+                mv -f "$rollback_core" "$HIHY_ROOT_DIR/bin/appS"
+                serviceRestart >/dev/null 2>&1 || true
+                echoColor red "新 Core 启动失败，已恢复旧版本。"
+                return 1
+            fi
+            rm -f "$rollback_core"
+            rm -f "$HIHY_VERSION_STATUS_FILE"
             echoColor green "Hysteria Core update done."
         fi
     else
@@ -2092,6 +2350,11 @@ hihyUpdate() {
     fi
 
     chmod 755 "$tmp_file"
+    if ! validateDownloadedShell "$tmp_file"; then
+        rm -f "$tmp_file"
+        echoColor red "下载的 hihy 脚本校验失败，保留当前版本。"
+        exit 1
+    fi
     mv "$tmp_file" "$HIHY_BIN_LINK"
 
     rm -f "$HIHY_VERSION_STATUS_FILE"
@@ -2132,6 +2395,482 @@ EOF
     fi
 }
 
+detectServiceManager() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        echo "systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        echo "openrc"
+    else
+        echo "legacy"
+    fi
+}
+
+writeSystemdService() {
+    local start_cmd_prefix
+    local exec_start
+    local temp_file
+    local backup_file=""
+
+    start_cmd_prefix=$(getStartCommand)
+    if [ -n "$start_cmd_prefix" ]; then
+        if [ "${start_cmd_prefix%% *}" = "chrt" ]; then
+            start_cmd_prefix="$(command -v chrt)${start_cmd_prefix#chrt}"
+        fi
+        exec_start="$start_cmd_prefix $HIHY_ROOT_DIR/bin/appS --log-level info -c $HIHY_CONFIG_FILE server"
+    else
+        exec_start="$HIHY_ROOT_DIR/bin/appS --log-level info -c $HIHY_CONFIG_FILE server"
+    fi
+
+    temp_file=$(mktemp "${HIHY_SERVICE_FILE}.tmp.XXXXXX") || return 1
+    cat >"$temp_file" <<EOF
+[Unit]
+Description=Hysteria 2 Server managed by Hi_Hysteria
+Documentation=${HIHY_REPO_URL}
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=${exec_start}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$temp_file"
+    if [ -f "$HIHY_SERVICE_FILE" ]; then
+        backup_file=$(mktemp "${HIHY_SERVICE_FILE}.backup.XXXXXX") || return 1
+        cp -a "$HIHY_SERVICE_FILE" "$backup_file" || return 1
+    fi
+    mv -f "$temp_file" "$HIHY_SERVICE_FILE"
+    if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze verify "$HIHY_SERVICE_FILE" >/dev/null 2>&1; then
+        if [ -n "$backup_file" ]; then
+            mv -f "$backup_file" "$HIHY_SERVICE_FILE"
+        else
+            rm -f "$HIHY_SERVICE_FILE"
+        fi
+        return 1
+    fi
+    [ -n "$backup_file" ] && rm -f "$backup_file"
+}
+
+writeOpenRcService() {
+    cat >"$HIHY_INIT_SERVICE" <<EOF
+#!/sbin/openrc-run
+
+name="hihy"
+description="Hysteria 2 Server managed by Hi_Hysteria"
+command="${HIHY_ROOT_DIR}/bin/appS"
+command_args="--log-level info -c ${HIHY_CONFIG_FILE} server"
+command_background="yes"
+pidfile="${HIHY_PID_FILE}"
+output_log="${HIHY_LOG_FILE}"
+error_log="${HIHY_LOG_FILE}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0700 "${HIHY_ROOT_DIR}/logs"
+    checkpath --file --owner root:root --mode 0600 "${HIHY_LOG_FILE}"
+}
+EOF
+    chmod 755 "$HIHY_INIT_SERVICE"
+}
+
+writeLegacyService() {
+    local start_cmd_prefix
+    start_cmd_prefix=$(getStartCommand)
+    mkdir -p "$(dirname "$HIHY_LEGACY_SERVICE")"
+
+    cat >"$HIHY_LEGACY_SERVICE" <<EOF
+#!/bin/sh
+HIHY_PATH="${HIHY_ROOT_DIR}"
+PID_FILE="${HIHY_PID_FILE}"
+LOG_FILE="${HIHY_LOG_FILE}"
+START_CMD_PREFIX="${start_cmd_prefix}"
+
+start() {
+    if [ -f "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null; then
+        echo "hihy is already running"
+        return 0
+    fi
+    rm -f "\$PID_FILE"
+    if [ -n "\$START_CMD_PREFIX" ]; then
+        nohup \$START_CMD_PREFIX "\$HIHY_PATH/bin/appS" --log-level info -c "\$HIHY_PATH/conf/config.yaml" server >"\$LOG_FILE" 2>&1 &
+    else
+        nohup "\$HIHY_PATH/bin/appS" --log-level info -c "\$HIHY_PATH/conf/config.yaml" server >"\$LOG_FILE" 2>&1 &
+    fi
+    echo \$! >"\$PID_FILE"
+}
+
+stop() {
+    [ -f "\$PID_FILE" ] || return 0
+    pid=\$(cat "\$PID_FILE")
+    if kill -0 "\$pid" 2>/dev/null; then
+        kill "\$pid"
+    fi
+    rm -f "\$PID_FILE"
+}
+
+status() {
+    if [ -f "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null; then
+        echo "hihy is running"
+        return 0
+    fi
+    echo "hihy is not running"
+    return 3
+}
+
+case "\$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 2; start ;;
+    status) status ;;
+    log) tail -f "\$LOG_FILE" ;;
+    *) echo "Usage: \$0 {start|stop|restart|status|log}"; exit 1 ;;
+esac
+EOF
+    chmod 755 "$HIHY_LEGACY_SERVICE"
+    if [ -d "$(dirname "$HIHY_INIT_SERVICE")" ]; then
+        ln -sf "$HIHY_LEGACY_SERVICE" "$HIHY_INIT_SERVICE"
+    fi
+    if [ ! -f "$HIHY_RC_LOCAL" ]; then
+        printf '#!/bin/bash\n' >"$HIHY_RC_LOCAL"
+        chmod 755 "$HIHY_RC_LOCAL"
+    fi
+    if ! grep -qF "$HIHY_LEGACY_SERVICE start" "$HIHY_RC_LOCAL"; then
+        printf '%s start\n' "$HIHY_LEGACY_SERVICE" >>"$HIHY_RC_LOCAL"
+    fi
+}
+
+installHihyService() {
+    local manager
+    manager=$(detectServiceManager)
+
+    case "$manager" in
+        systemd)
+            writeSystemdService || return 1
+            systemctl daemon-reload || return 1
+            systemctl enable hihy.service >/dev/null 2>&1 || return 1
+            systemctl restart hihy.service || return 1
+            systemctl is-active --quiet hihy.service || return 1
+            ;;
+        openrc)
+            writeOpenRcService || return 1
+            rc-update add hihy default >/dev/null 2>&1 || return 1
+            rc-service hihy restart >/dev/null 2>&1 || rc-service hihy start || return 1
+            ;;
+        *)
+            writeLegacyService || return 1
+            "$HIHY_LEGACY_SERVICE" restart || return 1
+            ;;
+    esac
+}
+
+serviceStart() {
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = "systemd" ]; then
+        systemctl start hihy.service
+    elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
+        rc-service hihy start
+    else
+        "$HIHY_LEGACY_SERVICE" start
+    fi
+}
+
+serviceStop() {
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = "systemd" ]; then
+        systemctl stop hihy.service
+    elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
+        rc-service hihy stop
+    else
+        "$HIHY_LEGACY_SERVICE" stop
+    fi
+}
+
+serviceRestart() {
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = "systemd" ]; then
+        systemctl restart hihy.service
+    elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
+        rc-service hihy restart
+    else
+        "$HIHY_LEGACY_SERVICE" restart
+    fi
+}
+
+serviceIsActive() {
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = "systemd" ]; then
+        systemctl is-active --quiet hihy.service
+    elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
+        rc-service hihy status >/dev/null 2>&1
+    else
+        "$HIHY_LEGACY_SERVICE" status >/dev/null 2>&1
+    fi
+}
+
+migrateLegacyService() {
+    local was_running="false"
+    local backup_dir
+    local had_init_service="false"
+
+    [ "$(detectServiceManager)" = "systemd" ] || return 1
+    [ -f "$HIHY_LEGACY_SERVICE" ] || return 0
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ ! -e "$HIHY_INIT_SERVICE" ] && [ ! -L "$HIHY_INIT_SERVICE" ] && systemctl is-active --quiet hihy.service; then
+        return 0
+    fi
+
+    "$HIHY_LEGACY_SERVICE" status >/dev/null 2>&1 && was_running="true"
+    backup_dir=$(mktemp -d "$HIHY_ROOT_DIR/result/service-migration.XXXXXX") || return 1
+    cp -a "$HIHY_LEGACY_SERVICE" "$backup_dir/hihy.legacy" || return 1
+    [ -f "$HIHY_RC_LOCAL" ] && cp -a "$HIHY_RC_LOCAL" "$backup_dir/rc.local"
+    if [ -e "$HIHY_INIT_SERVICE" ] || [ -L "$HIHY_INIT_SERVICE" ]; then
+        cp -a "$HIHY_INIT_SERVICE" "$backup_dir/hihy.init" || return 1
+        rm -f "$HIHY_INIT_SERVICE"
+        had_init_service="true"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if ! writeSystemdService; then
+        echoColor red "systemd unit 生成或校验失败。"
+        rm -f "$HIHY_SERVICE_FILE"
+        [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! systemctl daemon-reload || ! systemctl enable hihy.service >/dev/null 2>&1; then
+        echoColor red "systemd unit 加载或启用失败。"
+        rm -f "$HIHY_SERVICE_FILE"
+        [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    "$HIHY_LEGACY_SERVICE" stop >/dev/null 2>&1 || true
+    if ! systemctl start hihy.service || ! systemctl is-active --quiet hihy.service; then
+        systemctl disable --now hihy.service >/dev/null 2>&1 || true
+        rm -f "$HIHY_SERVICE_FILE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        cp -a "$backup_dir/hihy.legacy" "$HIHY_LEGACY_SERVICE"
+        [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
+        [ -f "$backup_dir/rc.local" ] && cp -a "$backup_dir/rc.local" "$HIHY_RC_LOCAL"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        [ "$was_running" = "true" ] && "$HIHY_LEGACY_SERVICE" start >/dev/null 2>&1
+        return 1
+    fi
+
+    if [ -f "$HIHY_RC_LOCAL" ]; then
+        sed -i "\|${HIHY_LEGACY_SERVICE} start|d" "$HIHY_RC_LOCAL"
+    fi
+    rm -f "$HIHY_INIT_SERVICE"
+    cat >"$HIHY_LEGACY_SERVICE" <<EOF
+#!/bin/sh
+case "\$1" in
+    start|stop|restart|status) systemctl "\$1" hihy.service ;;
+    log) journalctl -u hihy.service -f ;;
+    *) echo "Usage: \$0 {start|stop|restart|status|log}"; exit 1 ;;
+esac
+EOF
+    chmod 755 "$HIHY_LEGACY_SERVICE"
+    printf 'manager=systemd\nmigrated_at=%s\nbackup_dir=%s\n' "$(date +%s)" "$backup_dir" >"$HIHY_MIGRATION_STATE_FILE"
+    chmod 600 "$HIHY_MIGRATION_STATE_FILE"
+}
+
+promptLegacyServiceMigration() {
+    [ "$(detectServiceManager)" = "systemd" ] || return 0
+    [ ! -f "$HIHY_SERVICE_FILE" ] || return 0
+    [ -f "$HIHY_LEGACY_SERVICE" ] || return 0
+    [ -f "$HIHY_ROOT_DIR/result/service-migration.dismissed" ] && return 0
+
+    echoColor yellow "检测到旧版 rc.local/SysV 启动方式，建议迁移到原生 systemd。"
+    echoColor yellow "迁移会先验证新服务，失败时自动恢复旧启动方式。"
+    echoColor yellow "1) 现在迁移  2) 暂不迁移  3) 不再提示"
+    read -r migration_choice
+    case "$migration_choice" in
+        1)
+            if migrateLegacyService; then
+                echoColor green "已迁移到原生 systemd。"
+            else
+                echoColor red "迁移失败，已保留或恢复旧启动方式。"
+            fi
+            ;;
+        3)
+            ensureHihyDirectories
+            touch "$HIHY_ROOT_DIR/result/service-migration.dismissed"
+            chmod 600 "$HIHY_ROOT_DIR/result/service-migration.dismissed"
+            ;;
+    esac
+}
+
+installCronTask() {
+    local temp_file
+    command -v crontab >/dev/null 2>&1 || return 1
+    temp_file=$(mktemp) || return 1
+    crontab -l 2>/dev/null >"$temp_file" || true
+    sed -i '/# hihy-managed: weekly-log-truncate/d;/[[:space:]]hihy cronTask[[:space:]]*$/d;/\/usr\/bin\/hihy cronTask[[:space:]]*$/d' "$temp_file"
+    if [ "$(detectServiceManager)" != "systemd" ]; then
+        printf '%s\n' '# hihy-managed: weekly-log-truncate' >>"$temp_file"
+        printf '%s\n' '15 4 * * 1 /usr/bin/hihy cronTask' >>"$temp_file"
+    fi
+    crontab "$temp_file"
+    local result=$?
+    rm -f "$temp_file"
+    return "$result"
+}
+
+removeCronTask() {
+    local temp_file
+    command -v crontab >/dev/null 2>&1 || return 0
+    temp_file=$(mktemp) || return 1
+    crontab -l 2>/dev/null >"$temp_file" || true
+    sed -i '/# hihy-managed: weekly-log-truncate/d;/[[:space:]]hihy cronTask[[:space:]]*$/d;/\/usr\/bin\/hihy cronTask[[:space:]]*$/d' "$temp_file"
+    crontab "$temp_file"
+    local result=$?
+    rm -f "$temp_file"
+    return "$result"
+}
+
+detectFirewallBackend() {
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        echo "firewalld"
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        echo "ufw"
+    elif command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+        echo "nft"
+    elif command -v iptables >/dev/null 2>&1; then
+        echo "iptables"
+    else
+        echo "none"
+    fi
+}
+
+recordOwnedFirewallRule() {
+    local backend="$1"
+    local protocol="$2"
+    local port="$3"
+    ensureHihyDirectories || return 1
+    touch "$HIHY_FIREWALL_STATE_FILE"
+    chmod 600 "$HIHY_FIREWALL_STATE_FILE"
+    if ! grep -qF "backend=${backend}|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE"; then
+        printf 'backend=%s|protocol=%s|port=%s\n' "$backend" "$protocol" "$port" >>"$HIHY_FIREWALL_STATE_FILE"
+    fi
+}
+
+firewallRuleExists() {
+    local backend="$1"
+    local protocol="$2"
+    local port="$3"
+    local zone
+
+    case "$backend" in
+        ufw) ufw status | grep -Eq "(^|[[:space:]])${port}/${protocol}([[:space:]]|$)" ;;
+        firewalld)
+            zone=$(firewall-cmd --get-default-zone)
+            firewall-cmd --zone="$zone" --query-port="${port}/${protocol}" --permanent >/dev/null 2>&1
+            ;;
+        iptables) iptables -w 5 -C INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+allowPort() {
+    local protocol="$1"
+    local port="$2"
+    local backend
+    local zone
+
+    validate_protocol "$protocol" || return 1
+    if [[ "$port" == *:* ]]; then
+        validate_port_range "${port%%:*}" "${port##*:}" || return 1
+    else
+        validate_port "$port" || return 1
+    fi
+
+    backend=$(detectFirewallBackend)
+    if [ "$backend" = "none" ]; then
+        echoColor yellow "未检测到活动防火墙，请在云安全组中开放 ${port}/${protocol}。"
+        return 0
+    fi
+
+    if firewallRuleExists "$backend" "$protocol" "$port"; then
+        echoColor purple "防火墙规则已存在，不会在卸载时删除: ${port}/${protocol}"
+        return 0
+    fi
+
+    case "$backend" in
+        ufw) ufw allow "${port}/${protocol}" >/dev/null || return 1 ;;
+        firewalld)
+            zone=$(firewall-cmd --get-default-zone)
+            firewall-cmd --zone="$zone" --add-port="${port}/${protocol}" --permanent >/dev/null || return 1
+            firewall-cmd --reload >/dev/null || return 1
+            ;;
+        iptables)
+            iptables -w 5 -I INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT || return 1
+            command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+            ;;
+        nft)
+            echoColor yellow "检测到原生 nftables，但没有活动 UFW/firewalld。为避免覆盖全局规则，请手动开放 ${port}/${protocol}。"
+            return 0
+            ;;
+    esac
+    recordOwnedFirewallRule "$backend" "$protocol" "$port"
+    echoColor purple "已自动开放: ${port}/${protocol} (${backend})"
+}
+
+removeOwnedFirewallRules() {
+    local line backend protocol port zone
+    [ -f "$HIHY_FIREWALL_STATE_FILE" ] || return 0
+
+    while IFS= read -r line; do
+        backend=$(printf '%s' "$line" | cut -d'|' -f1 | cut -d= -f2)
+        protocol=$(printf '%s' "$line" | cut -d'|' -f2 | cut -d= -f2)
+        port=$(printf '%s' "$line" | cut -d'|' -f3 | cut -d= -f2)
+        validate_protocol "$protocol" || continue
+        case "$backend" in
+            ufw) ufw delete allow "${port}/${protocol}" >/dev/null 2>&1 || true ;;
+            firewalld)
+                zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
+                firewall-cmd --zone="$zone" --remove-port="${port}/${protocol}" --permanent >/dev/null 2>&1 || true
+                ;;
+            iptables)
+                while iptables -w 5 -C INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT >/dev/null 2>&1; do
+                    iptables -w 5 -D INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT || break
+                done
+                ;;
+        esac
+    done <"$HIHY_FIREWALL_STATE_FILE"
+    command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+    rm -f "$HIHY_FIREWALL_STATE_FILE"
+}
+
+explainOfficialPortHopping() {
+    echoColor purple "Hysteria 2 官方端口跳跃原理:"
+    echoColor yellow "- 客户端定期在端口范围内随机切换 UDP 端口。"
+    echoColor yellow "- 服务端使用 listen 范围，由 Hysteria 自动创建 nftables/iptables 重定向规则。"
+    echoColor yellow "- Hysteria 停止时会自动清理其重定向规则。"
+    echoColor yellow "- 本脚本只负责开放本机防火墙端口范围，不清空或覆盖系统规则。"
+    echoColor yellow "- 云厂商安全组仍需单独开放相同 UDP 范围。"
+}
+
+verifyOfficialPortHopping() {
+    local start_port="$1"
+    local end_port="$2"
+    if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -Eq "udp dport ${start_port}-${end_port}"; then
+        return 0
+    fi
+    if command -v iptables-save >/dev/null 2>&1 && iptables-save -t nat 2>/dev/null | grep -Eq -- "--dports? ${start_port}:${end_port}|--dport ${start_port}:${end_port}"; then
+        return 0
+    fi
+    return 1
+}
+
 uninstall_rc_local_for_arch() {
     # 检测是否为 Arch Linux
     if grep -q "Arch Linux" /etc/os-release; then
@@ -2170,7 +2909,7 @@ install() {
     fi
 
     # 创建必要目录
-    mkdir -p /etc/hihy/{bin,conf,cert,result,logs}
+    ensureHihyDirectories
     markInstallFailed "install-start" "installation started but not completed"
     echoColor purple "Ready to install.\n"
 
@@ -2180,182 +2919,25 @@ install() {
     downloadHysteriaCore
     setHysteriaConfig
 
-    # 获取启动命令前缀
-    local start_cmd_prefix=$(getStartCommand)
-
-    if [ -f "/etc/alpine-release" ]; then
-        # 使用 OpenRC
-        cat >/etc/init.d/hihy <<EOF
-#!/sbin/openrc-run
-
-name="hihy"
-description="Hysteria Proxy Service"
-supervisor="supervise-daemon"
-command="${start_cmd_prefix} /etc/hihy/bin/appS"
-command_args="--log-level info -c /etc/hihy/conf/config.yaml server"
-command_background="yes"
-pidfile="/var/run/hihy.pid"
-output_log="/etc/hihy/logs/hihy.log"
-error_log="/etc/hihy/logs/hihy.log"
-
-extra_started_commands="log status"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    checkpath --directory --owner root:root --mode 0755 /etc/hihy/logs
-}
-
-start() {
-    if [ -f "\$pidfile" ] && kill -0 \$(cat "\$pidfile") 2>/dev/null; then
-        eerror "hihy is already running"
+    if ! installHihyService; then
+        markInstallFailed "service" "failed to install or start service"
+        echoColor red "服务安装或启动失败。"
         return 1
     fi
 
-    ebegin "Starting hihy"
-    mkdir -p \$(dirname "\$output_log")
-    nohup \$command \$command_args > "\$output_log" 2>&1 &
-    echo \$! > "\$pidfile"
-    eend \$?
-}
-
-stop() {
-    if [ ! -f "\$pidfile" ]; then
-        eerror "hihy is not running"
-        return 1
-    fi
-
-    ebegin "Stopping hihy"
-    kill \$(cat "\$pidfile")
-    rm -f "\$pidfile"
-    eend \$?
-}
-
-restart() {
-    stop
-    sleep 2
-    if [ -f "\$pidfile" ]; then
-        eerror "Failed to stop hihy"
-        return 1
-    fi
-    start
-}
-
-status() {
-    if [ -f "\$pidfile" ] && kill -0 \$(cat "\$pidfile") 2>/dev/null; then
-        einfo "hihy is running"
-    else
-        einfo "hihy is not running"
-    fi
-}
-
-log() {
-    tail -f "\$output_log"
-}
-EOF
-        chmod +x /etc/init.d/hihy
-        rc-update add hihy default
-        rc-service hihy start
-
-    else
-        # 使用传统启动脚本
-        mkdir -p /etc/rc.d
-        cat >/etc/rc.d/hihy <<EOF
-#!/bin/sh
-
-HIHY_PATH="/etc/hihy"
-PID_FILE="/var/run/hihy.pid"
-LOG_FILE="\$HIHY_PATH/logs/hihy.log"
-START_CMD_PREFIX="${start_cmd_prefix}"
-
-start() {
-    if [ -f "\$PID_FILE" ] && kill -0 \$(cat "\$PID_FILE") 2>/dev/null; then
-        echo "hihy is already running"
-        return 1
-    fi
-
-    echo "Starting hihy..."
-    if [ -n "\$START_CMD_PREFIX" ]; then
-        nohup \$START_CMD_PREFIX \$HIHY_PATH/bin/appS --log-level info -c \$HIHY_PATH/conf/config.yaml server > "\$LOG_FILE" 2>&1 &
-    else
-        nohup \$HIHY_PATH/bin/appS --log-level info -c \$HIHY_PATH/conf/config.yaml server > "\$LOG_FILE" 2>&1 &
-    fi
-    echo \$! > "\$PID_FILE"
-}
-
-stop() {
-    if [ ! -f "\$PID_FILE" ]; then
-        echo "hihy is not running"
-        return 1
-    fi
-
-    echo "Stopping hihy..."
-    kill \$(cat "\$PID_FILE")
-    rm -f "\$PID_FILE"
-}
-
-restart() {
-    stop
-    sleep 2
-    if [ -f "\$PID_FILE" ]; then
-        echo "Failed to stop hihy"
-        return 1
-    fi
-    start
-}
-
-status() {
-    if [ -f "\$PID_FILE" ] && kill -0 \$(cat "\$PID_FILE") 2>/dev/null; then
-        echo "hihy is running"
-    else
-        echo "hihy is not running"
-    fi
-}
-
-log() {
-    tail -f "\$LOG_FILE"
-}
-
-case "\$1" in
-    start|stop|restart|status|log)
-        \$1
-        ;;
-    *)
-        echo "Usage: \$0 {start|stop|restart|status|log}"
-        exit 1
-        ;;
-esac
-EOF
-        chmod +x /etc/rc.d/hihy
-
-        # 尝试添加到现有的启动配置
-        if [ -d "/etc/init.d" ]; then
-            ln -sf /etc/rc.d/hihy /etc/init.d/hihy
+    if [ "${portHoppingStatus}" = "true" ]; then
+        if verifyOfficialPortHopping "$portHoppingStart" "$portHoppingEnd"; then
+            echoColor green "已检测到 Hysteria 官方端口范围重定向规则。"
+        else
+            echoColor yellow "服务已启动，但暂未检测到官方端口范围重定向规则。请检查 nft/iptables、服务日志和云安全组。"
         fi
-
-        if [ ! -f "/etc/rc.local" ]; then
-            touch /etc/rc.local
-            echo "#!/bin/bash" >/etc/rc.local
-            chmod +x /etc/rc.local
-        fi
-        if ! grep -q "/etc/rc.d/hihy start" /etc/rc.local; then
-            echo "/etc/rc.d/hihy start" >>/etc/rc.local
-        fi
-        # 启动服务
-        /etc/rc.d/hihy start
     fi
 
-    # 添加定时任务
-    crontab -l >./crontab.tmp 2>/dev/null || touch ./crontab.tmp
-    echo "15 4 * * 1 hihy cronTask" >>./crontab.tmp
-    crontab ./crontab.tmp
-    rm ./crontab.tmp
-    setup_rc_local_for_arch
+    installCronTask || echoColor yellow "定时日志清理任务安装失败，可稍后重试。"
 
     generate_client_config
+    secureHihyPermissions
+    clearInstallFailureMarker
     echoColor yellowBlack "安装完毕"
 }
 
@@ -2394,7 +2976,9 @@ checkFirewalldAllowPort() {
     fi
 }
 
-allowPort() {
+legacyAllowPortUnsafe() {
+    echoColor red "旧版防火墙实现已禁用，拒绝执行可能覆盖全局规则的操作。"
+    return 1
     # 如果防火墙启动状态则添加相应的开放端口
     # $1 tcp/udp
     # $2 port
@@ -2511,161 +3095,19 @@ EOF
 }
 
 addPortHoppingNat() {
-    # $1 portHoppingStart
-    # $2 portHoppingEnd
-    # $3 portHoppingTarget
-
-    # 检查必需命令
-    if ! command -v iptables >/dev/null 2>&1; then
-        echoColor red "未找到 iptables,请先安装"
-        return 1
-    fi
-    iptables -t nat -A PREROUTING -p udp --dport $1:$2 -m comment --comment "NAT $1:$2 to $3 (PortHopping-hihysteria)" -j DNAT --to-destination :$3
-    ip6tables -t nat -A PREROUTING -p udp --dport $1:$2 -m comment --comment "NAT $1:$2 to $3 (PortHopping-hihysteria)" -j DNAT --to-destination :$3
-    if [ -f "/etc/alpine-release" ]; then
-        # Alpine Linux: 使用 OpenRC
-        # 确保加载必要模块
-        modprobe ip_tables
-        modprobe ip6_tables
-        modprobe iptable_nat
-        modprobe ip6table_nat
-
-        # 创建并初始化 iptables 规则目录
-        mkdir -p /etc/iptables
-
-        # 创建基础规则
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -F
-
-        ip6tables -P INPUT ACCEPT
-        ip6tables -P FORWARD ACCEPT
-        ip6tables -P OUTPUT ACCEPT
-        ip6tables -F
-
-        # 保存规则
-        /etc/init.d/iptables save
-        /etc/init.d/ip6tables save
-
-        # 启动 iptables 服务
-        rc-service iptables start
-        rc-service ip6tables start
-
-        # 确保服务开机启动
-        rc-update add iptables default
-        rc-update add ip6tables default
-
-        # 创建 port-hopping 服务
-        cat >/etc/init.d/port-hopping <<'EOF'
-#!/sbin/openrc-run
-
-description="Port Hopping NAT rules for Hysteria"
-depend() {
-    need net iptables ip6tables
-    after firewall
-}
-
-start() {
-    ebegin "Adding Port Hopping NAT rules"
-EOF
-        # 添加实际规则
-        echo "    iptables -t nat -A PREROUTING -p udp --dport $1:$2 -m comment --comment \"NAT $1:$2 to $3 (PortHopping-hihysteria)\" -j DNAT --to-destination :$3" >>/etc/init.d/port-hopping
-        echo "    ip6tables -t nat -A PREROUTING -p udp --dport $1:$2 -m comment --comment \"NAT $1:$2 to $3 (PortHopping-hihysteria)\" -j DNAT --to-destination :$3" >>/etc/init.d/port-hopping
-        cat >>/etc/init.d/port-hopping <<'EOF'
-    eend $?
-}
-
-stop() {
-    ebegin "Removing Port Hopping NAT rules"
-    iptables-save | grep -v "PortHopping-hihysteria" | iptables-restore
-    ip6tables-save | grep -v "PortHopping-hihysteria" | ip6tables-restore
-    eend $?
-}
-EOF
-        chmod +x /etc/init.d/port-hopping
-
-        # 添加到默认运行级别并启动
-        rc-update add port-hopping default
-        rc-service port-hopping start
-
-    else
-        # 其他 Linux 系统的处理保持不变
-        mkdir -p /etc/rc.d
-        cat >/etc/rc.d/port-hopping <<EOF
-#!/bin/sh
-iptables -t nat -A PREROUTING -p udp --dport $1:$2 -m comment --comment "NAT $1:$2 to $3 (PortHopping-hihysteria)" -j DNAT --to-destination :$3
-ip6tables -t nat -A PREROUTING -p udp --dport $1:$2 -m comment --comment "NAT $1:$2 to $3 (PortHopping-hihysteria)" -j DNAT --to-destination :$3
-EOF
-        chmod +x /etc/rc.d/port-hopping
-
-        if [ ! -f "/etc/rc.local" ]; then
-            touch /etc/rc.local
-            echo "#!/bin/bash" >/etc/rc.local
-            chmod +x /etc/rc.local
-        fi
-        if ! grep -q "/etc/rc.d/port-hopping start" /etc/rc.local; then
-            echo "/etc/rc.d/port-hopping start" >>/etc/rc.local
-        fi
-    fi
-
-    echoColor purple "Port Hopping NAT 规则已添加并持久化。"
+    echoColor yellow "当前版本使用 Hysteria 官方内置端口范围，不再由脚本手工创建 NAT 规则。"
+    explainOfficialPortHopping
+    return 1
 }
 
 delPortHoppingNat() {
-    # 删除 OpenRC 服务（如果存在）
-    if [ -f "/etc/alpine-release" ] && [ -f "/etc/init.d/port-hopping" ]; then
-        rc-service port-hopping stop
-        rc-update del port-hopping default
-        rm -f /etc/init.d/port-hopping
+    [ -f /etc/init.d/port-hopping ] && rc-service port-hopping stop >/dev/null 2>&1 || true
+    [ -f /etc/init.d/port-hopping ] && rc-update del port-hopping default >/dev/null 2>&1 || true
+    rm -f /etc/init.d/port-hopping /etc/rc.d/port-hopping
+    if [ -f "$HIHY_RC_LOCAL" ]; then
+        sed -i '/\/etc\/rc.d\/port-hopping/d' "$HIHY_RC_LOCAL"
     fi
-
-    # 删除 port-hopping 规则
-    if [ -f "/etc/rc.d/port-hopping" ]; then
-        rm -f /etc/rc.d/port-hopping
-    fi
-
-    # 删除 rc.local port-hopping 规则（如果存在）
-    if [ -f "/etc/rc.local" ]; then
-        sed -i '/\/etc\/rc.d\/port-hopping/d' /etc/rc.local
-    fi
-
-    # 删除所有 hihysteria 相关的 NAT 规则
-    local nat_rules_v4=$(iptables-save | grep -E "PortHopping-hihysteria|hihysteria")
-    local nat_rules_v6=$(ip6tables-save | grep -E "PortHopping-hihysteria|hihysteria")
-
-    if [ -n "$nat_rules_v4" ]; then
-        while IFS= read -r rule; do
-            local clean_rule=$(echo "$rule" | sed 's/-A/-D/')
-            # 添加执行结果检查
-            if eval "iptables $clean_rule 2>/dev/null" || ! iptables -t nat -C $(echo "$clean_rule" | cut -d' ' -f2-) 2>/dev/null; then
-                # 规则删除成功或规则已不存在都视为成功
-                continue
-            # else
-            #     echoColor yellow "警告: 删除 IPv4 规则失败: $clean_rule"
-            fi
-        done <<<"$nat_rules_v4"
-    fi
-
-    if [ -n "$nat_rules_v6" ]; then
-        while IFS= read -r rule; do
-            local clean_rule=$(echo "$rule" | sed 's/-A/-D/')
-            # 添加执行结果检查
-            if eval "ip6tables $clean_rule 2>/dev/null" || ! ip6tables -t nat -C $(echo "$clean_rule" | cut -d' ' -f2-) 2>/dev/null; then
-                # 规则删除成功或规则已不存在都视为成功
-                continue
-            # else
-            #     echoColor yellow "警告: 删除 IPv6 规则失败: $clean_rule"
-            fi
-        done <<<"$nat_rules_v6"
-    fi
-    # 保存 iptables 规则
-    if [ -d "/etc/iptables" ]; then
-        iptables-save >/etc/iptables/rules.v4
-        ip6tables-save >/etc/iptables/rules.v6
-    fi
-
-    echoColor purple "Port Hopping NAT 规则已清理完成"
+    echoColor purple "已移除旧版端口跳跃启动脚本；官方运行时规则由 Hysteria 停止时自行清理。"
 }
 
 checkRoot() {
@@ -2688,53 +3130,33 @@ uninstall() {
         echoColor yellow "检测到未完成的安装残留，正在按部分安装状态执行卸载清理..."
     fi
 
-    # 停止服务
-    if [ -f "/etc/alpine-release" ]; then
-        if [ -f "/etc/init.d/hihy" ]; then
-            rc-service hihy stop >/dev/null 2>&1 || true
-            rc-update del hihy default >/dev/null 2>&1 || true
-            rm -f /etc/init.d/hihy
-        fi
-    else
-        if [ -f "/etc/rc.d/hihy" ]; then
-            /etc/rc.d/hihy stop >/dev/null 2>&1 || true
-            rm -f /etc/rc.d/hihy
-        fi
+    serviceStop >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now hihy-cert-renew.timer >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/hihy-cert-renew.timer /etc/systemd/system/hihy-cert-renew.service
     fi
+    case "$(detectServiceManager)" in
+        systemd)
+            systemctl disable hihy.service >/dev/null 2>&1 || true
+            rm -f "$HIHY_SERVICE_FILE"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            ;;
+        openrc) rc-update del hihy default >/dev/null 2>&1 || true ;;
+    esac
+    rm -f "$HIHY_INIT_SERVICE" "$HIHY_LEGACY_SERVICE"
 
-    # 删除 iptables 规则
-    if command -v iptables-save >/dev/null 2>&1 && command -v iptables-restore >/dev/null 2>&1; then
-        iptables-save 2>/dev/null | grep -v "hihysteria" | iptables-restore >/dev/null 2>&1 || true
-    fi
-    if command -v ip6tables-save >/dev/null 2>&1 && command -v ip6tables-restore >/dev/null 2>&1; then
-        ip6tables-save 2>/dev/null | grep -v "hihysteria" | ip6tables-restore >/dev/null 2>&1 || true
-    fi
-
-    # 保存 iptables 规则
-    if [ -d "/etc/iptables" ]; then
-        if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save >/etc/iptables/rules.v4
-        fi
-        if command -v ip6tables-save >/dev/null 2>&1; then
-            ip6tables-save >/etc/iptables/rules.v6
-        fi
-    fi
-
-    # 删除定时任务
-    crontab -l 2>/dev/null | grep -v "hihy cronTask" | crontab -
-
-    delHihyFirewallPort udp
-    delHihyFirewallPort tcp
-    cleanupLegacyPortHoppingNatIfPresent
+    removeCronTask || true
+    removeOwnedFirewallRules
+    delPortHoppingNat
 
     # 删除相关目录和文件
-    rm -rf /etc/hihy
-    rm -f /var/run/hihy.pid
+    rm -rf "$HIHY_ROOT_DIR"
+    rm -f "$HIHY_PID_FILE"
 
-    if [ -f "/etc/rc.local" ]; then
-        sed -i '/\/etc\/rc.d\/hihy start/d' /etc/rc.local
-        if grep -q "/etc/rc.d/allow-port" /etc/rc.local; then
-            sed -i '/\/etc\/rc.d\/allow-port start/d' /etc/rc.local
+    if [ -f "$HIHY_RC_LOCAL" ]; then
+        sed -i "\|${HIHY_LEGACY_SERVICE} start|d" "$HIHY_RC_LOCAL"
+        if grep -q "/etc/rc.d/allow-port" "$HIHY_RC_LOCAL"; then
+            sed -i '/\/etc\/rc.d\/allow-port start/d' "$HIHY_RC_LOCAL"
         fi
     fi
 
@@ -2756,12 +3178,8 @@ uninstall() {
             echoColor purple "\n->保留WARP/WireProxy安装"
         fi
     fi
-    clearInstallFailureMarker
-
-    # 删除 Arch Linux 的 rc.local systemd 服务
-    uninstall_rc_local_for_arch
     # 检查是否完全删除
-    if [ ! -d "/etc/hihy" ]; then
+    if [ ! -d "$HIHY_ROOT_DIR" ]; then
         echoColor green "Hysteria 已完全卸载!"
     else
         echoColor red "卸载过程中发生错误，请检查是否有残留文件或进程。"
@@ -2791,7 +3209,7 @@ generate_qr() {
 }
 
 generate_client_config() {
-    if [ ! -e "/etc/rc.d/hihy" ] && [ ! -e "/etc/init.d/hihy" ]; then
+    if [ ! -f "$HIHY_CONFIG_FILE" ] || [ ! -x "$HIHY_ROOT_DIR/bin/appS" ]; then
         echoColor red "hysteria2 未安装!"
         exit 1
     fi
@@ -2853,11 +3271,13 @@ generate_client_config() {
         portHoppingMaxHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingMaxHopInterval" "30s")
         serverPortRange="${portHoppingStart}-${portHoppingEnd}"
     fi
-    client_configfile="./Hy2-${remarks}-v2rayN.yaml"
+    safe_remarks=$(sanitizeFileComponent "$remarks")
+    client_configfile="./Hy2-${safe_remarks}-v2rayN.yaml"
     if [ -f "${client_configfile}" ]; then
         rm -f "${client_configfile}"
     fi
     touch ${client_configfile}
+    chmod 600 "$client_configfile"
     if [ "${realmMode}" == "true" ]; then
         addOrUpdateYaml "$client_configfile" "server" "${realmURI}"
         addOrUpdateYaml "$client_configfile" "auth" "${auth_secret}"
@@ -3008,11 +3428,14 @@ generate_client_config() {
 
 generateMetaYaml() {
     remarks=$(getYamlValue "/etc/hihy/conf/backup.yaml" "remarks")
-    local metaFile="./Hy2-${remarks}-ClashMeta.yaml"
+    local safe_remarks
+    safe_remarks=$(sanitizeFileComponent "$remarks")
+    local metaFile="./Hy2-${safe_remarks}-ClashMeta.yaml"
     if [ -f "${metaFile}" ]; then
         rm -f ${metaFile}
     fi
     touch ${metaFile}
+    chmod 600 "$metaFile"
 
     cat <<EOF >${metaFile}
 mixed-port: 7890
@@ -3216,82 +3639,46 @@ EOF
 }
 
 checkLogs() {
-    if [ -f "/etc/hihy/logs/hihy.log" ]; then
-        tail -f /etc/hihy/logs/hihy.log
+    if [ "$(detectServiceManager)" = "systemd" ] && [ -f "$HIHY_SERVICE_FILE" ]; then
+        journalctl -u hihy.service -f
+    elif [ -f "$HIHY_LOG_FILE" ]; then
+        tail -f "$HIHY_LOG_FILE"
     else
         echoColor red "日志文件不存在!"
     fi
 }
 start() {
-    if [ -f "/etc/rc.d/hihy" ] || [ -f "/etc/init.d/hihy" ]; then
-
-        if [ -f "/etc/rc.d/hihy" ]; then
-            /etc/rc.d/hihy start
-        else
-            /etc/init.d/hihy start
-        fi
-        if [ $? -eq 0 ]; then
-            echoColor green "启动成功!"
-        else
-            echoColor red "启动失败!"
-        fi
+    if serviceStart; then
+        echoColor green "启动成功!"
     else
-        echoColor red "未找到启动脚本!"
+        echoColor red "启动失败!"
+        return 1
     fi
 }
 stop() {
-    if [ -f "/etc/rc.d/hihy" ] || [ -f "/etc/init.d/hihy" ]; then
-        if [ -f "/etc/rc.d/hihy" ]; then
-            /etc/rc.d/hihy stop
-        else
-            /etc/init.d/hihy stop
-        fi
-        if [ $? -eq 0 ]; then
-            echoColor green "停止成功!"
-        else
-            echoColor red "停止失败!"
-        fi
+    if serviceStop; then
+        echoColor green "停止成功!"
     else
-        echoColor red "未找到启动脚本!"
+        echoColor red "停止失败!"
+        return 1
     fi
 }
 restart() {
-    if [ -f "/etc/rc.d/hihy" ] || [ -f "/etc/init.d/hihy" ]; then
-        if [ -f "/etc/rc.d/hihy" ]; then
-            /etc/rc.d/hihy restart
-        else
-            /etc/init.d/hihy restart
-        fi
-        if [ $? -eq 0 ]; then
-            echoColor green "重启成功!"
-        else
-            echoColor red "重启失败!"
-        fi
+    if serviceRestart; then
+        echoColor green "重启成功!"
     else
-        echoColor red "未找到启动脚本!"
+        echoColor red "重启失败!"
+        return 1
     fi
 }
 checkStatus() {
-    if [ -f "/etc/rc.d/hihy" ] || [ -f "/etc/init.d/hihy" ]; then
-        if [ -f "/etc/rc.d/hihy" ]; then
-            msg=$(/etc/rc.d/hihy status)
-        else
-            msg=$(/etc/init.d/hihy status)
-        fi
-        if [ $? -ne 0 ]; then
-            echoColor red "检查状态失败!"
-            exit 1
-        fi
-
-        if echo "$msg" | grep -q "hihy is running"; then
-            echoColor green "hysteria正在运行"
-            version=$(/etc/hihy/bin/appS version | grep "^Version" | awk '{print $2}')
-            echoColor purple "当前版本: $(echoColor red ${version})"
-        else
-            echoColor red "hysteria未运行"
-        fi
+    if serviceIsActive; then
+        echoColor green "hysteria正在运行"
+        version=$(/etc/hihy/bin/appS version | grep "^Version" | awk '{print $2}')
+        echoColor purple "当前版本: $(echoColor red ${version})"
     else
-        echoColor red "未找到启动脚本!"
+        echoColor red "hysteria未运行"
+        return 1
     fi
 }
 
@@ -3455,7 +3842,9 @@ format_time_display() {
     fi
 }
 
-delHihyFirewallPort() {
+legacyDelHihyFirewallPortUnsafe() {
+    echoColor red "旧版防火墙删除实现已禁用，拒绝执行全量规则恢复。"
+    return 1
     # 如果防火墙启动状态则删除之前的规则
     local listen_value=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen")
     local port=$(getListenPrimaryPort "${listen_value}")
@@ -3516,6 +3905,10 @@ delHihyFirewallPort() {
     fi
 }
 
+delHihyFirewallPort() {
+    removeOwnedFirewallRules
+}
+
 changeIp64() {
     local socks5_status=$(getYamlValue "/etc/hihy/conf/backup.yaml" "socks5_status")
     local config_file="/etc/hihy/conf/config.yaml"
@@ -3525,10 +3918,34 @@ changeIp64() {
     fi
     mode_now=$(getYamlValue "$config_file" "outbounds[0].direct.mode")
 
-    echoColor purple "当前模式: $(echoColor red ${mode_now})"
-    echoColor yellow "1) ipv4优先"
-    echoColor yellow "2) ipv6优先"
-    echoColor yellow "3) 自动选择"
+    case "${mode_now}" in
+        46) mode_name="IPv4 优先，失败后回退 IPv6" ;;
+        64) mode_name="IPv6 优先，失败后回退 IPv4" ;;
+        4) mode_name="仅 IPv4" ;;
+        6) mode_name="仅 IPv6" ;;
+        *) mode_name="自动选择，IPv4/IPv6 竞速" ;;
+    esac
+
+    public_ipv4=$(curl -4 -fsS --connect-timeout 3 --max-time 8 https://api.ipify.org 2>/dev/null || true)
+    public_ipv6=$(curl -6 -fsS --connect-timeout 3 --max-time 8 https://api64.ipify.org 2>/dev/null || true)
+
+    echoColor purple "当前出口模式: $(echoColor red "${mode_name} (${mode_now})")"
+    if [ -n "${public_ipv4}" ]; then
+        echoColor purple "服务器公网 IPv4: $(echoColor red "${public_ipv4}")"
+    else
+        echoColor yellow "服务器公网 IPv4: 不可用或检测失败"
+    fi
+    if [ -n "${public_ipv6}" ]; then
+        echoColor purple "服务器公网 IPv6: $(echoColor red "${public_ipv6}")"
+    else
+        echoColor yellow "服务器公网 IPv6: 不可用或检测失败"
+    fi
+    echoColor yellow "提示: 优先模式会在首选协议不可用时回退；仅 IPv4/IPv6 不会回退。"
+    echoColor yellow "1) IPv4 优先"
+    echoColor yellow "2) IPv6 优先"
+    echoColor yellow "3) 仅 IPv4"
+    echoColor yellow "4) 仅 IPv6"
+    echoColor yellow "5) 自动选择"
     echoColor yellow "0) 退出"
     read -r -p "请选择: " input
     case $input in
@@ -3554,6 +3971,24 @@ changeIp64() {
             ;;
 
         3)
+            if [ "${mode_now}" == "4" ]; then
+                echoColor yellow "当前已经是仅 IPv4 模式"
+            else
+                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "4"
+                restart
+                echoColor green "已切换为仅 IPv4，所有代理出口只使用 ${public_ipv4:-IPv4}"
+            fi
+            ;;
+        4)
+            if [ "${mode_now}" == "6" ]; then
+                echoColor yellow "当前已经是仅 IPv6 模式"
+            else
+                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "6"
+                restart
+                echoColor green "已切换为仅 IPv6，所有代理出口只使用 ${public_ipv6:-IPv6}"
+            fi
+            ;;
+        5)
             if [ "${mode_now}" == "auto" ]; then
                 echoColor yellow "当前已经是自动选择模式"
             else
@@ -3781,11 +4216,456 @@ addSocks5Outbound() {
 
 }
 
+publishSharedCertificate() {
+    local source_cert="$1"
+    local source_key="$2"
+    local domain="$3"
+    local release_id release_dir current_link
+
+    validateCertificateBundle "$source_cert" "$source_key" "$domain" || return 1
+    ensureCertificateManagerDirectories || return 1
+    release_id=$(date -u +%Y%m%dT%H%M%SZ)
+    release_dir="$HIHY_SHARED_CERT_DIR/releases/$release_id"
+    mkdir -p "$release_dir"
+    chmod 700 "$release_dir"
+    command install -m 644 "$source_cert" "$release_dir/fullchain.pem"
+    command install -m 600 "$source_key" "$release_dir/privkey.pem"
+    openssl x509 -in "$source_cert" -noout -fingerprint -sha256 >"$release_dir/fingerprint"
+    chmod 600 "$release_dir/fingerprint"
+    current_link="$HIHY_SHARED_CERT_DIR/current"
+    ln -sfn "releases/$release_id" "$HIHY_SHARED_CERT_DIR/.current.new"
+    mv -Tf "$HIHY_SHARED_CERT_DIR/.current.new" "$current_link"
+    find "$HIHY_SHARED_CERT_DIR/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr | cut -d' ' -f2- | sed -n '4,$p' | while IFS= read -r old_release; do
+            rm -rf "$old_release"
+        done
+}
+
+migrateLocalHysteriaToSharedCertificate() {
+    local domain="$1"
+    local backup_config="$HIHY_ROOT_DIR/conf/config.before-shared-cert.yaml"
+    local cert_path="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
+    local key_path="$HIHY_SHARED_CERT_DIR/current/privkey.pem"
+
+    validateCertificateBundle "$cert_path" "$key_path" "$domain" || return 1
+    cp -a "$HIHY_CONFIG_FILE" "$backup_config" || return 1
+    chmod 600 "$backup_config"
+    yq eval 'del(.acme)' -i "$HIHY_CONFIG_FILE" || return 1
+    addOrUpdateYaml "$HIHY_CONFIG_FILE" "tls.cert" "$cert_path" "string"
+    addOrUpdateYaml "$HIHY_CONFIG_FILE" "tls.key" "$key_path" "string"
+    addOrUpdateYaml "$HIHY_CONFIG_FILE" "tls.sniGuard" "strict" "string"
+    chmod 600 "$HIHY_CONFIG_FILE"
+    if ! serviceRestart || ! serviceIsActive; then
+        cp -a "$backup_config" "$HIHY_CONFIG_FILE"
+        serviceRestart >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+issueOrRenewWildcardCertificate() {
+    local domain email wildcard lego_cert lego_key action="run"
+
+    domain=$(getCertificateManagerValue domain) || return 1
+    email=$(getCertificateManagerValue email) || return 1
+    wildcard="*.${domain}"
+    installLego || return 1
+    verifyCloudflareToken || { echoColor red "Cloudflare Token 无效或无法验证。"; return 1; }
+
+    lego_cert="$HIHY_CERT_MANAGER_DIR/lego/certificates/_.${domain}.crt"
+    lego_key="$HIHY_CERT_MANAGER_DIR/lego/certificates/_.${domain}.key"
+    [ -f "$lego_cert" ] && action="renew"
+
+    if ! CF_DNS_API_TOKEN_FILE="$HIHY_CERT_TOKEN_FILE" \
+        "$HIHY_LEGO_BIN" run --path "$HIHY_CERT_MANAGER_DIR/lego" \
+        --email "$email" --accept-tos --dns cloudflare \
+        --dns.propagation.disable-rns \
+        --domains "$wildcard"; then
+        echoColor red "通配符证书申请或续期失败。"
+        return 1
+    fi
+    publishSharedCertificate "$lego_cert" "$lego_key" "$domain" || return 1
+    printf 'last_issue=%s\n' "$(date +%s)" >"$HIHY_CERT_MANAGER_DIR/state/last-issue.state"
+    chmod 600 "$HIHY_CERT_MANAGER_DIR/state/last-issue.state"
+}
+
+getCertificateDaysRemaining() {
+    local cert="$1" end_date end_epoch now
+    end_date=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2-) || return 1
+    end_epoch=$(date -d "$end_date" +%s 2>/dev/null) || return 1
+    now=$(date +%s)
+    echo $(((end_epoch - now) / 86400))
+}
+
+renewAndDeployCertificates() {
+    local cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
+    local renew_days days
+    renew_days=$(getCertificateManagerValue renew_days 2>/dev/null || echo 30)
+    if [ -f "$cert" ]; then
+        days=$(getCertificateDaysRemaining "$cert" 2>/dev/null || echo 0)
+        [ "$days" -gt "$renew_days" ] && return 0
+    fi
+    issueOrRenewWildcardCertificate || return 1
+    deployCertificateToAllNodes
+}
+
+installCertificateRenewTimer() {
+    if [ "$(detectServiceManager)" != "systemd" ]; then
+        local temp_file
+        command -v crontab >/dev/null 2>&1 || return 1
+        temp_file=$(mktemp) || return 1
+        crontab -l 2>/dev/null >"$temp_file" || true
+        sed -i '/# hihy-managed: certificate-renewal/d;/\/usr\/bin\/hihy cert renew-auto/d' "$temp_file"
+        printf '%s\n' '# hihy-managed: certificate-renewal' >>"$temp_file"
+        printf '%s\n' '17 3 * * * /usr/bin/hihy cert renew-auto' >>"$temp_file"
+        crontab "$temp_file"
+        local result=$?
+        rm -f "$temp_file"
+        return "$result"
+    fi
+    cat >/etc/systemd/system/hihy-cert-renew.service <<EOF
+[Unit]
+Description=Renew and deploy Hi_Hysteria shared wildcard certificate
+After=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=${HIHY_BIN_LINK} cert renew-auto
+EOF
+    cat >/etc/systemd/system/hihy-cert-renew.timer <<'EOF'
+[Unit]
+Description=Daily Hi_Hysteria certificate renewal check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 /etc/systemd/system/hihy-cert-renew.service /etc/systemd/system/hihy-cert-renew.timer
+    systemctl daemon-reload && systemctl enable --now hihy-cert-renew.timer
+}
+
+initCertificateManager() {
+    local current_domain domain email token
+    current_domain=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.domains" 2>/dev/null)
+    current_domain=${current_domain#*.}
+    current_domain=${current_domain#[}
+    current_domain=${current_domain%]}
+    current_domain=${current_domain//\"/}
+    if printf '%s' "$current_domain" | grep -q '\.'; then
+        domain=$(printf '%s' "$current_domain" | awk -F. '{print $(NF-1)"."$NF}')
+    fi
+    [ -n "$domain" ] || domain="example.com"
+    email=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.email" 2>/dev/null)
+    [ -n "$email" ] && [ "$email" != "null" ] || email="admin@${domain}"
+
+    echoColor green "主域名(默认:${domain}):"
+    read -r input_domain
+    [ -n "$input_domain" ] && domain="$input_domain"
+    echoColor green "ACME 邮箱(默认:${email}):"
+    read -r input_email
+    [ -n "$input_email" ] && email="$input_email"
+    writeCertificateManagerConfig "$domain" "$email" || return 1
+
+    token=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.dns.config.cloudflare_api_token" 2>/dev/null)
+    if [ -z "$token" ] || [ "$token" = "null" ]; then
+        echoColor green "请输入 Cloudflare API Token(输入不回显):"
+        read -r -s token
+        echo
+    else
+        echoColor purple "已从当前 Hysteria 配置导入 Cloudflare Token。"
+    fi
+    [ -n "$token" ] || return 1
+    printf '%s' "$token" >"$HIHY_CERT_TOKEN_FILE"
+    chmod 600 "$HIHY_CERT_TOKEN_FILE"
+    verifyCloudflareToken || { echoColor red "Cloudflare Token 验证失败。"; return 1; }
+    installLego || return 1
+    issueOrRenewWildcardCertificate || return 1
+    migrateLocalHysteriaToSharedCertificate "$domain" || return 1
+    installCertificateRenewTimer || echoColor yellow "自动续期 timer 安装失败，可稍后手动执行。"
+    echoColor green "本机已配置为证书中心并切换到共享通配符证书。"
+}
+
+ensureCertificateDeployKey() {
+    ensureCertificateManagerDirectories || return 1
+    if [ ! -f "$HIHY_CERT_DEPLOY_KEY" ]; then
+        ssh-keygen -q -t ed25519 -N '' -C 'hihy-cert-deploy' -f "$HIHY_CERT_DEPLOY_KEY" || return 1
+    fi
+    chmod 600 "$HIHY_CERT_DEPLOY_KEY"
+    chmod 644 "${HIHY_CERT_DEPLOY_KEY}.pub"
+    touch "$HIHY_CERT_KNOWN_HOSTS"
+    chmod 600 "$HIHY_CERT_KNOWN_HOSTS"
+}
+
+initCertificateReceiver() {
+    local domain="$1"
+    if [ -z "$domain" ]; then
+        echoColor green "请输入共享通配符证书的主域名，例如 example.com:"
+        read -r domain
+    fi
+    printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' || return 1
+    ensureCertificateManagerDirectories || return 1
+    cat >"$HIHY_CERT_MANAGER_DIR/config/receiver.conf" <<EOF
+mode=receiver
+domain=${domain}
+EOF
+    chmod 600 "$HIHY_CERT_MANAGER_DIR/config/receiver.conf"
+    echoColor green "证书接收节点已初始化。"
+}
+
+getCertificateReceiverDomain() {
+    local file="$HIHY_CERT_MANAGER_DIR/config/receiver.conf"
+    if [ -f "$file" ]; then
+        grep '^domain=' "$file" | head -n 1 | cut -d= -f2-
+    else
+        getCertificateManagerValue domain
+    fi
+}
+
+receiveCertificatePackage() {
+    local domain temp_dir cert key backup_config=""
+    domain=$(getCertificateReceiverDomain) || return 1
+    temp_dir=$(mktemp -d "$HIHY_ROOT_DIR/.cert-receive.XXXXXX") || return 1
+    chmod 700 "$temp_dir"
+    if ! tar -xzf - -C "$temp_dir"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    cert="$temp_dir/fullchain.pem"
+    key="$temp_dir/privkey.pem"
+    validateCertificateBundle "$cert" "$key" "$domain" || { rm -rf "$temp_dir"; return 1; }
+    publishSharedCertificate "$cert" "$key" "$domain" || { rm -rf "$temp_dir"; return 1; }
+
+    if [ -f "$HIHY_CONFIG_FILE" ]; then
+        if [ "$(getYamlValue "$HIHY_CONFIG_FILE" "tls.cert" 2>/dev/null)" != "$HIHY_SHARED_CERT_DIR/current/fullchain.pem" ]; then
+            backup_config="$HIHY_ROOT_DIR/conf/config.before-shared-cert.yaml"
+            migrateLocalHysteriaToSharedCertificate "$domain" || { rm -rf "$temp_dir"; return 1; }
+        fi
+    fi
+    rm -rf "$temp_dir"
+    echo "certificate received"
+}
+
+validateCertificateNodeField() {
+    local type="$1" value="$2"
+    case "$type" in
+        name) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9._-]+$' ;;
+        host) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9.:-]+$' ;;
+        user) printf '%s' "$value" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$' ;;
+        port) validate_port "$value" ;;
+        domain) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' ;;
+        *) return 1 ;;
+    esac
+}
+
+addCertificateNode() {
+    local manager_domain name host port user node_domain node_file public_key auth_line
+    manager_domain=$(getCertificateManagerValue domain) || return 1
+    ensureCertificateDeployKey || return 1
+    echoColor green "节点名称:"
+    read -r name
+    echoColor green "SSH 地址:"
+    read -r host
+    echoColor green "SSH 端口(默认22):"
+    read -r port
+    [ -n "$port" ] || port=22
+    echoColor green "SSH 用户(默认root):"
+    read -r user
+    [ -n "$user" ] || user=root
+    echoColor green "节点证书域名:"
+    read -r node_domain
+    validateCertificateNodeField name "$name" && validateCertificateNodeField host "$host" && \
+        validateCertificateNodeField port "$port" && validateCertificateNodeField user "$user" && \
+        validateCertificateNodeField domain "$node_domain" || return 1
+    case "$node_domain" in
+        *."$manager_domain") ;;
+        *) echoColor red "节点域名不在 *.${manager_domain} 覆盖范围内。"; return 1 ;;
+    esac
+
+    ssh-keyscan -p "$port" -H "$host" 2>/dev/null >>"$HIHY_CERT_KNOWN_HOSTS" || return 1
+    sort -u "$HIHY_CERT_KNOWN_HOSTS" -o "$HIHY_CERT_KNOWN_HOSTS"
+    public_key=$(cat "${HIHY_CERT_DEPLOY_KEY}.pub")
+    auth_line="restrict,command=\"${HIHY_BIN_LINK} cert receive\" ${public_key}"
+    echoColor yellow "将通过当前 SSH 登录权限初始化接收节点并安装受限部署公钥。"
+    if ! ssh -p "$port" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HIHY_CERT_KNOWN_HOSTS" \
+        "${user}@${host}" "set -e; ${HIHY_BIN_LINK} cert receiver-init '${manager_domain}'; mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; if ! grep -qF '${public_key}' ~/.ssh/authorized_keys; then printf '%s\\n' '${auth_line}' >> ~/.ssh/authorized_keys; fi; chmod 600 ~/.ssh/authorized_keys"; then
+        return 1
+    fi
+    node_file="$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf"
+    cat >"$node_file" <<EOF
+name=${name}
+host=${host}
+port=${port}
+user=${user}
+domain=${node_domain}
+EOF
+    chmod 600 "$node_file"
+    deployCertificateToNode "$node_file"
+}
+
+deployCertificateToNode() {
+    local node_file="$1" host port user name cert key
+    [ -f "$node_file" ] || return 1
+    host=$(grep '^host=' "$node_file" | cut -d= -f2-)
+    port=$(grep '^port=' "$node_file" | cut -d= -f2-)
+    user=$(grep '^user=' "$node_file" | cut -d= -f2-)
+    name=$(grep '^name=' "$node_file" | cut -d= -f2-)
+    cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
+    key="$HIHY_SHARED_CERT_DIR/current/privkey.pem"
+    [ -f "$cert" ] && [ -f "$key" ] || return 1
+    if tar -czf - -C "$HIHY_SHARED_CERT_DIR/current" fullchain.pem privkey.pem \
+        | ssh -i "$HIHY_CERT_DEPLOY_KEY" -p "$port" -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HIHY_CERT_KNOWN_HOSTS" \
+            "${user}@${host}"; then
+        printf 'node=%s\nstatus=success\ndeployed_at=%s\n' "$name" "$(date +%s)" >"$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+        chmod 600 "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+        echoColor green "节点 ${name} 证书分发成功。"
+        return 0
+    fi
+    printf 'node=%s\nstatus=failed\ndeployed_at=%s\n' "$name" "$(date +%s)" >"$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+    chmod 600 "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+    echoColor red "节点 ${name} 证书分发失败。"
+    return 1
+}
+
+deployCertificateToAllNodes() {
+    local node_file result=0
+    [ -d "$HIHY_CERT_MANAGER_DIR/nodes" ] || return 0
+    for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
+        [ -f "$node_file" ] || continue
+        deployCertificateToNode "$node_file" || result=1
+    done
+    return "$result"
+}
+
+removeCertificateNode() {
+    local name
+    echoColor green "请输入要删除的节点名称:"
+    read -r name
+    validateCertificateNodeField name "$name" || return 1
+    rm -f "$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf" "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+}
+
+exportCertificateManagerProfile() {
+    local output temp_dir archive
+    command -v gpg >/dev/null 2>&1 || return 1
+    [ -f "$HIHY_CERT_MANAGER_CONFIG" ] && [ -f "$HIHY_CERT_TOKEN_FILE" ] || return 1
+    temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-export.XXXXXX") || return 1
+    chmod 700 "$temp_dir"
+    mkdir -p "$temp_dir/profile/nodes"
+    cp -a "$HIHY_CERT_MANAGER_CONFIG" "$temp_dir/profile/manager.conf"
+    cp -a "$HIHY_CERT_TOKEN_FILE" "$temp_dir/profile/cloudflare.token"
+    [ -f "$HIHY_CERT_DEPLOY_KEY" ] && cp -a "$HIHY_CERT_DEPLOY_KEY" "$temp_dir/profile/deploy_ed25519"
+    [ -f "${HIHY_CERT_DEPLOY_KEY}.pub" ] && cp -a "${HIHY_CERT_DEPLOY_KEY}.pub" "$temp_dir/profile/deploy_ed25519.pub"
+    [ -f "$HIHY_CERT_KNOWN_HOSTS" ] && cp -a "$HIHY_CERT_KNOWN_HOSTS" "$temp_dir/profile/known_hosts"
+    cp -a "$HIHY_CERT_MANAGER_DIR"/nodes/. "$temp_dir/profile/nodes/" 2>/dev/null || true
+    archive="$temp_dir/profile.tar.gz"
+    tar -czf "$archive" -C "$temp_dir" profile || { rm -rf "$temp_dir"; return 1; }
+    output="./hihy-cert-profile-$(getCertificateManagerValue domain)-$(date +%Y%m%d).gpg"
+    echoColor yellow "请输入配置包加密口令，GPG 将要求确认。"
+    if ! gpg --symmetric --cipher-algo AES256 --output "$output" "$archive"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    chmod 600 "$output"
+    rm -rf "$temp_dir"
+    echoColor green "加密配置包已导出: $output"
+}
+
+importCertificateManagerProfile() {
+    local input="$1" temp_dir archive profile_dir
+    command -v gpg >/dev/null 2>&1 || return 1
+    if [ -z "$input" ]; then
+        echoColor green "请输入 .gpg 配置包路径:"
+        read -r input
+    fi
+    [ -f "$input" ] || return 1
+    ensureCertificateManagerDirectories || return 1
+    temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-import.XXXXXX") || return 1
+    chmod 700 "$temp_dir"
+    archive="$temp_dir/profile.tar.gz"
+    gpg --output "$archive" --decrypt "$input" || { rm -rf "$temp_dir"; return 1; }
+    tar -xzf "$archive" -C "$temp_dir" || { rm -rf "$temp_dir"; return 1; }
+    profile_dir="$temp_dir/profile"
+    [ -f "$profile_dir/manager.conf" ] && [ -f "$profile_dir/cloudflare.token" ] || { rm -rf "$temp_dir"; return 1; }
+    command install -m 600 "$profile_dir/manager.conf" "$HIHY_CERT_MANAGER_CONFIG"
+    command install -m 600 "$profile_dir/cloudflare.token" "$HIHY_CERT_TOKEN_FILE"
+    [ -f "$profile_dir/deploy_ed25519" ] && command install -m 600 "$profile_dir/deploy_ed25519" "$HIHY_CERT_DEPLOY_KEY"
+    [ -f "$profile_dir/deploy_ed25519.pub" ] && command install -m 644 "$profile_dir/deploy_ed25519.pub" "${HIHY_CERT_DEPLOY_KEY}.pub"
+    [ -f "$profile_dir/known_hosts" ] && command install -m 600 "$profile_dir/known_hosts" "$HIHY_CERT_KNOWN_HOSTS"
+    cp -a "$profile_dir"/nodes/. "$HIHY_CERT_MANAGER_DIR/nodes/" 2>/dev/null || true
+    rm -rf "$temp_dir"
+    verifyCloudflareToken || return 1
+    echoColor green "证书中心配置导入完成。"
+}
+
+showCertificateManagerStatus() {
+    local domain cert days issuer serial node_file name state
+    domain=$(getCertificateManagerValue domain 2>/dev/null || getCertificateReceiverDomain 2>/dev/null || true)
+    cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
+    echoColor purple "证书角色: $(getCertificateManagerValue mode 2>/dev/null || echo receiver)"
+    echoColor purple "主域名: ${domain:-未配置}"
+    if [ -f "$cert" ]; then
+        days=$(getCertificateDaysRemaining "$cert" 2>/dev/null || echo unknown)
+        issuer=$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+        serial=$(openssl x509 -in "$cert" -noout -serial 2>/dev/null | cut -d= -f2-)
+        echoColor purple "剩余有效期: ${days} 天"
+        echoColor purple "签发者: ${issuer}"
+        echoColor purple "序列号: ${serial}"
+        openssl x509 -in "$cert" -noout -fingerprint -sha256
+    else
+        echoColor yellow "尚未发布共享证书。"
+    fi
+    for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
+        [ -f "$node_file" ] || continue
+        name=$(grep '^name=' "$node_file" | cut -d= -f2-)
+        state="$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+        if [ -f "$state" ]; then
+            echoColor yellow "节点 ${name}: $(grep '^status=' "$state" | cut -d= -f2-)"
+        else
+            echoColor yellow "节点 ${name}: 尚未分发"
+        fi
+    done
+}
+
+certificateManagerMenu() {
+    echoColor purple "证书中心与共享通配符证书"
+    echoColor yellow "1) 初始化本机为证书中心"
+    echoColor yellow "2) 初始化本机为接收节点"
+    echoColor yellow "3) 申请/续期并发布通配符证书"
+    echoColor yellow "4) 添加并初始化 SSH 节点"
+    echoColor yellow "5) 删除节点"
+    echoColor yellow "6) 向全部节点分发证书"
+    echoColor yellow "7) 查看证书和节点状态"
+    echoColor yellow "8) 导出 GPG 加密配置包"
+    echoColor yellow "9) 导入 GPG 加密配置包"
+    echoColor yellow "0) 返回"
+    read -r cert_choice
+    case "$cert_choice" in
+        1) initCertificateManager ;;
+        2) initCertificateReceiver ;;
+        3) issueOrRenewWildcardCertificate && deployCertificateToAllNodes ;;
+        4) addCertificateNode ;;
+        5) removeCertificateNode ;;
+        6) deployCertificateToAllNodes ;;
+        7) showCertificateManagerStatus ;;
+        8) exportCertificateManagerProfile ;;
+        9) importCertificateManagerProfile ;;
+        0) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 show_menu() {
+    secureHihyPermissions >/dev/null 2>&1 || true
+    promptLegacyServiceMigration
     clear
     echo -e " -------------------------------------------"
     echo -e "|**********      Hi Hysteria       **********|"
-    echo -e "|**********    Author: emptysuns   **********|"
+    echo -e "|**********      Author: AI驱动      **********|"
     echo -e "|**********     Version: $(echoColor red "${hihyV}")    **********|"
     echo -e " -------------------------------------------"
     echo -e "Tips: $(echoColor green "hihy") 命令再次运行本脚本."
@@ -3810,6 +4690,7 @@ show_menu() {
     echo -e "$(echoColor skyBlue "13) 查看hysteria2统计信息")"
     echo -e "$(echoColor yellow "14) 查看实时日志")"
     echo -e "$(echoColor yellow "15) 添加socks5出站[支持自动配置warp]")"
+    echo -e "$(echoColor lightCyan "16) 证书中心与共享通配符证书")"
 
     echo -e "$(echoColor purple "###############################")"
 
@@ -3891,6 +4772,10 @@ menu() {
                 addSocks5Outbound
                 exit 0
                 ;;
+            16)
+                certificateManagerMenu
+                wait_for_continue
+                ;;
             0) exit 0 ;;
             *)
                 echoColor red "Input Error !!!"
@@ -3962,6 +4847,30 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         addSocks5Outbound | 15)
             echoColor purple "-> 15) 添加socks5出站"
             addSocks5Outbound
+            ;;
+        cert | 16)
+            case "$2" in
+                manager-init) initCertificateManager ;;
+                receiver-init) initCertificateReceiver "$3" ;;
+                issue) issueOrRenewWildcardCertificate ;;
+                renew-auto) renewAndDeployCertificates ;;
+                deploy) deployCertificateToAllNodes ;;
+                node-add) addCertificateNode ;;
+                node-remove) removeCertificateNode ;;
+                status) showCertificateManagerStatus ;;
+                export) exportCertificateManagerProfile ;;
+                import) importCertificateManagerProfile "$3" ;;
+                receive) receiveCertificatePackage ;;
+                *) certificateManagerMenu ;;
+            esac
+            ;;
+        migrate-service)
+            if migrateLegacyService; then
+                echoColor green "服务迁移完成。"
+            else
+                echoColor red "服务迁移失败或当前无需迁移。"
+                exit 1
+            fi
             ;;
         cronTask) cronTask ;;
         *) menu ;;

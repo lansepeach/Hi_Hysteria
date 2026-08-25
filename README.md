@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.7`
+当前脚本版本：`1.0.8`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -18,6 +18,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 
 - 安装、卸载、启动、停止、重启 Hysteria2
 - 支持 ACME HTTP、ACME DNS、本地证书、自签证书
+- 支持单一证书中心申请通配符证书，并通过受限 SSH 自动分发到多台服务器
 - 支持 Brutal / BBR / Reno 拥塞控制模式
 - 支持 Hysteria2 原生端口跳跃/多端口范围监听
 - 支持 masquerade：string / proxy / file
@@ -29,6 +30,9 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持安装失败状态恢复、后台版本检查和缓存提示
 - 支持 Alpine、Arch、Debian、Ubuntu、RHEL、CentOS、Rocky Linux 等常见发行版
 - 支持 x86_64、i386/i686、aarch64/arm64、armv7、s390x、ppc64le、loongarch64 等架构
+- systemd 系统使用原生服务，旧版 rc.local/SysV 安装可确认后安全迁移
+- 防火墙规则采用所有权记录，卸载只删除脚本实际新增的规则
+- 端口跳跃优先使用 Hysteria 官方内置端口范围和自动重定向
 
 ## 安装
 
@@ -63,12 +67,15 @@ hihy 6            # 查看运行状态
 hihy 7            # 更新 Hysteria2 Core
 hihy 8            # 查看/重新生成客户端配置
 hihy 9            # 重新配置服务端
-hihy 10           # 切换 IPv4 / IPv6 优先级
+hihy 10           # 切换自动、IPv4/IPv6 优先或仅 IPv4/IPv6 出口
 hihy 11           # 更新 hihy 脚本
 hihy 12           # ACL 域名分流管理
 hihy 13           # 查看统计信息
 hihy 14           # 查看实时日志
 hihy 15           # 添加 socks5 出站
+hihy 16           # 证书中心、共享证书与节点分发管理
+hihy cert status  # 查看通配符证书和节点部署状态
+hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 ```
 
 ## 文档
@@ -93,7 +100,7 @@ hihy 9
 
 ## 鸣谢
 
-- [apernet/hysteria](https://github.com/apernet/hysteria)
+- [HyNetworks/hysteria](https://github.com/HyNetworks/hysteria)
 - [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria)
 - [2dust/v2rayN](https://github.com/2dust/v2rayN)
 - [MetaCubeX/Clash.Meta](https://github.com/MetaCubeX/Clash.Meta)
