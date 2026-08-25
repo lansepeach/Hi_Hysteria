@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.14"
+hihyV="ver1.15"
 
 umask 077
 
@@ -4926,6 +4926,46 @@ removeCertificateNode() {
     rm -f "$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf" "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
 }
 
+showCertificateNodes() {
+    local node_file state_file name host port user domain status deployed_at deployed_time count=0
+    echoColor purple "已配置的 SSH 证书节点"
+    printf '%-16s %-30s %-8s %-12s %-30s %-12s %s\n' \
+        "节点名称" "SSH 地址" "端口" "用户" "证书域名" "分发状态" "最近分发时间"
+    printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
+    for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
+        [ -f "$node_file" ] || continue
+        name=$(grep '^name=' "$node_file" | head -n 1 | cut -d= -f2-)
+        host=$(grep '^host=' "$node_file" | head -n 1 | cut -d= -f2-)
+        port=$(grep '^port=' "$node_file" | head -n 1 | cut -d= -f2-)
+        user=$(grep '^user=' "$node_file" | head -n 1 | cut -d= -f2-)
+        domain=$(grep '^domain=' "$node_file" | head -n 1 | cut -d= -f2-)
+        status="尚未分发"
+        deployed_time="-"
+        state_file="$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+        if [ -f "$state_file" ]; then
+            status=$(grep '^status=' "$state_file" | head -n 1 | cut -d= -f2-)
+            deployed_at=$(grep '^deployed_at=' "$state_file" | head -n 1 | cut -d= -f2-)
+            case "$status" in
+                success) status="成功" ;;
+                failed) status="失败" ;;
+                "") status="未知" ;;
+            esac
+            if is_uint "$deployed_at"; then
+                deployed_time=$(date -d "@${deployed_at}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$deployed_at")
+            fi
+        fi
+        printf '%-16s %-30s %-8s %-12s %-30s %-12s %s\n' \
+            "${name:-未知}" "${host:-未知}" "${port:-22}" "${user:-root}" "${domain:-未知}" "$status" "$deployed_time"
+        count=$((count + 1))
+    done
+    if [ "$count" -eq 0 ]; then
+        echoColor yellow "尚未添加 SSH 证书节点。"
+        return 0
+    fi
+    echoColor purple "节点总数: ${count}"
+    echoColor yellow "以上仅显示连接元数据，不显示部署私钥、Cloudflare Token 或其他凭据。"
+}
+
 exportCertificateManagerProfile() {
     local output temp_dir archive
     command -v gpg >/dev/null 2>&1 || return 1
@@ -5020,6 +5060,7 @@ certificateManagerMenu() {
     echoColor yellow "7) 查看证书和节点状态"
     echoColor yellow "8) 导出 GPG 加密配置包"
     echoColor yellow "9) 导入 GPG 加密配置包"
+    echoColor yellow "10) 查看所有 SSH 节点"
     echoColor yellow "0) 返回"
     read -r cert_choice
     case "$cert_choice" in
@@ -5032,6 +5073,7 @@ certificateManagerMenu() {
         7) showCertificateManagerStatus ;;
         8) exportCertificateManagerProfile ;;
         9) importCertificateManagerProfile ;;
+        10) showCertificateNodes ;;
         0) return 0 ;;
         *) return 1 ;;
     esac
@@ -5236,6 +5278,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
                 node-add) addCertificateNode ;;
                 node-remove) removeCertificateNode ;;
                 status) showCertificateManagerStatus ;;
+                nodes) showCertificateNodes ;;
                 export) exportCertificateManagerProfile ;;
                 import) importCertificateManagerProfile "$3" ;;
                 receive) receiveCertificatePackage ;;
