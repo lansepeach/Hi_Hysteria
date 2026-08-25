@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.8`
+当前脚本版本：`1.0.9`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -77,6 +77,8 @@ hihy 16           # 证书中心、共享证书与节点分发管理
 hihy cert status  # 查看通配符证书和节点部署状态
 hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 ```
+
+脚本更新完成后会自动重新载入新版菜单。远程版本由仓库根目录的 `VERSION` 提供，完整脚本下载失败时不会覆盖当前安装。
 
 ## 文档
 

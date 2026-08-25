@@ -386,6 +386,15 @@ A: 上个版本为了兼容portHopping动了很多祖传代码，导致一堆bug
 7、Core 更新启动失败时自动恢复旧版本
 8、增加通配符证书中心、GPG 加密配置包和受限 SSH 多节点分发
 ```
+##### (2026/08/25) 1.0.9
+
+```
+1、修复已迁移到原生 systemd 后仍重复提示迁移的问题
+2、通过 systemd 实际加载的 FragmentPath/SourcePath 判断原生服务
+3、迁移命令改为幂等，已迁移服务器重复执行不会中断服务
+4、增加轻量 VERSION 版本元数据和更新后自动重载菜单
+```
+
 ##### (2026/08/25) 1.0.8
 
 ```
@@ -393,4 +402,6 @@ A: 上个版本为了兼容portHopping动了很多祖传代码，导致一堆bug
 2、版本检测优先使用 GitHub Releases API，并保留重定向页面作为回退
 3、Core 下载优先校验 GitHub Release digest，并始终验证二进制版本
 4、脚本作者标识调整为 AI驱动
+5、hihy 更新改用轻量 VERSION 元数据，增加网络超时并在成功后自动重新载入新版菜单
+6、systemd 迁移状态改为检查实际加载的 FragmentPath/SourcePath，兼容不同 unit 安装路径并避免重复提示
 ```

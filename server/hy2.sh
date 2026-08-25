@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.08"
+hihyV="ver1.09"
 
 umask 077
 
@@ -30,16 +30,18 @@ HIHY_REPO_OWNER="${HIHY_REPO_OWNER:-lansepeach}"
 HIHY_REPO_NAME="${HIHY_REPO_NAME:-Hi_Hysteria}"
 HIHY_REPO_BRANCH="${HIHY_REPO_BRANCH:-main}"
 HIHY_REMOTE_SCRIPT_PATH="${HIHY_REMOTE_SCRIPT_PATH:-server/hy2.sh}"
+HIHY_REMOTE_VERSION_PATH="${HIHY_REMOTE_VERSION_PATH:-VERSION}"
 
 HIHY_REPO_URL="${HIHY_REPO_URL:-https://github.com/${HIHY_REPO_OWNER}/${HIHY_REPO_NAME}}"
 HIHY_REMOTE_SCRIPT_URL="${HIHY_REMOTE_SCRIPT_URL:-https://raw.githubusercontent.com/${HIHY_REPO_OWNER}/${HIHY_REPO_NAME}/refs/heads/${HIHY_REPO_BRANCH}/${HIHY_REMOTE_SCRIPT_PATH}}"
 HIHY_REMOTE_SCRIPT_MIRROR_URL="${HIHY_REMOTE_SCRIPT_MIRROR_URL:-https://cdn.jsdelivr.net/gh/${HIHY_REPO_OWNER}/${HIHY_REPO_NAME}@${HIHY_REPO_BRANCH}/${HIHY_REMOTE_SCRIPT_PATH}}"
+HIHY_REMOTE_VERSION_URL="${HIHY_REMOTE_VERSION_URL:-https://raw.githubusercontent.com/${HIHY_REPO_OWNER}/${HIHY_REPO_NAME}/refs/heads/${HIHY_REPO_BRANCH}/${HIHY_REMOTE_VERSION_PATH}}"
 
 HIHY_VERSION_STATUS_FILE="${HIHY_VERSION_STATUS_FILE:-$HIHY_ROOT_DIR/result/version-check.state}"
 HIHY_VERSION_CHECK_LOCK_FILE="${HIHY_VERSION_CHECK_LOCK_FILE:-$HIHY_ROOT_DIR/result/version-check.lock}"
 HIHY_VERSION_CHECK_TTL="${HIHY_VERSION_CHECK_TTL:-21600}"
-HIHY_REMOTE_CONNECT_TIMEOUT="${HIHY_REMOTE_CONNECT_TIMEOUT:-2}"
-HIHY_REMOTE_MAX_TIME="${HIHY_REMOTE_MAX_TIME:-5}"
+HIHY_REMOTE_CONNECT_TIMEOUT="${HIHY_REMOTE_CONNECT_TIMEOUT:-5}"
+HIHY_REMOTE_MAX_TIME="${HIHY_REMOTE_MAX_TIME:-30}"
 
 ensureHihyDirectories() {
     mkdir -p "$HIHY_ROOT_DIR/bin" "$HIHY_ROOT_DIR/conf" "$HIHY_ROOT_DIR/cert" \
@@ -329,6 +331,12 @@ fetchRemoteHeadersFromSources() {
 getLatestHihyVersion() {
     local content
     local version
+
+    version=$(fetchRemoteBodyFromSources "${HIHY_REMOTE_VERSION_URL}?t=$(date +%s)" 2>/dev/null | tr -d '\r\n[:space:]')
+    if printf '%s' "$version" | grep -Eq '^ver[0-9]+\.[0-9]+$'; then
+        printf '%s\n' "$version"
+        return 0
+    fi
 
     content=$(fetchRemoteBodyFromSources "$HIHY_REMOTE_SCRIPT_URL" "$HIHY_REMOTE_SCRIPT_MIRROR_URL") || return 1
 
@@ -2341,7 +2349,7 @@ hihyUpdate() {
 
     tmp_file="${HIHY_BIN_LINK}.tmp.$$"
 
-    if ! downloadToFile "$HIHY_REMOTE_SCRIPT_URL" "$tmp_file"; then
+    if ! downloadToFile "${HIHY_REMOTE_SCRIPT_URL}?t=$(date +%s)" "$tmp_file"; then
         if ! downloadToFile "$HIHY_REMOTE_SCRIPT_MIRROR_URL" "$tmp_file"; then
             rm -f "$tmp_file"
             echoColor red "hihy 更新失败，请检查网络或写入权限。"
@@ -2361,6 +2369,8 @@ hihyUpdate() {
 
     echoColor green "hihy 更新完成。"
     echoColor purple "更新来源: ${HIHY_REPO_URL}"
+    echoColor purple "正在重新载入新版脚本..."
+    exec "$HIHY_BIN_LINK"
 }
 
 hyCore_update_notifycation() {
@@ -2403,6 +2413,22 @@ detectServiceManager() {
     else
         echo "legacy"
     fi
+}
+
+isNativeHihySystemdService() {
+    local load_state fragment_path source_path
+
+    [ "$(detectServiceManager)" = "systemd" ] || return 1
+    load_state=$(systemctl show -p LoadState --value hihy.service 2>/dev/null)
+    fragment_path=$(systemctl show -p FragmentPath --value hihy.service 2>/dev/null)
+    source_path=$(systemctl show -p SourcePath --value hihy.service 2>/dev/null)
+
+    [ "$load_state" = "loaded" ] || return 1
+    [ -n "$fragment_path" ] || return 1
+    case "$fragment_path" in
+        /run/systemd/generator/* | /run/systemd/generator.late/*) return 1 ;;
+    esac
+    [ -z "$source_path" ] || return 1
 }
 
 writeSystemdService() {
@@ -2621,10 +2647,14 @@ migrateLegacyService() {
     local had_init_service="false"
 
     [ "$(detectServiceManager)" = "systemd" ] || return 1
-    [ -f "$HIHY_LEGACY_SERVICE" ] || return 0
-    if [ -f "$HIHY_SERVICE_FILE" ] && [ ! -e "$HIHY_INIT_SERVICE" ] && [ ! -L "$HIHY_INIT_SERVICE" ] && systemctl is-active --quiet hihy.service; then
+    if isNativeHihySystemdService; then
+        systemctl enable hihy.service >/dev/null 2>&1 || true
+        if [ -f "$HIHY_RC_LOCAL" ]; then
+            sed -i "\|${HIHY_LEGACY_SERVICE} start|d" "$HIHY_RC_LOCAL"
+        fi
         return 0
     fi
+    [ -f "$HIHY_LEGACY_SERVICE" ] || return 0
 
     "$HIHY_LEGACY_SERVICE" status >/dev/null 2>&1 && was_running="true"
     backup_dir=$(mktemp -d "$HIHY_ROOT_DIR/result/service-migration.XXXXXX") || return 1
@@ -2684,7 +2714,7 @@ EOF
 
 promptLegacyServiceMigration() {
     [ "$(detectServiceManager)" = "systemd" ] || return 0
-    [ ! -f "$HIHY_SERVICE_FILE" ] || return 0
+    isNativeHihySystemdService && return 0
     [ -f "$HIHY_LEGACY_SERVICE" ] || return 0
     [ -f "$HIHY_ROOT_DIR/result/service-migration.dismissed" ] && return 0
 
