@@ -6,6 +6,64 @@
 
 证书中心使用版本化目录原子发布证书，接收节点会校验证书格式、有效期、SAN 和私钥匹配后再切换。systemd timer 每天检查剩余有效期，并在需要时续期和重新分发。
 
+##### 分发后的证书位置
+
+证书中心和每台接收端都使用以下稳定路径：
+
+```text
+/etc/hihy/cert/shared/current/fullchain.pem
+/etc/hihy/cert/shared/current/privkey.pem
+```
+
+`current` 是指向当前证书版本目录的软链接。实际版本保存在：
+
+```text
+/etc/hihy/cert/shared/releases/<发布时间>/fullchain.pem
+/etc/hihy/cert/shared/releases/<发布时间>/privkey.pem
+/etc/hihy/cert/shared/releases/<发布时间>/fingerprint
+```
+
+目录结构示例：
+
+```text
+/etc/hihy/cert/shared/
+├── current -> releases/20260101T000000Z
+└── releases/
+    └── 20260101T000000Z/
+        ├── fullchain.pem
+        ├── privkey.pem
+        └── fingerprint
+```
+
+Hysteria 服务端配置使用 `current` 下的稳定路径：
+
+```yaml
+tls:
+  cert: /etc/hihy/cert/shared/current/fullchain.pem
+  key: /etc/hihy/cert/shared/current/privkey.pem
+```
+
+证书文件和目录权限如下：
+
+```text
+fullchain.pem  644
+privkey.pem    600
+fingerprint    600
+release 目录   700
+```
+
+脚本保留最近 3 个证书版本并自动清理更早的版本。证书中心由 Lego 申请的原始文件保存在 `/etc/hihy/cert-manager/lego/certificates/`，但实际分发和 Hysteria 使用的是 `/etc/hihy/cert/shared/current/` 下的文件。
+
+可以在中心端或接收端检查当前证书：
+
+```bash
+ls -l /etc/hihy/cert/shared/current
+ls -l /etc/hihy/cert/shared/current/
+openssl x509 \
+  -in /etc/hihy/cert/shared/current/fullchain.pem \
+  -noout -subject -issuer -dates -fingerprint -sha256
+```
+
 共享通配符私钥意味着任意节点失陷都会影响全部一级子域。发现节点被入侵后应立即重新签发新私钥和证书，并分发到所有节点。
 
 没有证据表明自签证书会被GFW所针对，不过不推荐自签某些特殊的域名，比如 `wechat.com`

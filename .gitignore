@@ -1,1 +1,27 @@
+# Local environment and runtime credentials
+.env
+.env.*
+!.env.example
+cloudflare.token
+deploy_ed25519
+deploy_ed25519.pub
+manager.conf
+receiver.conf
+known_hosts
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# Private keys and certificate bundles
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.gpg
+*.state
+
+# Exported certificate-manager profiles
 hihy-cert-profile-*.gpg

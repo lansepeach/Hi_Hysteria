@@ -84,7 +84,7 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 ## 文档
 
 - [防火墙问题](md/firewall.md)
-- [自签证书](md/certificate.md)
+- [证书配置与多服务器分发](md/certificate.md)
 - [UDP 服务商排雷列表](md/blacklist.md)
 - [延迟和上下行速度设置](md/speed.md)
 - [支持的客户端](md/client.md)
