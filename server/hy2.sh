@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.15"
+hihyV="ver1.16"
 
 umask 077
 
@@ -717,8 +717,8 @@ getArchitecture() {
         s390x)
             echo "s390x"
             ;;
-        ppc64le)
-            echo "ppc64le"
+        riscv64)
+            echo "riscv64"
             ;;
         loongarch64)
             echo "loong64"
@@ -1372,7 +1372,7 @@ setHysteriaConfig() {
             fi
         done
         echo -e "\n\n->域名: "$(echoColor red ${domain})"\n"
-        echo -e "\033[32m请选择DNS服务商:\n\n\033[0m\033[33m\033[01m1、Cloudflare(默认)\n2、Duck DNS\n3、Gandi.net\n4、Godaddy\n5、Name.com\n6、Vultr\033[0m\033[32m\n\n输入序号:\033[0m"
+        echo -e "\033[32m请选择DNS服务商:\n\n\033[0m\033[33m\033[01m1、Cloudflare(默认)\n2、Duck DNS\n3、Gandi.net\n4、Godaddy\n5、Namecheap\n6、Njalla\n7、Porkbun\n8、Vultr\033[0m\033[32m\n\n输入序号:\033[0m"
         read -r dnsNum
         if [ -z "${dnsNum}" ] || [ "${dnsNum}" == "1" ]; then
             dns="cloudflare"
@@ -1437,39 +1437,67 @@ setHysteriaConfig() {
                 fi
             done
         elif [ "${dnsNum}" == "5" ]; then
-            dns="namedotcom"
-            echo -e "\n\n->您选择Name.com DNS验证\n"
-            echoColor green "请输入Name.com namedotcom_api_token:"
+            dns="namecheap"
+            echo -e "\n\n->您选择Namecheap DNS验证\n"
+            echoColor green "请输入Namecheap namecheap_api_key:"
             while :; do
-                read -r namedotcom_api_token
-                if [ -z "${namedotcom_api_token}" ]; then
+                read -r namecheap_api_key
+                if [ -z "${namecheap_api_key}" ]; then
                     echoColor red "\n\n->此选项不能为空,请重新输入!"
-                    echoColor green "请输入Name.com namedotcom_api_token:"
+                    echoColor green "请输入Namecheap namecheap_api_key:"
                 else
                     break
                 fi
             done
-            echoColor green "请输入Name.com namedotcom_user:"
+            echoColor green "请输入Namecheap namecheap_api_user:"
             while :; do
-                read -r namedotcom_user
-                if [ -z "${namedotcom_user}" ]; then
+                read -r namecheap_api_user
+                if [ -z "${namecheap_api_user}" ]; then
                     echoColor red "\n\n->此选项不能为空,请重新输入!"
-                    echoColor green "请输入Name.com namedotcom_user:"
+                    echoColor green "请输入Namecheap namecheap_api_user:"
                 else
                     break
                 fi
             done
-            echoColor green "请输入Name.com namedotcom_server:"
-            while :; do
-                read -r namedotcom_server
-                if [ -z "${namedotcom_server}" ]; then
-                    echoColor red "\n\n->此选项不能为空,请重新输入!"
-                    echoColor green "请输入Name.com namedotcom_server:"
-                else
-                    break
-                fi
-            done
+            echoColor green "请输入Namecheap白名单客户端公网IP(留空由Core自动检测):"
+            read -r namecheap_client_ip
         elif [ "${dnsNum}" == "6" ]; then
+            dns="njalla"
+            echo -e "\n\n->您选择Njalla DNS验证\n"
+            echoColor green "请输入Njalla njalla_api_token:"
+            while :; do
+                read -r njalla_api_token
+                if [ -z "${njalla_api_token}" ]; then
+                    echoColor red "\n\n->此选项不能为空,请重新输入!"
+                    echoColor green "请输入Njalla njalla_api_token:"
+                else
+                    break
+                fi
+            done
+        elif [ "${dnsNum}" == "7" ]; then
+            dns="porkbun"
+            echo -e "\n\n->您选择Porkbun DNS验证\n"
+            echoColor green "请输入Porkbun porkbun_api_key:"
+            while :; do
+                read -r porkbun_api_key
+                if [ -z "${porkbun_api_key}" ]; then
+                    echoColor red "\n\n->此选项不能为空,请重新输入!"
+                    echoColor green "请输入Porkbun porkbun_api_key:"
+                else
+                    break
+                fi
+            done
+            echoColor green "请输入Porkbun porkbun_api_secret_key:"
+            while :; do
+                read -r porkbun_api_secret_key
+                if [ -z "${porkbun_api_secret_key}" ]; then
+                    echoColor red "\n\n->此选项不能为空,请重新输入!"
+                    echoColor green "请输入Porkbun porkbun_api_secret_key:"
+                else
+                    break
+                fi
+            done
+        elif [ "${dnsNum}" == "8" ]; then
             dns="vultr"
             echo -e "\n\n->您选择Vultr DNS验证\n"
             echoColor green "请输入Vultr vultr_api_token:"
@@ -1953,6 +1981,7 @@ setHysteriaConfig() {
     addOrUpdateYaml "$yaml_file" "quic.maxIdleTimeout" "30s"
     addOrUpdateYaml "$yaml_file" "quic.maxIncomingStreams" "1024"
     addOrUpdateYaml "$yaml_file" "quic.disablePathMTUDiscovery" "false"
+    addOrUpdateYaml "$yaml_file" "quic.disableStatelessReset" "false"
     if [ "${congestion_mode}" == "brutal" ]; then
         addOrUpdateYaml "$yaml_file" "bandwidth.up" "${server_upload}mbps"
         addOrUpdateYaml "$yaml_file" "bandwidth.down" "${server_download}mbps"
@@ -2072,11 +2101,22 @@ setHysteriaConfig() {
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "godaddy"
                     addOrUpdateYaml "$yaml_file" "acme.dns.config.godaddy_api_token" "${godaddy_api_token}"
                     ;;
-                "namedotcom")
-                    addOrUpdateYaml "$yaml_file" "acme.dns.name" "namedotcom"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namedotcom_api_token" "${namedotcom_api_token}"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namedotcom_user" "${namedotcom_user}"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namedotcom_server" "${namedotcom_server}"
+                "namecheap")
+                    addOrUpdateYaml "$yaml_file" "acme.dns.name" "namecheap"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_api_key" "${namecheap_api_key}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_api_user" "${namecheap_api_user}"
+                    if [ -n "${namecheap_client_ip}" ]; then
+                        addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_client_ip" "${namecheap_client_ip}"
+                    fi
+                    ;;
+                "njalla")
+                    addOrUpdateYaml "$yaml_file" "acme.dns.name" "njalla"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.njalla_api_token" "${njalla_api_token}"
+                    ;;
+                "porkbun")
+                    addOrUpdateYaml "$yaml_file" "acme.dns.name" "porkbun"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.porkbun_api_key" "${porkbun_api_key}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.porkbun_api_secret_key" "${porkbun_api_secret_key}"
                     ;;
                 "vultr")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "vultr"
@@ -2266,11 +2306,20 @@ downloadHysteriaCore() {
         "x86_64")
             asset_name="hysteria-linux-amd64"
             ;;
-        "aarch64")
+        "aarch64" | "arm64")
             asset_name="hysteria-linux-arm64"
             ;;
-        "mips64")
+        "armv5"*)
+            asset_name="hysteria-linux-armv5"
+            ;;
+        "armv6"* | "armv7"* | "arm")
+            asset_name="hysteria-linux-arm"
+            ;;
+        "mips" | "mipsle" | "mips64")
             asset_name="hysteria-linux-mipsle"
+            ;;
+        "riscv64")
+            asset_name="hysteria-linux-riscv64"
             ;;
         "s390x")
             asset_name="hysteria-linux-s390x"

@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.15`
+当前脚本版本：`1.0.16`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -18,6 +18,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 
 - 安装、卸载、启动、停止、重启 Hysteria2
 - 支持 ACME HTTP、ACME DNS、本地证书、自签证书
+- ACME DNS 支持 Cloudflare、Duck DNS、Gandi、GoDaddy、Namecheap、Njalla、Porkbun、Vultr
 - 支持中心端申请通配符证书，并通过受限 SSH 自动分发给多台接收端服务器
 - 支持 Brutal / BBR / Reno 拥塞控制模式
 - 支持 Hysteria2 原生端口跳跃/多端口范围监听
@@ -29,7 +30,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持添加 socks5 出站，包括 WireProxy/WARP
 - 支持安装失败状态恢复、后台版本检查和缓存提示
 - 支持 Alpine、Arch、Debian、Ubuntu、RHEL、CentOS、Rocky Linux 等常见发行版
-- 支持 x86_64、i386/i686、aarch64/arm64、armv7、s390x、ppc64le、loongarch64 等架构
+- 支持 x86_64、i386/i686、aarch64/arm64、ARMv5/ARMv6/ARMv7、MIPSLE、RISC-V、s390x、loongarch64 等官方发布架构
 - systemd 系统使用原生服务，旧版 rc.local/SysV 安装可确认后安全迁移
 - 防火墙规则采用所有权记录，卸载只删除脚本实际新增的规则
 - 端口跳跃优先使用 Hysteria 官方内置端口范围和自动重定向

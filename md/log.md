@@ -1,3 +1,13 @@
+##### (2026/08/26) 1.0.16
+
+```
+1、适配 Hysteria 2.12.2，显式启用默认的 QUIC stateless reset 快速重连行为
+2、移除 Hysteria 2.11.0 已删除、会导致 Core 启动失败的 Name.com ACME DNS 选项
+3、新增 Namecheap、Njalla、Porkbun ACME DNS 配置
+4、补齐 ARMv5/ARMv6/ARMv7、MIPSLE、RISC-V Core 下载映射，移除无官方二进制的 ppc64le 声明
+5、已内置 Gecko 混淆和随机端口跳跃；Mimic 因会中断旧客户端、且不能与端口跳跃共用，暂不自动安装或默认启用
+```
+
 ##### (2025/02/04) 1.0.2
 
 ```
