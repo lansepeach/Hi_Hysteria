@@ -29,7 +29,7 @@ jobs:
       - name: Check syntax and version consistency
         shell: bash
         run: |
-          for script in server/hy2.sh server/install.sh tests/hy2_regression.sh tests/reliability_regression.sh; do
+          for script in server/hy2.sh server/install.sh tests/hy2_regression.sh tests/reliability_regression.sh tests/nft_integration.sh; do
             bash -n "$script"
           done
           source server/hy2.sh
@@ -38,6 +38,11 @@ jobs:
         run: |
           bash tests/hy2_regression.sh
           bash tests/reliability_regression.sh
+      - name: Test nftables in an isolated network namespace
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2
+          sudo env "PATH=$PATH" bash tests/nft_integration.sh
       - name: Download verified Hysteria core
         shell: bash
         run: |

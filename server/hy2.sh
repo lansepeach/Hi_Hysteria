@@ -168,11 +168,15 @@ validateCertificateBundle() {
     local cert="$1"
     local key="$2"
     local domain="$3"
+    local subject_alt_names
 
     [ -s "$cert" ] && [ -s "$key" ] || return 1
     certificateMatchesKey "$cert" "$key" || return 1
     openssl x509 -in "$cert" -checkend 86400 -noout >/dev/null 2>&1 || return 1
-    openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -Fq "DNS:*.${domain}" || return 1
+    subject_alt_names=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null) || return 1
+    # SAN entries are comma-separated; a substring also accepts *.example.com.evil.test.
+    printf '%s\n' "$subject_alt_names" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | grep -ixF "DNS:*.${domain}" >/dev/null || return 1
 }
 
 installLego() {
@@ -2259,7 +2263,7 @@ setHysteriaConfig() {
             esac
         else
             getPortBindMsg TCP 80
-            allowPort tcp 80
+            allowPort tcp 80 || return 1
             addOrUpdateYaml "$yaml_file" "acme.type" "http"
             addOrUpdateYaml "$yaml_file" "acme.listenHost" "0.0.0.0"
         fi
@@ -2344,13 +2348,13 @@ setHysteriaConfig() {
             wait "$validation_pid" 2>/dev/null || true
             rm ./hihy_debug.info
             if [ "${realmMode}" != "true" ]; then
-                allowPort udp ${port}
+                allowPort udp "${port}" || return 1
                 if [ "${portHoppingStatus}" == "true" ]; then
-                    allowPort udp ${portHoppingStart}:${portHoppingEnd}
+                    allowPort udp "${portHoppingStart}:${portHoppingEnd}" || return 1
                 fi
                 if [ "${masquerade_tcp}" == "true" ]; then
                     getPortBindMsg TCP ${port}
-                    allowPort tcp ${port}
+                    allowPort tcp "${port}" || return 1
                 fi
             fi
             echoColor purple "Generating config..."
@@ -3093,7 +3097,7 @@ recordOwnedFirewallRule() {
     ensureHihyDirectories || return 1
     touch "$HIHY_FIREWALL_STATE_FILE"
     chmod 600 "$HIHY_FIREWALL_STATE_FILE"
-    if ! grep -qF "backend=${backend}|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE"; then
+    if ! grep -qxF "backend=${backend}|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE"; then
         printf 'backend=%s|protocol=%s|port=%s\n' "$backend" "$protocol" "$port" >>"$HIHY_FIREWALL_STATE_FILE"
     fi
 }
@@ -3103,7 +3107,7 @@ nftOwnedTableExists() {
 }
 
 nftOwnedTableIsManaged() {
-    nft list table inet hihy_firewall 2>/dev/null | grep -q 'hihy-owned:v1'
+    nft list table inet hihy_firewall 2>/dev/null | grep -q 'comment "hihy-owned:v1"'
 }
 
 writeNftOwnedRuleset() {
@@ -3151,24 +3155,96 @@ EOF
     mv -f "$temp_file" "$HIHY_NFT_RULESET_FILE"
 }
 
+writeNftFirewallBatch() {
+    local batch="$1" mode="${2:-apply}" snapshot table_name commands
+    local backend protocol port match_port
+    snapshot=$(nft -j list ruleset) || return 1
+    table_name=$(printf '%s' "$snapshot" | yq -p=json -r '
+        .nftables[] | select(has("table")) | .table |
+        select(.family == "inet" and .name == "hihy_firewall") | .name') || return 1
+    # JSON preserves table/chain names without interpolating them into nft syntax.
+    printf '%s\n' '{"nftables":[]}' >"$batch" || return 1
+    if [ -n "$table_name" ]; then
+        # Older nft JSON versions omit table comments; accept the legacy text marker too.
+        if nftOwnedTableIsManaged; then
+            yq -p=json -o=json -i '.nftables += [{"delete": {"table": {"family": "inet", "name": "hihy_firewall"}}}]' "$batch" || return 1
+        elif [ "$mode" = apply ]; then
+            echoColor red "检测到同名但不属于 Hi_Hysteria 的 nftables 表，拒绝修改。"
+            return 1
+        else
+            echoColor yellow "保留同名但不属于 Hi_Hysteria 的 nftables 表。"
+        fi
+    fi
+    # Handles change after reload. Discover only our tagged rules from the live ruleset.
+    commands=$(printf '%s' "$snapshot" | yq -p=json -o=json -I=0 '[
+        .nftables[] | select(has("rule")) | .rule |
+        select(.family == "inet" or .family == "ip" or .family == "ip6") |
+        select(.family != "inet" or .table != "hihy_firewall") |
+        select((.comment // "") | test("^hihy-owned:input:v1:(tcp|udp):[0-9]+(:[0-9]+)?$")) |
+        {"delete": {"rule": {"family": .family, "table": .table, "chain": .chain, "handle": .handle}}}
+        ]') || return 1
+    HIHY_NFT_COMMANDS="$commands" yq -p=json -o=json -i '.nftables += env(HIHY_NFT_COMMANDS)' "$batch" || return 1
+    [ "$mode" = apply ] || return 0
+    yq -p=json -o=json -i '.nftables += [
+        {"add": {"table": {"family": "inet", "name": "hihy_firewall"}}},
+        {"add": {"chain": {"family": "inet", "table": "hihy_firewall", "name": "hihy_input",
+            "type": "filter", "hook": "input", "prio": -10, "policy": "accept"}}},
+        {"add": {"rule": {"family": "inet", "table": "hihy_firewall", "chain": "hihy_input",
+            "expr": [{"counter": null}], "comment": "hihy-owned:v1"}}}
+        ]' "$batch" || return 1
+    # An accept in our own base chain cannot override drops in later base chains.
+    # Insert the requested ports at the start of every existing INPUT filter chain.
+    [ -f "$HIHY_FIREWALL_STATE_FILE" ] || return 0
+    while IFS='|' read -r backend protocol port; do
+        [ "$backend" = backend=nft ] || continue
+        protocol=${protocol#protocol=}
+        port=${port#port=}
+        validate_protocol "$protocol" || return 1
+        if [[ "$port" == *:* ]]; then
+            validate_port_range "${port%%:*}" "${port##*:}" || return 1
+            match_port="{\"range\": [${port%%:*}, ${port##*:}]}"
+        else
+            validate_port "$port" || return 1
+            match_port="$port"
+        fi
+        commands=$(printf '%s' "$snapshot" |
+            HIHY_NFT_PROTOCOL="$protocol" HIHY_NFT_PORT="$match_port" HIHY_NFT_PORT_LABEL="$port" \
+            yq -p=json -o=json -I=0 '
+            [{"match": {"op": "==", "left": {"payload": {"protocol": strenv(HIHY_NFT_PROTOCOL), "field": "dport"}},
+                "right": env(HIHY_NFT_PORT)}}, {"accept": null}] as $expr |
+            [.nftables[] | select(has("chain")) | .chain |
+                select(.family == "inet" or .family == "ip" or .family == "ip6") |
+                select(.hook == "input" and .type == "filter") |
+                select(.family != "inet" or .table != "hihy_firewall") |
+                {"insert": {"rule": {"family": .family, "table": .table, "chain": .name, "expr": $expr,
+                    "comment": "hihy-owned:input:v1:" + strenv(HIHY_NFT_PROTOCOL) + ":" + strenv(HIHY_NFT_PORT_LABEL)}}}
+            ] + [{"add": {"rule": {"family": "inet", "table": "hihy_firewall", "chain": "hihy_input", "expr": $expr,
+                "comment": "hihy-owned:" + strenv(HIHY_NFT_PROTOCOL) + ":" + strenv(HIHY_NFT_PORT_LABEL)}}}]') || return 1
+        HIHY_NFT_COMMANDS="$commands" yq -p=json -o=json -i '.nftables += env(HIHY_NFT_COMMANDS)' "$batch" || return 1
+    done <"$HIHY_FIREWALL_STATE_FILE"
+}
+
+restoreNftOwnedFirewall() (
+    local mode="${1:-apply}" batch
+    ensureHihyDirectories || return 1
+    batch=$(mktemp "$HIHY_NFT_DIR/apply.XXXXXX") || return 1
+    trap 'rm -f "$batch"' EXIT
+    if [ "$mode" = apply ]; then
+        writeNftOwnedRuleset || return 1
+    fi
+    writeNftFirewallBatch "$batch" "$mode" || return 1
+    # Deletion of old rules and insertion of new rules form one atomic transaction.
+    nft -j -c -f "$batch" && nft -j -f "$batch"
+)
+
 writeNftLoader() {
-    cat >"$HIHY_NFT_LOADER" <<EOF
-#!/bin/sh
-set -eu
-if nft list table inet hihy_firewall >/dev/null 2>&1; then
-    nft list table inet hihy_firewall | grep -q 'hihy-owned:v1' || {
-        echo 'Refusing to replace unowned nftables table inet hihy_firewall' >&2
-        exit 1
-    }
-    batch=\$(mktemp '${HIHY_NFT_DIR}/apply.XXXXXX')
-    trap 'rm -f "\$batch"' EXIT
-    printf '%s\n' 'delete table inet hihy_firewall' >"\$batch"
-    cat '$HIHY_NFT_RULESET_FILE' >>"\$batch"
-    nft -f "\$batch"
-else
-    nft -f '$HIHY_NFT_RULESET_FILE'
-fi
-EOF
+    # Re-discover chains and rule handles on boot instead of persisting stale handles.
+    {
+        printf '#!/bin/bash\n'
+        printf 'export HIHY_ROOT_DIR=%q HIHY_FIREWALL_STATE_FILE=%q HIHY_NFT_DIR=%q HIHY_NFT_RULESET_FILE=%q\n' \
+            "$HIHY_ROOT_DIR" "$HIHY_FIREWALL_STATE_FILE" "$HIHY_NFT_DIR" "$HIHY_NFT_RULESET_FILE"
+        printf 'exec %q firewall-restore\n' "$HIHY_BIN_LINK"
+    } >"$HIHY_NFT_LOADER" || return 1
     chmod 700 "$HIHY_NFT_LOADER"
 }
 
@@ -3231,19 +3307,14 @@ applyNftOwnedRuleset() {
         echoColor red "检测到同名但不属于 Hi_Hysteria 的 nftables 表，拒绝修改。"
         return 1
     fi
-    writeNftOwnedRuleset || return 1
     installNftPersistence || return 1
-    "$HIHY_NFT_LOADER"
+    restoreNftOwnedFirewall
 }
 
 removeNftOwnedFirewall() {
-    local result=0
-    if nftOwnedTableExists; then
-        if nftOwnedTableIsManaged; then
-            nft delete table inet hihy_firewall >/dev/null 2>&1 || result=1
-        else
-            echoColor yellow "保留同名但不属于 Hi_Hysteria 的 nftables 表。"
-        fi
+    if command -v nft >/dev/null 2>&1; then
+        # Keep persistence and ownership metadata available if cleanup fails.
+        restoreNftOwnedFirewall remove || return 1
     fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl disable hihy-firewall.service >/dev/null 2>&1 || true
@@ -3258,7 +3329,7 @@ removeNftOwnedFirewall() {
         sed -i "\|${HIHY_NFT_LOADER}|d" "$HIHY_RC_LOCAL"
     fi
     rm -f "$HIHY_NFT_RULESET_FILE" "$HIHY_NFT_LOADER"
-    return "$result"
+    return 0
 }
 
 firewallRuleExists() {
@@ -3273,7 +3344,7 @@ firewallRuleExists() {
             zone=$(firewall-cmd --get-default-zone)
             firewall-cmd --zone="$zone" --query-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1
             ;;
-        nft) grep -qF "backend=nft|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE" 2>/dev/null ;;
+        nft) grep -qxF "backend=nft|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE" 2>/dev/null ;;
         iptables) iptables -w 5 -C INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT >/dev/null 2>&1 ;;
         *) return 1 ;;
     esac
@@ -3300,6 +3371,11 @@ allowPort() {
     fi
 
     if firewallRuleExists "$backend" "$protocol" "$port"; then
+        if [ "$backend" = nft ]; then
+            applyNftOwnedRuleset || return 1
+            echoColor purple "已重新应用脚本管理的防火墙规则: ${port}/${protocol}"
+            return 0
+        fi
         echoColor purple "防火墙规则已存在，不会在卸载时删除: ${port}/${protocol}"
         return 0
     fi
@@ -3318,7 +3394,8 @@ allowPort() {
         nft)
             recordOwnedFirewallRule "$backend" "$protocol" "$port" || return 1
             if ! applyNftOwnedRuleset; then
-                sed -i "\|^backend=nft|protocol=${protocol}|port=${port}$|d" "$HIHY_FIREWALL_STATE_FILE"
+                sed -i "/^backend=nft|protocol=${protocol}|port=${port}$/d" "$HIHY_FIREWALL_STATE_FILE"
+                writeNftOwnedRuleset >/dev/null 2>&1 || true
                 echoColor red "nftables 自动放行失败。"
                 return 1
             fi
@@ -5567,6 +5644,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             fi
             ;;
         firewall-apply) applyNftOwnedRuleset ;;
+        firewall-restore) restoreNftOwnedFirewall ;;
         cronTask) cronTask ;;
         *) menu ;;
     esac

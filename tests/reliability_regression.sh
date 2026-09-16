@@ -16,6 +16,41 @@ assert_eq "$(formatURIHost '[fe80::1%eth0]')" '[fe80::1%25eth0]'
 assert_eq "$(formatURIHost '[fe80::1%eth0]' native)" '[fe80::1%eth0]'
 assert_eq "$(formatURIHost 'example.com')" 'example.com'
 
+# Port ownership must match the whole record, including range endpoints.
+(
+    ensureHihyDirectories
+    recordOwnedFirewallRule nft udp 4433
+    if firewallRuleExists nft udp 443; then fail '4433 matched 443'; fi
+    recordOwnedFirewallRule nft udp 443
+    firewallRuleExists nft udp 443 || fail '443 ownership missing'
+    recordOwnedFirewallRule nft udp 443
+    assert_eq "$(wc -l < "$HIHY_FIREWALL_STATE_FILE")" 2
+    recordOwnedFirewallRule nft udp 100:2000
+    if firewallRuleExists nft udp 100:200; then fail 'range prefix matched'; fi
+    recordOwnedFirewallRule nft udp 100:200
+    firewallRuleExists nft udp 100:200 || fail 'range ownership missing'
+    if firewallRuleExists nft tcp 443; then fail 'UDP ownership matched TCP'; fi
+    rm -f "$HIHY_FIREWALL_STATE_FILE"
+)
+
+# Use real certificates: only a complete wildcard DNS SAN may authorize publication.
+(
+    cert="$scratch/bundle.crt"; key="$scratch/bundle.key"
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$key" 2>/dev/null
+    for san in 'DNS:*.example.com.evil.test' 'DNS:*.sub.example.com' 'DNS:example.com' 'DNS:*.example.com'; do
+        openssl req -x509 -key "$key" -out "$cert" -subj '/CN=*.example.com' \
+            -addext "subjectAltName=DNS:unrelated.test,$san,DNS:last.test" -days 3 2>/dev/null
+        if [ "$san" = 'DNS:*.example.com' ]; then
+            validateCertificateBundle "$cert" "$key" example.com || fail 'valid wildcard SAN rejected'
+            validateCertificateBundle "$cert" "$key" EXAMPLE.COM || fail 'case-insensitive DNS rejected'
+        elif validateCertificateBundle "$cert" "$key" example.com; then
+            fail "wrong SAN accepted: $san"
+        fi
+    done
+    openssl req -x509 -key "$key" -out "$cert" -subj '/CN=*.example.com' -days 3 2>/dev/null
+    if validateCertificateBundle "$cert" "$key" example.com; then fail 'CN-only certificate accepted'; fi
+)
+
 # ARMv5 must not receive an incompatible ARMv6 binary; endian mapping is explicit.
 (
     uname() { echo armv6l; }; assert_eq "$(getArchitecture)" arm

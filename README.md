@@ -123,7 +123,10 @@ hihy 9
 ```bash
 bash tests/hy2_regression.sh
 bash tests/reliability_regression.sh
+sudo env "PATH=$PATH" bash tests/nft_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria
 ```
 
 测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，不会调用生产节点或申请真实证书。
+
+nftables 集成测试还需要 root、nftables、iproute2 和网络命名空间支持；它在独立网络命名空间内验证 IPv4/IPv6 通流、重载及卸载清理，不修改主机防火墙。
