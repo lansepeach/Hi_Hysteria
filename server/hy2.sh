@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.17"
+hihyV="ver1.18"
 
 umask 077
 
@@ -712,8 +712,22 @@ getArchitecture() {
         aarch64 | arm64)
             echo "arm64"
             ;;
-        armv7*)
+        armv6* | armv7* | arm)
             echo "arm"
+            ;;
+        armv5*)
+            echoColor red "官方 yq ARM 包要求 ARMv6；ARMv5 请预先安装兼容的 yq v4。" >&2
+            return 1
+            ;;
+        mipsle | mips64le)
+            echo "$arch"
+            ;;
+        mips | mips64)
+            if [ "$(od -An -tu1 -j5 -N1 /proc/self/exe | tr -d '[:space:]')" = 1 ]; then
+                echo "${arch}le"
+            else
+                echo "$arch"
+            fi
             ;;
         s390x)
             echo "s390x"
@@ -725,7 +739,8 @@ getArchitecture() {
             echo "loong64"
             ;;
         *)
-            echo "unknown"
+            echoColor red "没有匹配的 yq 架构: $arch" >&2
+            return 1
             ;;
     esac
 }
@@ -859,8 +874,8 @@ checkSystemForUpdate() {
 
     # 检查 yq 命令
     # 安装 yq
-    if ! command -v yq >/dev/null; then
-        arch=$(getArchitecture)
+    if ! command -v yq >/dev/null || ! yq --version 2>/dev/null | grep -q 'version v4\.'; then
+        arch=$(getArchitecture) || return 1
         echoColor purple "正在下载 yq (${arch})..."
         if ! downloadToFile "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}" "$HIHY_YQ_BIN"; then
             if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
@@ -871,6 +886,9 @@ checkSystemForUpdate() {
             exit 1
         fi
         chmod +x "$HIHY_YQ_BIN"
+        "$HIHY_YQ_BIN" --version 2>/dev/null | grep -q 'version v4\.' || {
+            echoColor red "yq 无法运行或版本不兼容。"; return 1;
+        }
     fi
 }
 
@@ -1094,14 +1112,14 @@ addOrUpdateYaml() {
     # 将值转换为 JSON 格式以避免解析错误
     local jsonValue
     if [[ $valueType == "auto" ]]; then
-        jsonValue=$(echo "$value" | yq eval -o=json)
+        jsonValue=$(printf '%s\n' "$value" | yq eval -o=json) || return 1
     elif [[ $valueType == "string" ]]; then
         HIHY_YAML_VALUE="$value" yq eval ".${keyPath} = strenv(HIHY_YAML_VALUE)" -i "$file"
         return $?
     elif [[ $valueType == "number" ]]; then
-        jsonValue=$(echo "$value" | yq eval -o=json)
+        jsonValue=$(printf '%s\n' "$value" | yq eval -o=json) || return 1
     elif [[ $valueType == "bool" ]]; then
-        jsonValue=$(echo "$value" | yq eval -o=json)
+        jsonValue=$(printf '%s\n' "$value" | yq eval -o=json) || return 1
     else
         echo "Unsupported value type: $valueType"
         return 1
@@ -1169,12 +1187,29 @@ getECHConfigList() {
     printf '%s\n' "$config"
 }
 
-encodeECHQuery() {
-    local value="$1"
-    value=${value//+/%2B}
-    value=${value//\//%2F}
-    value=${value//=/%3D}
-    printf '%s' "$value"
+encodeURIComponent() {
+    local LC_ALL=C value="$1" char encoded i
+    for ((i=0; i<${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-]) printf '%s' "$char" ;;
+            *) printf -v encoded '%%%02X' "'$char"; printf '%s' "$encoded" ;;
+        esac
+    done
+}
+
+encodeECHQuery() { encodeURIComponent "$1"; }
+
+formatURIHost() {
+    local host="$1"
+    host="${host#[}"
+    host="${host%]}"
+    if [[ "$host" == *:* ]]; then
+        [ "${2:-uri}" = native ] || host="${host//%/%25}"
+        printf '[%s]' "$host"
+    else
+        printf '%s' "$host"
+    fi
 }
 
 prepareECH() {
@@ -1297,7 +1332,7 @@ setHysteriaConfig() {
             echoColor red "牵手服务器选项输入错误。"
             return 1
         fi
-        realmURI="realm://${realmPassword}@${realmAddress}/${realmName}"
+        realmURI="realm://$(encodeURIComponent "$realmPassword")@${realmAddress}/$(encodeURIComponent "$realmName")"
         echo -e "\n->牵手地址: "$(echoColor red ${realmURI})"\n"
         if command -v warp >/dev/null 2>&1 && [ -f "/etc/wireguard/warp.conf" ]; then
             echoColor purple "\n->检测到已安装WARP,可通过 warp d 命令获得双栈WARP IP"
@@ -2036,11 +2071,11 @@ setHysteriaConfig() {
     fi
 
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml "$yaml_file" "listen" "${realmURI}"
+        addOrUpdateYaml "$yaml_file" "listen" "${realmURI}" "string"
     elif [ "${portHoppingStatus}" == "true" ]; then
-        addOrUpdateYaml "$yaml_file" "listen" ":${port},${portHoppingStart}-${portHoppingEnd}"
+        addOrUpdateYaml "$yaml_file" "listen" ":${port},${portHoppingStart}-${portHoppingEnd}" "string"
     else
-        addOrUpdateYaml "$yaml_file" "listen" ":${port}"
+        addOrUpdateYaml "$yaml_file" "listen" ":${port}" "string"
     fi
     if [ "${realmMode}" == "true" ]; then
         addOrUpdateYaml "$yaml_file" "realm.stunServers[0]" "stun.nextcloud.com:3478"
@@ -2053,7 +2088,7 @@ setHysteriaConfig() {
         yq eval 'del(.realm)' -i "$yaml_file"
     fi
     addOrUpdateYaml "$yaml_file" "auth.type" "password"
-    addOrUpdateYaml "$yaml_file" "auth.password" "${auth_secret}"
+    addOrUpdateYaml "$yaml_file" "auth.password" "${auth_secret}" "string"
     addOrUpdateYaml "$yaml_file" "ignoreClientBandwidth" "${ignore_client_bandwidth}"
     if [ "${congestion_mode}" != "brutal" ]; then
         addOrUpdateYaml "$yaml_file" "congestion.type" "${congestion_type}"
@@ -2065,7 +2100,7 @@ setHysteriaConfig() {
     fi
     if [ "${obfs_status}" == "true" ]; then
         addOrUpdateYaml "$yaml_file" "obfs.type" "${obfs_type}"
-        addOrUpdateYaml "$yaml_file" "obfs.${obfs_type}.password" "${obfs_pass}"
+        addOrUpdateYaml "$yaml_file" "obfs.${obfs_type}.password" "${obfs_pass}" "string"
     else
         yq eval 'del(.obfs)' -i "$yaml_file"
     fi
@@ -2087,18 +2122,18 @@ setHysteriaConfig() {
     else
         yq eval 'del(.bandwidth)' -i "$yaml_file"
     fi
-    addOrUpdateYaml "$yaml_file" "acl.file" "${acl_file}"
+    addOrUpdateYaml "$yaml_file" "acl.file" "${acl_file}" "string"
     case ${masquerade_type} in
         "string")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "string"
-            addOrUpdateYaml "$yaml_file" "masquerade.string.content" "${masquerade_string}"
+            addOrUpdateYaml "$yaml_file" "masquerade.string.content" "${masquerade_string}" "string"
             addOrUpdateYaml "$yaml_file" "masquerade.string.headers.content-type" "text/plain"
-            addOrUpdateYaml "$yaml_file" "masquerade.string.headers.custom-stuff" "${masquerade_stuff}"
+            addOrUpdateYaml "$yaml_file" "masquerade.string.headers.custom-stuff" "${masquerade_stuff}" "string"
             addOrUpdateYaml "$yaml_file" "masquerade.string.statusCode" "200"
             ;;
         "proxy")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "proxy"
-            addOrUpdateYaml "$yaml_file" "masquerade.proxy.url" "${masquerade_proxy}"
+            addOrUpdateYaml "$yaml_file" "masquerade.proxy.url" "${masquerade_proxy}" "string"
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.rewriteHost" "true"
             echoColor green "是否跳过伪装上游 TLS 证书验证?"
             echoColor yellow "1、不跳过，验证证书(推荐/默认)  2、跳过验证(仅自签或特殊上游)"
@@ -2112,7 +2147,7 @@ setHysteriaConfig() {
             ;;
         "file")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "file"
-            addOrUpdateYaml "$yaml_file" "masquerade.file.dir" "${masquerade_file}"
+            addOrUpdateYaml "$yaml_file" "masquerade.file.dir" "${masquerade_file}" "string"
             if [ ! -d "${masquerade_file}" ]; then
                 mkdir -p ${masquerade_file}
                 wget -q -O ./mikutap.tar.gz https://github.com/HFIProgramming/mikutap/archive/refs/tags/2.0.0.tar.gz
@@ -2154,8 +2189,8 @@ setHysteriaConfig() {
             echoColor green "移动 CA 证书到结果目录..."
             mv /etc/hihy/cert/${domain}.ca.crt /etc/hihy/result
             echoColor purple "证书生成成功！\n"
-            addOrUpdateYaml "$yaml_file" "tls.cert" "/etc/hihy/cert/${domain}.crt"
-            addOrUpdateYaml "$yaml_file" "tls.key" "/etc/hihy/cert/${domain}.key"
+            addOrUpdateYaml "$yaml_file" "tls.cert" "/etc/hihy/cert/${domain}.crt" "string"
+            addOrUpdateYaml "$yaml_file" "tls.key" "/etc/hihy/cert/${domain}.key" "string"
             addOrUpdateYaml "$yaml_file" "tls.sniGuard" "strict"
         else
             u_host=${domain}
@@ -2164,8 +2199,8 @@ setHysteriaConfig() {
                 remarks="${domain}"
             fi
             insecure="0"
-            addOrUpdateYaml "$yaml_file" "tls.cert" "${local_cert}"
-            addOrUpdateYaml "$yaml_file" "tls.key" "${local_key}"
+            addOrUpdateYaml "$yaml_file" "tls.cert" "${local_cert}" "string"
+            addOrUpdateYaml "$yaml_file" "tls.key" "${local_key}" "string"
             addOrUpdateYaml "$yaml_file" "tls.sniGuard" "strict"
         fi
     else
@@ -2175,8 +2210,8 @@ setHysteriaConfig() {
         if [ -z "${remarks}" ]; then
             remarks="${domain}"
         fi
-        addOrUpdateYaml "$yaml_file" "acme.domains" "${domain}"
-        addOrUpdateYaml "$yaml_file" "acme.email" "pekora@${domain}"
+        addOrUpdateYaml "$yaml_file" "acme.domains" "${domain}" "string"
+        addOrUpdateYaml "$yaml_file" "acme.email" "pekora@${domain}" "string"
         addOrUpdateYaml "$yaml_file" "acme.ca" "letsencrypt"
         addOrUpdateYaml "$yaml_file" "acme.dir" "/etc/hihy/cert"
         if [ "${useDns}" == "true" ]; then
@@ -2185,41 +2220,41 @@ setHysteriaConfig() {
             case ${dns} in
                 "cloudflare")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "cloudflare"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.cloudflare_api_token" "${cloudflare_api_token}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.cloudflare_api_token" "${cloudflare_api_token}" "string"
                     ;;
                 "duckdns")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "duckdns"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.duckdns_api_token" "${duckdns_api_token}"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.duckdns_override_domain" "${duckdns_override_domain}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.duckdns_api_token" "${duckdns_api_token}" "string"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.duckdns_override_domain" "${duckdns_override_domain}" "string"
                     ;;
                 "gandi")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "gandi"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.gandi_api_token" "${gandi_api_token}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.gandi_api_token" "${gandi_api_token}" "string"
                     ;;
                 "godaddy")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "godaddy"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.godaddy_api_token" "${godaddy_api_token}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.godaddy_api_token" "${godaddy_api_token}" "string"
                     ;;
                 "namecheap")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "namecheap"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_api_key" "${namecheap_api_key}"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_api_user" "${namecheap_api_user}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_api_key" "${namecheap_api_key}" "string"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_api_user" "${namecheap_api_user}" "string"
                     if [ -n "${namecheap_client_ip}" ]; then
-                        addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_client_ip" "${namecheap_client_ip}"
+                        addOrUpdateYaml "$yaml_file" "acme.dns.config.namecheap_client_ip" "${namecheap_client_ip}" "string"
                     fi
                     ;;
                 "njalla")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "njalla"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.njalla_api_token" "${njalla_api_token}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.njalla_api_token" "${njalla_api_token}" "string"
                     ;;
                 "porkbun")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "porkbun"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.porkbun_api_key" "${porkbun_api_key}"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.porkbun_api_secret_key" "${porkbun_api_secret_key}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.porkbun_api_key" "${porkbun_api_key}" "string"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.porkbun_api_secret_key" "${porkbun_api_secret_key}" "string"
                     ;;
                 "vultr")
                     addOrUpdateYaml "$yaml_file" "acme.dns.name" "vultr"
-                    addOrUpdateYaml "$yaml_file" "acme.dns.config.vultr_api_token" "${vultr_api_token}"
+                    addOrUpdateYaml "$yaml_file" "acme.dns.config.vultr_api_token" "${vultr_api_token}" "string"
                     ;;
             esac
         else
@@ -2255,7 +2290,7 @@ setHysteriaConfig() {
         trafficPort=$((${port} + 1))
     fi
     addOrUpdateYaml "$yaml_file" "trafficStats.listen" "127.0.0.1:${trafficPort}"
-    addOrUpdateYaml "$yaml_file" "trafficStats.secret" "${auth_secret}"
+    addOrUpdateYaml "$yaml_file" "trafficStats.secret" "${auth_secret}" "string"
     if [ ${block_http3} == "true" ]; then
         echo -e "reject(all, udp/443)" >${acl_file}
     fi
@@ -2339,7 +2374,7 @@ setHysteriaConfig() {
     fi
     backup_file="$HIHY_BACKUP_FILE"
     touch ${backup_file}
-    addOrUpdateYaml ${backup_file} "remarks" "${remarks}"
+    addOrUpdateYaml ${backup_file} "remarks" "${remarks}" "string"
     addOrUpdateYaml ${backup_file} "serverAddress" "${u_host}" "string"
     addOrUpdateYaml ${backup_file} "serverPort" "${port}"
     addOrUpdateYaml ${backup_file} "congestionMode" "${congestion_mode}"
@@ -2355,13 +2390,13 @@ setHysteriaConfig() {
     addOrUpdateYaml ${backup_file} "portHoppingHopInterval" "${portHoppingHopInterval}"
     addOrUpdateYaml ${backup_file} "portHoppingMinHopInterval" "${portHoppingMinHopInterval}"
     addOrUpdateYaml ${backup_file} "portHoppingMaxHopInterval" "${portHoppingMaxHopInterval}"
-    addOrUpdateYaml ${backup_file} "domain" "${domain}"
+    addOrUpdateYaml ${backup_file} "domain" "${domain}" "string"
     addOrUpdateYaml ${backup_file} "trafficPort" "${trafficPort}"
     addOrUpdateYaml ${backup_file} "socks5_status" "false"
     addOrUpdateYaml ${backup_file} "realmMode" "${realmMode}"
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml ${backup_file} "realmURI" "${realmURI}"
-        addOrUpdateYaml ${backup_file} "realmName" "${realmName}"
+        addOrUpdateYaml ${backup_file} "realmURI" "${realmURI}" "string"
+        addOrUpdateYaml ${backup_file} "realmName" "${realmName}" "string"
     fi
     addOrUpdateYaml ${backup_file} "masquerade_xforwarded" "${masquerade_xforwarded}"
     if [ "$masquerade_tcp" == "true" ]; then
@@ -3257,7 +3292,8 @@ allowPort() {
         validate_port "$port" || return 1
     fi
 
-    backend=$(detectFirewallBackend)
+    backend="${3:-$(detectFirewallBackend)}"
+    case "$backend" in ufw | firewalld | iptables | nft | none) ;; *) return 1 ;; esac
     if [ "$backend" = "none" ]; then
         echoColor yellow "未检测到活动防火墙，请在云安全组中开放 ${port}/${protocol}。"
         return 0
@@ -3295,7 +3331,7 @@ allowPort() {
 }
 
 removeOwnedFirewallRules() {
-    local line backend protocol port zone has_nft="false"
+    local line backend protocol port zone has_nft="false" has_firewalld=false result=0
     if [ ! -f "$HIHY_FIREWALL_STATE_FILE" ]; then
         removeNftOwnedFirewall
         return $?
@@ -3307,25 +3343,31 @@ removeOwnedFirewallRules() {
         port=$(printf '%s' "$line" | cut -d'|' -f3 | cut -d= -f2)
         validate_protocol "$protocol" || continue
         case "$backend" in
-            ufw) ufw delete allow "${port}/${protocol}" >/dev/null 2>&1 || true ;;
+            ufw) ufw delete allow "${port}/${protocol}" >/dev/null 2>&1 || result=1 ;;
             firewalld)
+                has_firewalld=true
                 zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
-                firewall-cmd --zone="$zone" --remove-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1 || true
+                firewall-cmd --zone="$zone" --remove-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1 || result=1
                 ;;
             iptables)
                 while iptables -w 5 -C INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT >/dev/null 2>&1; do
-                    iptables -w 5 -D INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT || break
+                    iptables -w 5 -D INPUT -p "$protocol" --dport "$port" -m comment --comment "hihy-owned:${protocol}:${port}" -j ACCEPT || { result=1; break; }
                 done
                 ;;
             nft) has_nft="true" ;;
         esac
     done <"$HIHY_FIREWALL_STATE_FILE"
-    command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
+    if [ "$has_firewalld" = true ]; then
+        firewall-cmd --reload >/dev/null 2>&1 || result=1
+    fi
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
     if [ "$has_nft" = "true" ] || nftOwnedTableExists || [ -f "$HIHY_NFT_RULESET_FILE" ] || [ -f "$HIHY_NFT_SERVICE_FILE" ]; then
-        removeNftOwnedFirewall || true
+        removeNftOwnedFirewall || result=1
     fi
-    rm -f "$HIHY_FIREWALL_STATE_FILE"
+    if [ "$result" = 0 ]; then
+        rm -f "$HIHY_FIREWALL_STATE_FILE" || result=1
+    fi
+    return "$result"
 }
 
 explainOfficialPortHopping() {
@@ -3392,7 +3434,7 @@ install() {
     echoColor purple "Ready to install.\n"
 
     # 获取版本并下载核心
-    checkSystemForUpdate
+    checkSystemForUpdate || return 1
     downloadHysteriaCore || return 1
     setHysteriaConfig || return 1
 
@@ -3755,14 +3797,17 @@ generate_client_config() {
     fi
     touch ${client_configfile}
     chmod 600 "$client_configfile"
+    local uri_host native_host
+    uri_host=$(formatURIHost "$serverAddress")
+    native_host=$(formatURIHost "$serverAddress" native)
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "server" "${realmURI}"
-        addOrUpdateYaml "$client_configfile" "auth" "${auth_secret}"
+        addOrUpdateYaml "$client_configfile" "server" "${realmURI}" "string"
     elif [ "${portHoppingStatus}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port},${serverPortRange}/"
+        addOrUpdateYaml "$client_configfile" "server" "${native_host}:${port},${serverPortRange}" "string"
     else
-        addOrUpdateYaml "$client_configfile" "server" "hysteria2://${auth_secret}@${serverAddress}:${port}/"
+        addOrUpdateYaml "$client_configfile" "server" "${native_host}:${port}" "string"
     fi
+    addOrUpdateYaml "$client_configfile" "auth" "$auth_secret" "string"
     if [ "${realmMode}" == "true" ]; then
         addOrUpdateYaml "$client_configfile" "realm.stunServers[0]" "stun.chat.bilibili.com:3478"
         addOrUpdateYaml "$client_configfile" "realm.stunServers[1]" "stun.miwifi.com:3478"
@@ -3778,7 +3823,7 @@ generate_client_config() {
 
     local ech_config=""
     exportClientECH "$HIHY_CONFIG_FILE" "$client_configfile" || return 1
-    addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}"
+    addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}" "string"
     if [ "${insecure}" == "true" ]; then
         addOrUpdateYaml "$client_configfile" "tls.insecure" "true"
     elif [ "${insecure}" == "false" ]; then
@@ -3797,7 +3842,7 @@ generate_client_config() {
     fi
     if [ "${obfs_status}" == "true" ]; then
         addOrUpdateYaml "$client_configfile" "obfs.type" "${obfs_type}"
-        addOrUpdateYaml "$client_configfile" "obfs.${obfs_type}.password" "${obfs_pass}"
+        addOrUpdateYaml "$client_configfile" "obfs.${obfs_type}.password" "${obfs_pass}" "string"
     else
         yq eval 'del(.obfs)' -i "$client_configfile"
     fi
@@ -3828,7 +3873,7 @@ generate_client_config() {
     if [ "${realmMode}" == "true" ]; then
         url=""
     else
-        url_base="hy2://${auth_secret}@${serverAddress}"
+        url_base="hy2://$(encodeURIComponent "$auth_secret")@${uri_host}"
 
         if [ "${portHoppingStatus}" == "true" ]; then
             url_base="${url_base}:${port}/?mport=${serverPortRange}&"
@@ -3843,12 +3888,12 @@ generate_client_config() {
         fi
 
         if [ "${obfs_status}" == "true" ]; then
-            url_base="${url_base}&obfs=${obfs_type}&obfs-password=${obfs_pass}"
+            url_base="${url_base}&obfs=$(encodeURIComponent "$obfs_type")&obfs-password=$(encodeURIComponent "$obfs_pass")"
         fi
         if [ -n "$ech_config" ]; then
             url_base="${url_base}&ech=$(encodeECHQuery "$ech_config")"
         fi
-        url="${url_base}&sni=${tls_sni}#Hy2-${remarks}"
+        url="${url_base}&sni=$(encodeURIComponent "$tls_sni")#$(encodeURIComponent "Hy2-${remarks}")"
     fi
     # 在生成配置前添加分隔线
     echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -4099,19 +4144,21 @@ EOF
         portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}")
         portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}")
     fi
-    addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}"
+    serverAddress="${serverAddress#[}"
+    serverAddress="${serverAddress%]}"
+    addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}" "string"
     addOrUpdateYaml "${metaFile}" "proxies[0].type" "hysteria2"
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}"
+        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}" "string"
         yq eval 'del(.proxies[0].port)' -i "${metaFile}"
     else
-        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}"
+        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}" "string"
         addOrUpdateYaml "${metaFile}" "proxies[0].port" "${port}"
         if [ "${portHoppingStatus}" == "true" ]; then
             addOrUpdateYaml "${metaFile}" "proxies[0].ports" "${portHoppingStart}-${portHoppingEnd}"
         fi
     fi
-    addOrUpdateYaml "${metaFile}" "proxies[0].password" "${auth_secret}"
+    addOrUpdateYaml "${metaFile}" "proxies[0].password" "${auth_secret}" "string"
     # BBR/Reno 不设置固定带宽，不能导出空的 " Mbps"。
     if [[ "$upload" =~ ^[0-9]+$ ]] && [ "$upload" -gt 0 ]; then
         addOrUpdateYaml "${metaFile}" "proxies[0].up" "${upload} Mbps"
@@ -4126,14 +4173,14 @@ EOF
     addOrUpdateYaml "${metaFile}" "proxies[0].skip-cert-verify" "${insecure}"
     if [ "${obfs_status}" == "true" ]; then
         addOrUpdateYaml "${metaFile}" "proxies[0].obfs" "${obfs_type}"
-        addOrUpdateYaml "${metaFile}" "proxies[0].obfs-password" "${obfs_pass}"
+        addOrUpdateYaml "${metaFile}" "proxies[0].obfs-password" "${obfs_pass}" "string"
     else
         yq eval 'del(.proxies[0].obfs, .proxies[0].obfs-password)' -i "${metaFile}"
     fi
-    addOrUpdateYaml "${metaFile}" "proxies[0].sni" "${tls_sni}"
+    addOrUpdateYaml "${metaFile}" "proxies[0].sni" "${tls_sni}" "string"
     addOrUpdateYaml "${metaFile}" "proxy-groups[0].name" "PROXY"
     addOrUpdateYaml "${metaFile}" "proxy-groups[0].type" "select"
-    addOrUpdateYaml "${metaFile}" "proxy-groups[0].proxies" "[${remarks}]"
+    addOrUpdateYaml "${metaFile}" "proxy-groups[0].proxies[0]" "${remarks}" "string"
     echoColor purple "\n📱 4、[Clash.Mini/ClashX.Meta/Clash.Meta for Android/Clash.verge/openclash] ClashMeta配置。文件地址: $(echoColor green ${metaFile})"
     if [ "${realmMode}" == "true" ]; then
         echoColor yellow "⚠ Clash Meta可能不完全支持Realm模式,建议优先使用原生配置文件"
@@ -4508,80 +4555,110 @@ changeIp64() {
     esac
 }
 
+restoreReconfiguration() {
+    local backup_dir="$1" was_running="$2" backend protocol rule_port result=0
+    local old_port old_realm old_hopping old_start old_end old_tcp
+    if ! serviceStop && serviceIsActive; then
+        echoColor red "新服务未能停止，尚未恢复文件。"
+        return 1
+    fi
+    removeOwnedFirewallRules || return 1
+    cp -a "$backup_dir/config.yaml" "$HIHY_CONFIG_FILE" || return 1
+    cp -a "$backup_dir/backup.yaml" "$HIHY_BACKUP_FILE" || return 1
+    if [ -f "$backup_dir/acl.txt" ]; then
+        cp -a "$backup_dir/acl.txt" "$HIHY_ACL_FILE" || return 1
+    else
+        rm -f "$HIHY_ACL_FILE" || return 1
+    fi
+    if [ -d "$backup_dir/cert" ]; then
+        mkdir -p "$HIHY_ROOT_DIR/cert" || return 1
+        cp -a "$backup_dir/cert/." "$HIHY_ROOT_DIR/cert/" || return 1
+    fi
+    if [ -f "$backup_dir/firewall-owned.state" ]; then
+        # 逐条重建实际规则并重新记录所有权，不能只恢复状态文件。
+        while IFS='|' read -r backend protocol rule_port; do
+            [ -n "$backend" ] || continue
+            allowPort "${protocol#protocol=}" "${rule_port#port=}" "${backend#backend=}" || result=1
+        done < "$backup_dir/firewall-owned.state"
+    else
+        # 兼容尚无所有权记录的旧安装；已有的外部规则不会被接管。
+        old_realm=$(getBackupValueOrDefault "$backup_dir/backup.yaml" realmMode false)
+        old_port=$(getYamlValue "$backup_dir/backup.yaml" serverPort)
+        if [ "$old_realm" != true ] && validate_port "$old_port"; then
+            allowPort udp "$old_port" || result=1
+            old_hopping=$(getBackupValueOrDefault "$backup_dir/backup.yaml" portHoppingStatus false)
+            old_tcp=$(getBackupValueOrDefault "$backup_dir/backup.yaml" masquerade_tcp false)
+            if [ "$old_hopping" = true ]; then
+                old_start=$(getYamlValue "$backup_dir/backup.yaml" portHoppingStart)
+                old_end=$(getYamlValue "$backup_dir/backup.yaml" portHoppingEnd)
+                allowPort udp "$old_start:$old_end" || result=1
+            fi
+            if [ "$old_tcp" = true ]; then
+                allowPort tcp "$old_port" || result=1
+            fi
+        fi
+    fi
+    secureHihyPermissions || result=1
+    if [ "$was_running" = true ]; then
+        if ! serviceStart || ! waitHihyServiceHealthy; then
+            echoColor red "旧配置已恢复，但服务未恢复正常。"
+            result=1
+        fi
+    fi
+    if [ "$result" = 0 ]; then
+        clearInstallFailureMarker
+        echoColor yellow "已恢复旧配置、防火墙和原服务启停状态。"
+    fi
+    return "$result"
+}
+
 changeServerConfig() {
-    local previous_port backup_dir was_running="false"
-    if [ "$(classifyInstallState)" != "installed" ]; then
+    local backup_dir was_running=false failed=false
+    if [ "$(classifyInstallState)" != installed ]; then
         echoColor red "请先安装hysteria2,再去修改配置..."
         return 1
     fi
     local old_ech_path ech_key_path=""
-    old_ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" "ech.keyPath") || return 1
+    old_ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" ech.keyPath) || return 1
     prepareECH "$old_ech_path" || return 1
     backup_dir=$(mktemp -d "$HIHY_ROOT_DIR/result/reconfigure.XXXXXX") || return 1
-    cp -a "$HIHY_CONFIG_FILE" "$backup_dir/config.yaml" || { rm -rf "$backup_dir"; return 1; }
-    cp -a "$HIHY_BACKUP_FILE" "$backup_dir/backup.yaml" || { rm -rf "$backup_dir"; return 1; }
-    [ -f "$HIHY_ACL_FILE" ] && cp -a "$HIHY_ACL_FILE" "$backup_dir/acl.txt"
-    [ -f "$HIHY_FIREWALL_STATE_FILE" ] && cp -a "$HIHY_FIREWALL_STATE_FILE" "$backup_dir/firewall-owned.state"
-    serviceIsActive && was_running="true"
-    portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
-    if [ "${portHoppingStatus}" == "true" ]; then
-        portHoppingStart=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStart")
-        portHoppingEnd=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingEnd")
+    cp -a "$HIHY_CONFIG_FILE" "$backup_dir/config.yaml" &&
+        cp -a "$HIHY_BACKUP_FILE" "$backup_dir/backup.yaml" || { rm -rf "$backup_dir"; return 1; }
+    if [ -f "$HIHY_ACL_FILE" ]; then
+        cp -a "$HIHY_ACL_FILE" "$backup_dir/acl.txt" || { rm -rf "$backup_dir"; return 1; }
     fi
-    masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
-    previous_port=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverPort")
-    stop || { rm -rf "$backup_dir"; return 1; }
-    cleanupLegacyPortHoppingNatIfPresent
-    if [ "${masquerade_tcp}" == "true" ]; then
-        delHihyFirewallPort tcp
-        delHihyFirewallPort udp
-    else
-        delHihyFirewallPort udp
+    if [ -f "$HIHY_FIREWALL_STATE_FILE" ]; then
+        cp -a "$HIHY_FIREWALL_STATE_FILE" "$backup_dir/firewall-owned.state" || { rm -rf "$backup_dir"; return 1; }
     fi
-    if ! setHysteriaConfig "$ech_key_path"; then
-        echoColor yellow "重新配置未完成，正在恢复原配置和服务。"
-        removeOwnedFirewallRules >/dev/null 2>&1 || true
-        cp -a "$backup_dir/config.yaml" "$HIHY_CONFIG_FILE"
-        cp -a "$backup_dir/backup.yaml" "$HIHY_BACKUP_FILE"
-        [ -f "$backup_dir/acl.txt" ] && cp -a "$backup_dir/acl.txt" "$HIHY_ACL_FILE"
-        rm -f "$HIHY_FIREWALL_STATE_FILE"
-        allowPort udp "$previous_port" >/dev/null 2>&1 || true
-        [ "${portHoppingStatus}" = "true" ] && allowPort udp "${portHoppingStart}:${portHoppingEnd}" >/dev/null 2>&1 || true
-        [ "${masquerade_tcp}" = "true" ] && allowPort tcp "$previous_port" >/dev/null 2>&1 || true
-        if [ -f "$backup_dir/firewall-owned.state" ]; then
-            cp -a "$backup_dir/firewall-owned.state" "$HIHY_FIREWALL_STATE_FILE"
-        else
-            rm -f "$HIHY_FIREWALL_STATE_FILE"
+    if [ -d "$HIHY_ROOT_DIR/cert" ]; then
+        cp -a "$HIHY_ROOT_DIR/cert" "$backup_dir/cert" || { rm -rf "$backup_dir"; return 1; }
+    fi
+    serviceIsActive && was_running=true
+    if [ "$was_running" = true ]; then
+        serviceStop || { echoColor red "停止服务失败，备份保留在 $backup_dir"; return 1; }
+    fi
+    if ! removeOwnedFirewallRules || ! setHysteriaConfig "$ech_key_path"; then
+        failed=true
+    elif [ "$was_running" = true ]; then
+        if ! serviceStart || ! waitHihyServiceHealthy; then
+            failed=true
         fi
-        [ "$was_running" = "true" ] && start >/dev/null 2>&1 || true
-        secureHihyPermissions
-        rm -rf "$backup_dir"
+    fi
+    if [ "$failed" = true ]; then
+        echoColor yellow "重新配置未完成，正在恢复旧状态。"
+        if restoreReconfiguration "$backup_dir" "$was_running"; then
+            rm -rf "$backup_dir"
+        else
+            echoColor red "恢复未完全成功，备份保留在 $backup_dir，请检查日志和防火墙。"
+        fi
         return 1
     fi
-    if ! start || ! serviceIsActive; then
-        echoColor red "新配置正式启动失败，正在恢复原配置和服务。"
-        removeOwnedFirewallRules >/dev/null 2>&1 || true
-        cp -a "$backup_dir/config.yaml" "$HIHY_CONFIG_FILE"
-        cp -a "$backup_dir/backup.yaml" "$HIHY_BACKUP_FILE"
-        [ -f "$backup_dir/acl.txt" ] && cp -a "$backup_dir/acl.txt" "$HIHY_ACL_FILE"
-        rm -f "$HIHY_FIREWALL_STATE_FILE"
-        allowPort udp "$previous_port" >/dev/null 2>&1 || true
-        [ "${portHoppingStatus}" = "true" ] && allowPort udp "${portHoppingStart}:${portHoppingEnd}" >/dev/null 2>&1 || true
-        [ "${masquerade_tcp}" = "true" ] && allowPort tcp "$previous_port" >/dev/null 2>&1 || true
-        if [ -f "$backup_dir/firewall-owned.state" ]; then
-            cp -a "$backup_dir/firewall-owned.state" "$HIHY_FIREWALL_STATE_FILE"
-        else
-            rm -f "$HIHY_FIREWALL_STATE_FILE"
-        fi
-        [ "$was_running" = "true" ] && start >/dev/null 2>&1 || true
-        secureHihyPermissions
-        rm -rf "$backup_dir"
+    if ! generate_client_config; then
+        echoColor yellow "服务端配置已保存，但客户端导出失败。旧配置备份: $backup_dir"
         return 1
     fi
-    generate_client_config
     rm -rf "$backup_dir"
-    echoColor green "配置修改成功"
-
+    echoColor green "配置修改成功，已保留原服务启停状态。"
 }
 
 aclControl() {
@@ -4815,7 +4892,7 @@ migrateLocalHysteriaToSharedCertificate() {
 }
 
 issueOrRenewWildcardCertificate() {
-    local domain email wildcard lego_cert lego_key action="run"
+    local domain email wildcard lego_cert lego_key renew_days action="run"
 
     domain=$(getCertificateManagerValue domain) || return 1
     email=$(getCertificateManagerValue email) || return 1
@@ -4827,11 +4904,12 @@ issueOrRenewWildcardCertificate() {
     lego_key="$HIHY_CERT_MANAGER_DIR/lego/certificates/_.${domain}.key"
     [ -f "$lego_cert" ] && action="renew"
 
-    if ! CF_DNS_API_TOKEN_FILE="$HIHY_CERT_TOKEN_FILE" \
-        "$HIHY_LEGO_BIN" run --path "$HIHY_CERT_MANAGER_DIR/lego" \
-        --email "$email" --accept-tos --dns cloudflare \
-        --dns.propagation.disable-rns \
-        --domains "$wildcard"; then
+    renew_days=$(getCertificateManagerValue renew_days 2>/dev/null) || renew_days=30
+    [[ "$renew_days" =~ ^[0-9]+$ ]] && [ "$renew_days" -gt 0 ] || return 1
+    local lego_args=(--path "$HIHY_CERT_MANAGER_DIR/lego" --email "$email"
+        --accept-tos --dns cloudflare --dns.propagation.disable-rns --domains "$wildcard" "$action")
+    [ "$action" != renew ] || lego_args+=(--days "$renew_days")
+    if ! CF_DNS_API_TOKEN_FILE="$HIHY_CERT_TOKEN_FILE" "$HIHY_LEGO_BIN" "${lego_args[@]}"; then
         echoColor red "通配符证书申请或续期失败。"
         return 1
     fi
@@ -4849,15 +4927,17 @@ getCertificateDaysRemaining() {
 }
 
 renewAndDeployCertificates() {
-    local cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
-    local renew_days days
-    renew_days=$(getCertificateManagerValue renew_days 2>/dev/null || echo 30)
+    local cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem" renew_days days=0
+    renew_days=$(getCertificateManagerValue renew_days 2>/dev/null) || renew_days=30
+    [[ "$renew_days" =~ ^[0-9]+$ ]] && [ "$renew_days" -gt 0 ] || return 1
     if [ -f "$cert" ]; then
-        days=$(getCertificateDaysRemaining "$cert" 2>/dev/null || echo 0)
-        [ "$days" -gt "$renew_days" ] && return 0
+        days=$(getCertificateDaysRemaining "$cert" 2>/dev/null) || days=0
     fi
-    issueOrRenewWildcardCertificate || return 1
-    deployCertificateToAllNodes
+    if [ "$days" -le "$renew_days" ]; then
+        issueOrRenewWildcardCertificate || return 1
+    fi
+    # 续期成功后某个节点失败，下次定时任务也必须重试该节点。
+    deployCertificateToAllNodes pending
 }
 
 installCertificateRenewTimer() {
@@ -5066,7 +5146,7 @@ EOF
 }
 
 deployCertificateToNode() {
-    local node_file="$1" host port user name cert key
+    local node_file="$1" host port user name cert key cert_digest
     [ -f "$node_file" ] || return 1
     host=$(grep '^host=' "$node_file" | cut -d= -f2-)
     port=$(grep '^port=' "$node_file" | cut -d= -f2-)
@@ -5075,11 +5155,13 @@ deployCertificateToNode() {
     cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
     key="$HIHY_SHARED_CERT_DIR/current/privkey.pem"
     [ -f "$cert" ] && [ -f "$key" ] || return 1
-    if tar -czf - -C "$HIHY_SHARED_CERT_DIR/current" fullchain.pem privkey.pem \
+    cert_digest=$(sha256sum "$cert") || return 1
+    cert_digest=${cert_digest%% *}
+    if (set -o pipefail; tar -czf - -C "$HIHY_SHARED_CERT_DIR/current" fullchain.pem privkey.pem \
         | ssh -i "$HIHY_CERT_DEPLOY_KEY" -p "$port" -o BatchMode=yes \
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HIHY_CERT_KNOWN_HOSTS" \
-            "${user}@${host}"; then
-        printf 'node=%s\nstatus=success\ndeployed_at=%s\n' "$name" "$(date +%s)" >"$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+            "${user}@${host}"); then
+        printf 'node=%s\nstatus=success\ndeployed_at=%s\ncert_sha256=%s\n' "$name" "$(date +%s)" "$cert_digest" >"$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
         chmod 600 "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
         echoColor green "节点 ${name} 证书分发成功。"
         return 0
@@ -5091,10 +5173,19 @@ deployCertificateToNode() {
 }
 
 deployCertificateToAllNodes() {
-    local node_file result=0
+    local mode="${1:-all}" node_file name state_file digest result=0
     [ -d "$HIHY_CERT_MANAGER_DIR/nodes" ] || return 0
+    digest=$(sha256sum "$HIHY_SHARED_CERT_DIR/current/fullchain.pem") || return 1
+    digest=${digest%% *}
     for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
         [ -f "$node_file" ] || continue
+        name=$(grep '^name=' "$node_file" | cut -d= -f2-)
+        validateCertificateNodeField name "$name" || { result=1; continue; }
+        state_file="$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+        if [ "$mode" = pending ] && [ -f "$state_file" ] &&
+            grep -qx 'status=success' "$state_file" && grep -qx "cert_sha256=$digest" "$state_file"; then
+            continue
+        fi
         deployCertificateToNode "$node_file" || result=1
     done
     return "$result"

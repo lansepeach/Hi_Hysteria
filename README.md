@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.17`
+当前脚本版本：`1.0.18`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -32,9 +32,12 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持安装失败状态恢复、后台版本检查和缓存提示
 - 核心更新强制校验 SHA-256，检查启动稳定性，失败时回滚，并保留原服务启停状态
 - 支持 Alpine、Arch、Debian、Ubuntu、RHEL、CentOS、Rocky Linux 等常见发行版
-- 支持 x86_64、i386/i686、aarch64/arm64、ARMv5/ARMv6/ARMv7、MIPSLE、RISC-V、s390x、loongarch64 等官方发布架构
+- 支持 x86_64、i386/i686、aarch64/arm64、ARMv6/ARMv7、MIPSLE、RISC-V、s390x、loongarch64 等官方发布架构
+- ARMv5 核心可用，但需预装兼容该 CPU 的 yq v4；官方当前 yq ARM 包要求 ARMv6
 - systemd 系统使用原生服务，旧版 rc.local/SysV 安装可确认后安全迁移
 - 防火墙规则采用所有权记录，卸载只删除脚本实际新增的规则
+- 重新配置失败时恢复旧配置、证书与防火墙；恢复不完整时保留备份
+- 证书定时任务独立检查续期和分发，自动重试失败节点
 - 端口跳跃优先使用 Hysteria 官方内置端口范围和自动重定向
 
 ## 安装
@@ -114,3 +117,13 @@ hihy 9
 - [2dust/v2rayN](https://github.com/2dust/v2rayN)
 - [MetaCubeX/Clash.Meta](https://github.com/MetaCubeX/Clash.Meta)
 - [fscarmen/warp](https://gitlab.com/fscarmen/warp)
+
+## 开发验证
+
+```bash
+bash tests/hy2_regression.sh
+bash tests/reliability_regression.sh
+python3 tests/ech_integration.py /path/to/hysteria
+```
+
+测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，不会调用生产节点或申请真实证书。
