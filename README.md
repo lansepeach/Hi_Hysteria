@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.16`
+当前脚本版本：`1.0.17`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -20,6 +20,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持 ACME HTTP、ACME DNS、本地证书、自签证书
 - ACME DNS 支持 Cloudflare、Duck DNS、Gandi、GoDaddy、Namecheap、Njalla、Porkbun、Vultr
 - 支持中心端申请通配符证书，并通过受限 SSH 自动分发给多台接收端服务器
+- 支持可选 ECH：内置密钥生成、密钥复用、原生客户端配置和分享链接导出
 - 支持 Brutal / BBR / Reno 拥塞控制模式
 - 支持 Hysteria2 原生端口跳跃/多端口范围监听
 - 支持 masquerade：string / proxy / file
@@ -29,6 +30,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持查看在线用户、流量统计、活动连接和实时日志
 - 支持添加 socks5 出站，包括 WireProxy/WARP
 - 支持安装失败状态恢复、后台版本检查和缓存提示
+- 核心更新强制校验 SHA-256，检查启动稳定性，失败时回滚，并保留原服务启停状态
 - 支持 Alpine、Arch、Debian、Ubuntu、RHEL、CentOS、Rocky Linux 等常见发行版
 - 支持 x86_64、i386/i686、aarch64/arm64、ARMv5/ARMv6/ARMv7、MIPSLE、RISC-V、s390x、loongarch64 等官方发布架构
 - systemd 系统使用原生服务，旧版 rc.local/SysV 安装可确认后安全迁移
@@ -86,6 +88,7 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 
 - [防火墙问题](md/firewall.md)
 - [证书配置与多服务器分发](md/certificate.md)
+- [ECH 配置与 v2.12.3 升级](md/ech.md)
 - [UDP 服务商排雷列表](md/blacklist.md)
 - [延迟和上下行速度设置](md/speed.md)
 - [支持的客户端](md/client.md)
@@ -94,7 +97,9 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 
 ## 更新说明
 
-脚本更新后，建议运行：
+升级至本版脚本后，先运行 `hihy 7` 更新核心（建议 v2.12.3 或更高版本）。仅获取端口跳跃修复不需要重新配置。
+
+如需启用 ECH 或修改其他配置，再运行：
 
 ```bash
 hihy 9

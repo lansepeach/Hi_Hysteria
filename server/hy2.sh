@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.16"
+hihyV="ver1.17"
 
 umask 077
 
@@ -325,7 +325,7 @@ fetchRemoteHeadersFromSources() {
     local response
 
     for url in "$@"; do
-        if response=$(curl -fsSI --connect-timeout "$HIHY_REMOTE_CONNECT_TIMEOUT" --max-time "$HIHY_REMOTE_MAX_TIME" "$url" 2>/dev/null); then
+        if response=$(curl -fsSIL --connect-timeout "$HIHY_REMOTE_CONNECT_TIMEOUT" --max-time "$HIHY_REMOTE_MAX_TIME" "$url" 2>/dev/null); then
             printf '%s' "$response"
             return 0
         fi
@@ -358,34 +358,35 @@ getLatestHihyVersion() {
     printf '%s\n' "$version"
 }
 
+isHysteriaReleaseVersion() {
+    [[ "$1" =~ ^app/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
 getLatestHysteriaVersion() {
     local content version headers
-
     content=$(fetchRemoteBodyFromSources "https://api.github.com/repos/HyNetworks/hysteria/releases/latest") || true
     if [ -n "$content" ]; then
         version=$(printf '%s' "$content" | yq -p=json -r '.tag_name // ""' 2>/dev/null)
-        if [ -n "$version" ] && [ "$version" != "null" ]; then
+        if isHysteriaReleaseVersion "$version"; then
             printf '%s\n' "$version"
             return 0
         fi
     fi
-
-    headers=$(curl -fsSIL --connect-timeout "$HIHY_REMOTE_CONNECT_TIMEOUT" --max-time "$HIHY_REMOTE_MAX_TIME" \
-        "https://github.com/HyNetworks/hysteria/releases/latest" 2>/dev/null) || return 1
-    version=$(printf '%s\n' "$headers" | grep -i '^location:' | grep -o 'tag/[^[:space:]]*' \
-        | sed 's/tag\///;s/\r//;s/ //g' | tail -n 1)
-    [ -n "$version" ] || return 1
+    headers=$(fetchRemoteHeadersFromSources "https://github.com/HyNetworks/hysteria/releases/latest") || return 1
+    version=$(printf '%s\n' "$headers" | tr -d '\r' \
+        | sed -nE 's@^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:.*releases/tag/(app(/|%2[Ff])v[0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$@\1@p' \
+        | tail -n 1 | sed 's/%2[Ff]/\//g')
+    isHysteriaReleaseVersion "$version" || return 1
     printf '%s\n' "$version"
 }
 
 getHysteriaReleaseAsset() {
-    local version="$1"
-    local asset_name="$2"
-    local field="$3"
-    local content
-
-    content=$(fetchRemoteBodyFromSources "https://api.github.com/repos/HyNetworks/hysteria/releases/tags/${version}") || return 1
-    printf '%s' "$content" | yq -p=json -r ".assets[] | select(.name == \"${asset_name}\") | .${field} // \"\"" 2>/dev/null | head -n 1
+    local version="$1" asset_name="$2" content
+    isHysteriaReleaseVersion "$version" || return 1
+    content=$(fetchRemoteBodyFromSources "https://api.github.com/repos/HyNetworks/hysteria/releases/tags/${version//\//%2F}") || return 1
+    # 一次请求同时获取下载地址和摘要，避免额外消耗 GitHub API 配额。
+    printf '%s' "$content" | HIHY_ASSET_NAME="$asset_name" yq -p=json -o=json \
+        '.assets[] | select(.name == strenv(HIHY_ASSET_NAME))' 2>/dev/null
 }
 
 getLocalHysteriaVersion() {
@@ -1095,7 +1096,8 @@ addOrUpdateYaml() {
     if [[ $valueType == "auto" ]]; then
         jsonValue=$(echo "$value" | yq eval -o=json)
     elif [[ $valueType == "string" ]]; then
-        jsonValue=$(echo "\"$value\"" | yq eval -o=json)
+        HIHY_YAML_VALUE="$value" yq eval ".${keyPath} = strenv(HIHY_YAML_VALUE)" -i "$file"
+        return $?
     elif [[ $valueType == "number" ]]; then
         jsonValue=$(echo "$value" | yq eval -o=json)
     elif [[ $valueType == "bool" ]]; then
@@ -1154,7 +1156,101 @@ countdown() {
     echo -e "\n\033[32m✨ 完成!\033[0m"
 }
 
+getECHConfigList() {
+    local key_path="$1" config
+    [ -r "$key_path" ] || return 1
+    # 只导出公开的 ECH CONFIGS 块，绝不输出 ECH KEYS。
+    config=$(awk '/^-----BEGIN ECH CONFIGS-----$/ {inside=1; next}
+        /^-----END ECH CONFIGS-----$/ {inside=0; done=1; exit}
+        inside {gsub(/[[:space:]]/, ""); printf "%s", $0}
+        END {if (!done) exit 1}' "$key_path") || return 1
+    [[ "$config" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    printf '%s' "$config" | base64 -d >/dev/null 2>&1 || return 1
+    printf '%s\n' "$config"
+}
+
+encodeECHQuery() {
+    local value="$1"
+    value=${value//+/%2B}
+    value=${value//\//%2F}
+    value=${value//=/%3D}
+    printf '%s' "$value"
+}
+
+prepareECH() {
+    local old_path="${1:-}" choice public_name key_dir
+    ech_key_path=""
+    if [ -n "$old_path" ] && [ "$old_path" != null ]; then
+        echoColor green "ECH: 1、保留启用(默认)  2、关闭"
+        read -r choice || return 1
+        [ "$choice" != 2 ] || return 0
+        ech_key_path="$old_path"
+    else
+        echoColor green "ECH: 1、关闭(默认)  2、启用"
+        echoColor yellow "ECH 加密真实 SNI，适合未开启混淆的连接；客户端需支持 ECH。"
+        read -r choice || return 1
+        [ "$choice" = 2 ] || return 0
+        ech_key_path="$HIHY_ROOT_DIR/cert/ech.pem"
+    fi
+    if [[ "$ech_key_path" != /* ]]; then
+        echoColor red "ECH 密钥路径必须为绝对路径，请先修正 ech.keyPath。"
+        return 1
+    fi
+    if [ ! -e "$ech_key_path" ]; then
+        if [ -n "$old_path" ] && [ "$old_path" != null ]; then
+            echoColor red "原 ECH 密钥不存在: $old_path。请恢复密钥或选择关闭；不会自动轮换密钥。"
+            return 1
+        fi
+        "$HIHY_ROOT_DIR/bin/appS" ech --help >/dev/null 2>&1 || {
+            echoColor red "生成 ECH 密钥需要 Hysteria v2.12.3 或更高版本，请先更新核心。"
+            return 1
+        }
+        echoColor green "请输入 ECH 外层公开域名(明文可见，例如 decoy.example.com):"
+        read -r public_name || return 1
+        [ -n "$public_name" ] || { echoColor red "公开域名不能为空。"; return 1; }
+        key_dir=$(dirname "$ech_key_path")
+        mkdir -p "$key_dir" || return 1
+        # 不传 --overwrite；已有密钥必须复用，不能静默轮换。
+        "$HIHY_ROOT_DIR/bin/appS" ech --public-name "$public_name" --output "$ech_key_path" >/dev/null || return 1
+    fi
+    getECHConfigList "$ech_key_path" >/dev/null || {
+        echoColor red "ECH 密钥文件缺少有效的 ECH CONFIGS 块，无法导出客户端配置。"
+        return 1
+    }
+    chmod 600 "$ech_key_path" || return 1
+    echoColor green "ECH 已启用，复用密钥: $ech_key_path"
+    echoColor yellow "ECH 不替代 TLS 证书；开启混淆时通常没有额外收益。"
+}
+
+exportClientECH() {
+    local server_config="$1" client_config="$2" key_path
+    ech_config=""
+    key_path=$(getYamlValue "$server_config" "ech.keyPath") || return 1
+    if [ -n "$key_path" ] && [ "$key_path" != null ]; then
+        if [[ "$key_path" != /* ]]; then
+            echoColor red "请先将服务端 ech.keyPath 改为绝对路径后再导出。" >&2
+            return 1
+        fi
+        ech_config=$(getECHConfigList "$key_path") || {
+            echoColor red "无法读取 ECH 公开配置，已中止导出以避免丢失 ECH。" >&2
+            return 1
+        }
+        addOrUpdateYaml "$client_config" "tls.ech" "$ech_config" "string" || return 1
+    else
+        yq eval 'del(.tls.ech)' -i "$client_config" || return 1
+    fi
+}
+
 setHysteriaConfig() {
+    local ech_key_path="" old_ech_path=""
+    if [ "$#" -gt 0 ]; then
+        ech_key_path="$1"
+    else
+        if [ -f "$HIHY_CONFIG_FILE" ]; then
+            old_ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" "ech.keyPath") || return 1
+        fi
+        prepareECH "$old_ech_path" || return 1
+    fi
     mkdir -p /etc/hihy/bin /etc/hihy/conf /etc/hihy/cert /etc/hihy/result /etc/hihy/acl/
     acl_file="/etc/hihy/acl/acl.txt"
     if [ -f "${acl_file}" ]; then
@@ -1618,6 +1714,9 @@ setHysteriaConfig() {
 
     rm -f "$yaml_file"
     touch "$yaml_file"
+    if [ -n "$ech_key_path" ]; then
+        addOrUpdateYaml "$yaml_file" "ech.keyPath" "$ech_key_path" "string" || return 1
+    fi
 
     if [ "${realmMode}" == "true" ]; then
         port=""
@@ -2284,131 +2383,135 @@ setHysteriaConfig() {
     echoColor greenWhite "安装成功,请查看下方配置详细信息"
 }
 
-downloadHysteriaCore() {
-    local version="${1:-}"
-    [ -n "$version" ] || version=$(getLatestHysteriaVersion || true)
-
-    echo -e "The Latest hysteria version: $(echoColor red "${version}")\nDownload..."
-
-    if [ -z "$version" ]; then
-        echoColor red "[Network error]: Failed to get the latest version of hysteria in Github!"
-        exit 1
-    fi
-
-    local arch
-    arch=$(uname -m)
-
-    local asset_name=""
-    local download_url=""
-    local expected_digest=""
-
+getHysteriaAssetName() {
+    local arch="${1:-$(uname -m)}"
     case "$arch" in
-        "x86_64")
-            asset_name="hysteria-linux-amd64"
+        x86_64) echo hysteria-linux-amd64 ;;
+        aarch64 | arm64) echo hysteria-linux-arm64 ;;
+        armv5*) echo hysteria-linux-armv5 ;;
+        armv6* | armv7* | arm) echo hysteria-linux-arm ;;
+        mipsle) echo hysteria-linux-mipsle ;;
+        mips | mips64)
+            # uname 在部分 MIPSLE 系统也报告 mips；读取本机 ELF 的 EI_DATA。
+            if [ "$(od -An -tu1 -j5 -N1 /proc/self/exe | tr -d '[:space:]')" = 1 ]; then
+                echo hysteria-linux-mipsle
+            else
+                echoColor red "上游没有大端 MIPS 核心。" >&2
+                return 1
+            fi
             ;;
-        "aarch64" | "arm64")
-            asset_name="hysteria-linux-arm64"
-            ;;
-        "armv5"*)
-            asset_name="hysteria-linux-armv5"
-            ;;
-        "armv6"* | "armv7"* | "arm")
-            asset_name="hysteria-linux-arm"
-            ;;
-        "mips" | "mipsle" | "mips64")
-            asset_name="hysteria-linux-mipsle"
-            ;;
-        "riscv64")
-            asset_name="hysteria-linux-riscv64"
-            ;;
-        "s390x")
-            asset_name="hysteria-linux-s390x"
-            ;;
-        "i686" | "i386")
-            asset_name="hysteria-linux-386"
-            ;;
-        "loongarch64")
-            asset_name="hysteria-linux-loong64"
-            ;;
-        *)
-            echoColor yellowBlack "Error[OS Message]:${arch}\nPlease open an issue at ${HIHY_REPO_URL}/issues !"
-            exit 1
-            ;;
+        riscv64) echo hysteria-linux-riscv64 ;;
+        s390x) echo hysteria-linux-s390x ;;
+        i686 | i386) echo hysteria-linux-386 ;;
+        loongarch64) echo hysteria-linux-loong64 ;;
+        *) echoColor red "不支持的核心架构: $arch" >&2; return 1 ;;
     esac
-
-    download_url=$(getHysteriaReleaseAsset "$version" "$asset_name" "browser_download_url" || true)
-    expected_digest=$(getHysteriaReleaseAsset "$version" "$asset_name" "digest" || true)
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        download_url="https://github.com/HyNetworks/hysteria/releases/download/${version}/${asset_name}"
-    fi
-
-    local staged_core="$HIHY_ROOT_DIR/bin/appS.new"
-    mkdir -p "$HIHY_ROOT_DIR/bin"
-
-    if ! downloadToFile "$download_url" "$staged_core"; then
-        echoColor red "Network Error: Can't download Hysteria core!"
-        return 1
-    fi
-
-    if [ -n "$expected_digest" ] && [ "$expected_digest" != "null" ]; then
-        local actual_digest
-        actual_digest="sha256:$(sha256sum "$staged_core" | awk '{print $1}')"
-        if [ "$actual_digest" != "$expected_digest" ]; then
-            rm -f "$staged_core"
-            echoColor red "Hysteria Core SHA-256 校验失败。"
-            return 1
-        fi
-    fi
-
-    chmod 755 "$staged_core"
-    local downloaded_version
-    downloaded_version=$("$staged_core" version 2>/dev/null | grep '^Version:' | awk '{print $2}' | head -n 1)
-    if [ "app/${downloaded_version}" != "$version" ]; then
-        rm -f "$staged_core"
-        echoColor red "下载的 Hysteria Core 版本校验失败。"
-        return 1
-    fi
-    mv -f "$staged_core" "$HIHY_ROOT_DIR/bin/appS"
-    chmod 755 "$HIHY_ROOT_DIR/bin/appS"
-    echoColor purple "\nDownload completed."
 }
 
-updateHysteriaCore() {
-    if [ -f "/etc/hihy/bin/appS" ]; then
-        local localV=$(echo app/$(/etc/hihy/bin/appS version | grep Version: | awk '{print $2}' | head -n 1))
-        local remoteV
-        remoteV=$(getLatestHysteriaVersion || true)
-        echo -e "Local core version: $(echoColor red "${localV}")"
-        echo -e "Remote core version: $(echoColor red "${remoteV}")"
-        if [ -z "$remoteV" ]; then
-            echoColor red "无法获取远程 Hysteria Core 版本，请检查 GitHub API 或网络连接。"
-            return 1
-        elif [ "${localV}" = "${remoteV}" ]; then
-            echoColor green "Already the latest version. Ignore."
-        else
-            local was_running="false"
-            local rollback_core="$HIHY_ROOT_DIR/bin/appS.rollback"
-            serviceIsActive && was_running="true"
-            cp -a "$HIHY_ROOT_DIR/bin/appS" "$rollback_core" || return 1
-            if ! downloadHysteriaCore "$remoteV"; then
-                rm -f "$rollback_core"
-                return 1
-            fi
-            if [ "$was_running" = "true" ] && ! serviceRestart; then
-                mv -f "$rollback_core" "$HIHY_ROOT_DIR/bin/appS"
-                serviceRestart >/dev/null 2>&1 || true
-                echoColor red "新 Core 启动失败，已恢复旧版本。"
-                return 1
-            fi
-            rm -f "$rollback_core"
-            rm -f "$HIHY_VERSION_STATUS_FILE"
-            echoColor green "Hysteria Core update done."
-        fi
+downloadHysteriaCore() (
+    local version="${1:-}" destination="${2:-$HIHY_ROOT_DIR/bin/appS}"
+    local asset metadata download_url expected_digest actual_digest stage
+    [ -n "$version" ] || version=$(getLatestHysteriaVersion) || return 1
+    isHysteriaReleaseVersion "$version" || { echoColor red "无法获取有效的正式版本。"; return 1; }
+    asset=$(getHysteriaAssetName) || return 1
+    command -v sha256sum >/dev/null 2>&1 || { echoColor red "缺少 sha256sum，无法校验核心。"; return 1; }
+    mkdir -p "$HIHY_ROOT_DIR/bin" || return 1
+    stage=$(mktemp -d "$HIHY_ROOT_DIR/bin/.download.XXXXXX") || return 1
+    trap 'rm -rf "$stage"' EXIT
+    metadata=$(getHysteriaReleaseAsset "$version" "$asset" || true)
+    download_url=$(printf '%s' "$metadata" | yq -p=json -r '.browser_download_url // ""' 2>/dev/null) || true
+    expected_digest=$(printf '%s' "$metadata" | yq -p=json -r '.digest // ""' 2>/dev/null) || true
+    if [ -z "$download_url" ] || [ "$download_url" = null ]; then
+        download_url="https://github.com/HyNetworks/hysteria/releases/download/${version}/${asset}"
+    fi
+    echoColor purple "下载 Hysteria ${version}..."
+    HIHY_REMOTE_MAX_TIME="${HIHY_CORE_DOWNLOAD_TIMEOUT:-180}" downloadToFile "$download_url" "$stage/appS" || return 1
+    if [ -z "$expected_digest" ] || [ "$expected_digest" = null ]; then
+        # API 限流或没有 digest 时仍必须校验，不能直接运行未校验的文件。
+        downloadToFile "https://github.com/HyNetworks/hysteria/releases/download/${version}/hashes.txt" "$stage/hashes.txt" || return 1
+        expected_digest=$(awk -v name="$asset" '$2 == "build/" name || $2 == name {print $1}' "$stage/hashes.txt")
+        expected_digest="sha256:$expected_digest"
+    fi
+    actual_digest=$(sha256sum "$stage/appS") || return 1
+    actual_digest="sha256:${actual_digest%% *}"
+    if [[ ! "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || [ "$actual_digest" != "$expected_digest" ]; then
+        echoColor red "Hysteria Core SHA-256 校验失败，保留原核心。"
+        return 1
+    fi
+    chmod 755 "$stage/appS" || return 1
+    if [ "$(getLocalHysteriaVersion "$stage/appS")" != "$version" ]; then
+        echoColor red "下载的核心无法运行或版本不匹配。"
+        return 1
+    fi
+    mv -f "$stage/appS" "$destination" || return 1
+    echoColor green "核心下载及校验完成。"
+)
+
+hihyProcessAlive() {
+    local pid="$1" state
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    state=$(awk '/^State:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+    [ -n "$state" ] && [ "$state" != Z ]
+}
+
+getHihyServicePID() {
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = systemd ]; then
+        systemctl show -p MainPID --value hihy.service
     else
-        echoColor red "Hysteria core not found."
-        exit 1
+        [ -r "$HIHY_PID_FILE" ] || return 1
+        cat "$HIHY_PID_FILE"
     fi
 }
+
+waitHihyServiceHealthy() {
+    local initial_pid current_pid i
+    initial_pid=$(getHihyServicePID) || return 1
+    hihyProcessAlive "$initial_pid" || return 1
+    # 不仅检查启动命令返回值，也检查延迟退出和 systemd 重启循环。
+    for ((i=0; i<5; i++)); do
+        sleep 1
+        serviceIsActive || return 1
+        current_pid=$(getHihyServicePID) || return 1
+        [ "$current_pid" = "$initial_pid" ] && hihyProcessAlive "$current_pid" || return 1
+    done
+}
+
+updateHysteriaCore() (
+    local core="$HIHY_ROOT_DIR/bin/appS" rollback_core="$HIHY_ROOT_DIR/bin/appS.rollback"
+    local local_version version stage="" was_running=false lock="$HIHY_ROOT_DIR/bin/.core-update.lock"
+    [ -x "$core" ] || { echoColor red "Hysteria core not found."; return 1; }
+    mkdir "$lock" 2>/dev/null || { echoColor red "已有核心更新任务，或异常退出留下锁: $lock"; return 1; }
+    trap 'rm -rf "${stage:-$lock/stage}"; rmdir "$lock"' EXIT
+    version=$(getLatestHysteriaVersion) || { echoColor red "无法获取最新版本，保留当前服务。"; return 1; }
+    isHysteriaReleaseVersion "$version" || return 1
+    local_version=$(getLocalHysteriaVersion "$core")
+    echoColor purple "当前核心: $local_version; 最新核心: $version"
+    [ "$local_version" != "$version" ] || { echoColor green "已是最新版本。"; return 0; }
+    stage=$(mktemp -d "$HIHY_ROOT_DIR/bin/.update.XXXXXX") || return 1
+    downloadHysteriaCore "$version" "$stage/appS" || return 1
+    cp -p "$core" "$stage/rollback" && mv -f "$stage/rollback" "$rollback_core" || return 1
+    serviceIsActive && was_running=true
+    mv -f "$stage/appS" "$core" || return 1
+    if [ "$was_running" = true ]; then
+        if ! serviceRestart || ! waitHihyServiceHealthy; then
+            echoColor yellow "新核心启动失败，正在恢复旧核心..."
+            cp -p "$rollback_core" "$stage/restore" && mv -f "$stage/restore" "$core" || return 1
+            if serviceRestart && waitHihyServiceHealthy; then
+                echoColor yellow "已恢复旧核心并启动服务，更新未完成。"
+            else
+                echoColor red "已恢复旧核心，但服务启动失败，请查看日志。备份: $rollback_core"
+            fi
+            return 1
+        fi
+    fi
+    rm -f "$HIHY_VERSION_STATUS_FILE"
+    if [ "$was_running" = true ]; then
+        echoColor green "核心更新成功，服务已启动。旧核心: $rollback_core"
+    else
+        echoColor green "核心更新成功，服务保持停止状态。旧核心: $rollback_core"
+    fi
+)
 
 hihy_update_notifycation() {
     displayCachedVersionNotifications
@@ -2786,7 +2889,9 @@ serviceIsActive() {
     elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
         rc-service hihy status >/dev/null 2>&1
     else
-        "$HIHY_LEGACY_SERVICE" status >/dev/null 2>&1
+        local pid
+        pid=$(getHihyServicePID) || return 1
+        hihyProcessAlive "$pid"
     fi
 }
 
@@ -3287,9 +3392,8 @@ install() {
     echoColor purple "Ready to install.\n"
 
     # 获取版本并下载核心
-    version=$(getLatestHysteriaVersion || true)
     checkSystemForUpdate
-    downloadHysteriaCore
+    downloadHysteriaCore || return 1
     setHysteriaConfig || return 1
 
     if ! installHihyService; then
@@ -3586,31 +3690,31 @@ generate_client_config() {
         echoColor red "hysteria2 未安装!"
         exit 1
     fi
-    remarks=$(getYamlValue "/etc/hihy/conf/backup.yaml" "remarks")
-    serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
-    realmMode=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "realmMode" "false")
+    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" "remarks")
+    serverAddress=$(getYamlValue "$HIHY_BACKUP_FILE" "serverAddress")
+    realmMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "realmMode" "false")
     if [ "${realmMode}" == "true" ]; then
-        realmURI=$(getYamlValue "/etc/hihy/conf/backup.yaml" "realmURI")
+        realmURI=$(getYamlValue "$HIHY_BACKUP_FILE" "realmURI")
     fi
-    listen_value=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen")
+    listen_value=$(getYamlValue "$HIHY_CONFIG_FILE" "listen")
     port=$(getListenPrimaryPort "${listen_value}")
-    auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
-    tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
-    insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
-    masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
-    obfs_type=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.type")
+    auth_secret=$(getYamlValue "$HIHY_CONFIG_FILE" "auth.password")
+    tls_sni=$(getYamlValue "$HIHY_BACKUP_FILE" "domain")
+    insecure=$(getYamlValue "$HIHY_BACKUP_FILE" "insecure")
+    masquerade_tcp=$(getYamlValue "$HIHY_BACKUP_FILE" "masquerade_tcp")
+    obfs_type=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.type")
     if [ "${obfs_type}" == "salamander" ] || [ "${obfs_type}" == "gecko" ]; then
         obfs_status="true"
-        obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.${obfs_type}.password")
+        obfs_pass=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.${obfs_type}.password")
     else
         obfs_status="false"
         obfs_type=""
         obfs_pass=""
     fi
-    SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
-    CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
-    max_CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxConnReceiveWindow")
-    max_SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxStreamReceiveWindow")
+    SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initStreamReceiveWindow")
+    CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initConnReceiveWindow")
+    max_CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxConnReceiveWindow")
+    max_SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxStreamReceiveWindow")
     if [ "${SRW}" = "null" ]; then
         SRW=""
     fi
@@ -3623,25 +3727,25 @@ generate_client_config() {
     if [ "${max_SRW}" = "null" ]; then
         max_SRW=""
     fi
-    congestion_mode=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "congestionMode" "brutal")
-    congestion_type=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "congestionType" "")
-    congestion_bbr_profile=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "congestionBbrProfile" "standard")
-    download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
-    upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
+    congestion_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionMode" "brutal")
+    congestion_type=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionType" "")
+    congestion_bbr_profile=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionBbrProfile" "standard")
+    download=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.up")
+    upload=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.down")
     if [ "${download}" = "null" ]; then
         download=""
     fi
     if [ "${upload}" = "null" ]; then
         upload=""
     fi
-    portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
+    portHoppingStatus=$(getYamlValue "$HIHY_BACKUP_FILE" "portHoppingStatus")
     if [ "${portHoppingStatus}" == "true" ]; then
-        portHoppingStart=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingStart" "${port}")
-        portHoppingEnd=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingEnd" "${port}")
-        portHoppingIntervalMode=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingIntervalMode" "fixed")
-        portHoppingHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingHopInterval" "30s")
-        portHoppingMinHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingMinHopInterval" "10s")
-        portHoppingMaxHopInterval=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingMaxHopInterval" "30s")
+        portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}")
+        portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}")
+        portHoppingIntervalMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingIntervalMode" "fixed")
+        portHoppingHopInterval=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingHopInterval" "30s")
+        portHoppingMinHopInterval=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingMinHopInterval" "10s")
+        portHoppingMaxHopInterval=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingMaxHopInterval" "30s")
         serverPortRange="${portHoppingStart}-${portHoppingEnd}"
     fi
     safe_remarks=$(sanitizeFileComponent "$remarks")
@@ -3672,6 +3776,8 @@ generate_client_config() {
         yq eval 'del(.realm)' -i "$client_configfile"
     fi
 
+    local ech_config=""
+    exportClientECH "$HIHY_CONFIG_FILE" "$client_configfile" || return 1
     addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}"
     if [ "${insecure}" == "true" ]; then
         addOrUpdateYaml "$client_configfile" "tls.insecure" "true"
@@ -3739,6 +3845,9 @@ generate_client_config() {
         if [ "${obfs_status}" == "true" ]; then
             url_base="${url_base}&obfs=${obfs_type}&obfs-password=${obfs_pass}"
         fi
+        if [ -n "$ech_config" ]; then
+            url_base="${url_base}&ech=$(encodeECHQuery "$ech_config")"
+        fi
         url="${url_base}&sni=${tls_sni}#Hy2-${remarks}"
     fi
     # 在生成配置前添加分隔线
@@ -3747,7 +3856,7 @@ generate_client_config() {
 
     # 美化输出信息
     echo -e "\n✨ 配置信息如下:"
-    local localV=$(echo app/$(/etc/hihy/bin/appS version | grep Version: | awk '{print $2}' | head -n 1))
+    local localV=$(echo app/$("$HIHY_ROOT_DIR/bin/appS" version | grep Version: | awk '{print $2}' | head -n 1))
     echo -e "\n📌 当前hysteria2 server版本: $(echoColor red ${localV})"
     echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -3776,7 +3885,11 @@ generate_client_config() {
         echo -e "\n"
         echoColor yellow "Realm模式不支持分享链接和ClashMeta配置,请使用原生配置文件"
     else
-        echoColor purple "\n🔗 2、[v2rayN-Windows/v2rayN-Andriod/nekobox/passwall/Shadowrocket]分享链接:\n"
+        if [ -n "$ech_config" ]; then
+            echoColor purple "\n🔗 2、支持 ECH 的客户端分享链接（请确认导入后保留 ECH 参数）:\n"
+        else
+            echoColor purple "\n🔗 2、[v2rayN-Windows/v2rayN-Andriod/nekobox/passwall/Shadowrocket]分享链接:\n"
+        fi
         echoColor green "${url}"
         echo -e "\n"
         generate_qr "${url}"
@@ -3791,7 +3904,9 @@ generate_client_config() {
     echoColor green "↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓COPY↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓"
     cat ${client_configfile}
     echoColor green "↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑COPY↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑"
-    if [ "${realmMode}" != "true" ]; then
+    if [ -n "$ech_config" ]; then
+        echoColor yellow "ECH 已写入原生 YAML 和可用的分享链接；暂不生成 Clash Meta 配置。"
+    elif [ "${realmMode}" != "true" ]; then
         generateMetaYaml
     fi
 
@@ -3800,7 +3915,13 @@ generate_client_config() {
 }
 
 generateMetaYaml() {
-    remarks=$(getYamlValue "/etc/hihy/conf/backup.yaml" "remarks")
+    local ech_path
+    ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" "ech.keyPath") || return 1
+    if [ -n "$ech_path" ] && [ "$ech_path" != null ]; then
+        echoColor yellow "ECH 模式请使用原生 Hysteria YAML；暂不导出 Clash Meta 配置。"
+        return 1
+    fi
+    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" "remarks")
     local safe_remarks
     safe_remarks=$(sanitizeFileComponent "$remarks")
     local metaFile="./Hy2-${safe_remarks}-ClashMeta.yaml"
@@ -3948,35 +4069,35 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 EOF
-    realmMode=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "realmMode" "false")
-    serverAddress=$(getYamlValue "/etc/hihy/conf/backup.yaml" "serverAddress")
-    listen_value=$(getYamlValue "/etc/hihy/conf/config.yaml" "listen")
+    realmMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "realmMode" "false")
+    serverAddress=$(getYamlValue "$HIHY_BACKUP_FILE" "serverAddress")
+    listen_value=$(getYamlValue "$HIHY_CONFIG_FILE" "listen")
     port=$(getListenPrimaryPort "${listen_value}")
-    auth_secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
-    tls_sni=$(getYamlValue "/etc/hihy/conf/backup.yaml" "domain")
-    insecure=$(getYamlValue "/etc/hihy/conf/backup.yaml" "insecure")
-    masquerade_tcp=$(getYamlValue "/etc/hihy/conf/backup.yaml" "masquerade_tcp")
-    obfs_type=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.type")
+    auth_secret=$(getYamlValue "$HIHY_CONFIG_FILE" "auth.password")
+    tls_sni=$(getYamlValue "$HIHY_BACKUP_FILE" "domain")
+    insecure=$(getYamlValue "$HIHY_BACKUP_FILE" "insecure")
+    masquerade_tcp=$(getYamlValue "$HIHY_BACKUP_FILE" "masquerade_tcp")
+    obfs_type=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.type")
     if [ "${obfs_type}" == "salamander" ] || [ "${obfs_type}" == "gecko" ]; then
         obfs_status="true"
-        obfs_pass=$(getYamlValue "/etc/hihy/conf/config.yaml" "obfs.${obfs_type}.password")
+        obfs_pass=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.${obfs_type}.password")
     else
         obfs_status="false"
         obfs_type=""
         obfs_pass=""
     fi
-    SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initStreamReceiveWindow")
-    CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.initConnReceiveWindow")
-    max_CRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxConnReceiveWindow")
-    max_SRW=$(getYamlValue "/etc/hihy/conf/config.yaml" "quic.maxStreamReceiveWindow")
-    download=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.up")
+    SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initStreamReceiveWindow")
+    CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initConnReceiveWindow")
+    max_CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxConnReceiveWindow")
+    max_SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxStreamReceiveWindow")
+    download=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.up")
     download=$(echo ${download} | sed 's/[^0-9]//g')
-    upload=$(getYamlValue "/etc/hihy/conf/config.yaml" "bandwidth.down")
+    upload=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.down")
     upload=$(echo ${upload} | sed 's/[^0-9]//g')
-    portHoppingStatus=$(getYamlValue "/etc/hihy/conf/backup.yaml" "portHoppingStatus")
+    portHoppingStatus=$(getYamlValue "$HIHY_BACKUP_FILE" "portHoppingStatus")
     if [ "${portHoppingStatus}" == "true" ]; then
-        portHoppingStart=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingStart" "${port}")
-        portHoppingEnd=$(getBackupValueOrDefault "/etc/hihy/conf/backup.yaml" "portHoppingEnd" "${port}")
+        portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}")
+        portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}")
     fi
     addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}"
     addOrUpdateYaml "${metaFile}" "proxies[0].type" "hysteria2"
@@ -3991,8 +4112,17 @@ EOF
         fi
     fi
     addOrUpdateYaml "${metaFile}" "proxies[0].password" "${auth_secret}"
-    addOrUpdateYaml "${metaFile}" "proxies[0].up" "${upload} Mbps"
-    addOrUpdateYaml "${metaFile}" "proxies[0].down" "${download} Mbps"
+    # BBR/Reno 不设置固定带宽，不能导出空的 " Mbps"。
+    if [[ "$upload" =~ ^[0-9]+$ ]] && [ "$upload" -gt 0 ]; then
+        addOrUpdateYaml "${metaFile}" "proxies[0].up" "${upload} Mbps"
+    else
+        yq eval 'del(.proxies[0].up)' -i "$metaFile"
+    fi
+    if [[ "$download" =~ ^[0-9]+$ ]] && [ "$download" -gt 0 ]; then
+        addOrUpdateYaml "${metaFile}" "proxies[0].down" "${download} Mbps"
+    else
+        yq eval 'del(.proxies[0].down)' -i "$metaFile"
+    fi
     addOrUpdateYaml "${metaFile}" "proxies[0].skip-cert-verify" "${insecure}"
     if [ "${obfs_status}" == "true" ]; then
         addOrUpdateYaml "${metaFile}" "proxies[0].obfs" "${obfs_type}"
@@ -4384,6 +4514,9 @@ changeServerConfig() {
         echoColor red "请先安装hysteria2,再去修改配置..."
         return 1
     fi
+    local old_ech_path ech_key_path=""
+    old_ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" "ech.keyPath") || return 1
+    prepareECH "$old_ech_path" || return 1
     backup_dir=$(mktemp -d "$HIHY_ROOT_DIR/result/reconfigure.XXXXXX") || return 1
     cp -a "$HIHY_CONFIG_FILE" "$backup_dir/config.yaml" || { rm -rf "$backup_dir"; return 1; }
     cp -a "$HIHY_BACKUP_FILE" "$backup_dir/backup.yaml" || { rm -rf "$backup_dir"; return 1; }
@@ -4405,7 +4538,7 @@ changeServerConfig() {
     else
         delHihyFirewallPort udp
     fi
-    if ! setHysteriaConfig; then
+    if ! setHysteriaConfig "$ech_key_path"; then
         echoColor yellow "重新配置未完成，正在恢复原配置和服务。"
         removeOwnedFirewallRules >/dev/null 2>&1 || true
         cp -a "$backup_dir/config.yaml" "$HIHY_CONFIG_FILE"
@@ -5183,7 +5316,7 @@ menu() {
         case $input in
             1)
                 install
-                exit 0
+                exit $?
                 ;;
             2)
                 uninstall
@@ -5207,7 +5340,7 @@ menu() {
                 ;;
             7)
                 updateHysteriaCore
-                exit 0
+                exit $?
                 ;;
             8)
                 generate_client_config
@@ -5215,7 +5348,7 @@ menu() {
                 ;;
             9)
                 changeServerConfig
-                exit 0
+                exit $?
                 ;;
             10)
                 changeIp64
