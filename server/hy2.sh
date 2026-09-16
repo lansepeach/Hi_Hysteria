@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.18"
+hihyV="ver1.19"
 
 umask 077
 
