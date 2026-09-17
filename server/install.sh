@@ -4,22 +4,27 @@ set -e
 
 echo -e "Downloading hihy (Hysteria2)..."
 
-HIHY_URL="https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh"
-HIHY_BIN="/usr/bin/hihy"
+HIHY_URL="${HIHY_URL:-https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/hy2.sh}"
+HIHY_BIN="${HIHY_BIN:-/usr/bin/hihy}"
 HIHY_TMP=""
 
 cleanup() {
-    [ -n "$HIHY_TMP" ] && rm -f "$HIHY_TMP"
+    if [ -n "$HIHY_TMP" ]; then
+        rm -f "$HIHY_TMP" || true
+    fi
+    return 0
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: 请使用 root 权限运行"
     exit 1
 fi
 
-HIHY_TMP=$(mktemp /usr/bin/.hihy.tmp.XXXXXX)
+HIHY_TMP=$(mktemp "$(dirname "$HIHY_BIN")/.hihy.tmp.XXXXXX")
 
 if command -v curl >/dev/null 2>&1; then
     curl -fL --connect-timeout 5 --max-time 30 -o "$HIHY_TMP" "$HIHY_URL"

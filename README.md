@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.19`
+当前脚本版本：`1.0.20`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -123,10 +123,17 @@ hihy 9
 ```bash
 bash tests/hy2_regression.sh
 bash tests/reliability_regression.sh
+bash tests/management_regression.sh
 sudo env "PATH=$PATH" bash tests/nft_integration.sh
+sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria
+python3 tests/config_integration.py /path/to/hysteria
 ```
 
 测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，不会调用生产节点或申请真实证书。
 
 nftables 集成测试还需要 root、nftables、iproute2 和网络命名空间支持；它在独立网络命名空间内验证 IPv4/IPv6 通流、重载及卸载清理，不修改主机防火墙。
+
+iptables 集成测试也需要 root、iptables 和挂载命名空间支持，持久化操作写入临时目录。管理回归测试覆盖非法输入、异常退出、证书 SNI、SOCKS5 凭据、卸载失败与安装返回码；配置集成测试使用真实核心验证 Brutal/BBR/Reno 和证书迁移后的握手。
+
+历史迁移工具 `optimize_hihy.py` 已停用，不再生成或覆盖脚本；请直接维护 `server/hy2.sh`。

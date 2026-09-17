@@ -17,6 +17,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 detectServiceManager() { echo legacy; }
 systemctl() { return 0; }
 rc-update() { return 0; }
+netfilter-persistent() { fail "unexpected iptables persistence from nft test"; }
 installHihyLauncher "$PWD/server/hy2.sh"
 ensureHihyDirectories
 ip link set lo up
