@@ -124,6 +124,8 @@ startInstallValidationProcess() {
         else:
             assert config['congestion']['type'] == mode
             assert 'bandwidth' not in config
+        assert config['sniff']['enable'] is True
+        assert 'enabled' not in config['sniff']
         assert not list((root / 'conf').glob('.configure.*')), 'staging directory leaked'
         connect(cert, 'helloworld.com')
 

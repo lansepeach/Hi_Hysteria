@@ -250,6 +250,14 @@ cd "$scratch/exports"
 generate_client_config > "$scratch/export.log"
 assert_eq "$(yq '.proxies[0].up' Hy2-regression-ClashMeta.yaml)" null
 assert_eq "$(yq '.proxies[0].down' Hy2-regression-ClashMeta.yaml)" null
+addOrUpdateYaml "$HIHY_BACKUP_FILE" remarks realm-test string
+addOrUpdateYaml "$HIHY_BACKUP_FILE" realmMode true bool
+addOrUpdateYaml "$HIHY_BACKUP_FILE" realmURI 'realm://public@realm.hy2.io/test-realm' string
+generate_client_config > "$scratch/realm-export.log"
+assert_eq "$(yq '.server' Hy2-realm-test-v2rayN.yaml)" 'realm://public@realm.hy2.io/test-realm'
+assert_eq "$(yq '.realm.heartbeatInterval' Hy2-realm-test-v2rayN.yaml)" null
+addOrUpdateYaml "$HIHY_BACKUP_FILE" realmMode false bool
+addOrUpdateYaml "$HIHY_BACKUP_FILE" remarks regression string
 addOrUpdateYaml "$HIHY_CONFIG_FILE" bandwidth.up '100 mbps' string
 addOrUpdateYaml "$HIHY_CONFIG_FILE" bandwidth.down '20 mbps' string
 generateMetaYaml > /dev/null
@@ -262,4 +270,3 @@ assert_eq "$(yq '.tls.ech' Hy2-ech-test-v2rayN.yaml)" YWJj
 [[ "$url" == *'&ech=YWJj&'* ]] || fail 'ECH missing from full URI export'
 [ ! -e Hy2-ech-test-ClashMeta.yaml ] || fail 'unsupported ECH Meta export produced'
 printf 'PASS: releases, mandatory checksums, legacy/systemd status, rollback, YAML strings, full BBR/ECH export\n'
-

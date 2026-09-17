@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.20"
+hihyV="ver1.21"
 
 umask 077
 
@@ -2218,7 +2218,7 @@ setHysteriaConfig() (
         u_host="${realmURI}"
     fi
 
-    addOrUpdateYaml "$yaml_file" "sniff.enabled" "true" || return 1
+    addOrUpdateYaml "$yaml_file" "sniff.enable" "true" || return 1
     addOrUpdateYaml "$yaml_file" "sniff.timeout" "2s" || return 1
     addOrUpdateYaml "$yaml_file" "sniff.rewriteDomain" "false" || return 1
     addOrUpdateYaml "$yaml_file" "sniff.tcpPorts" "80,443" || return 1
@@ -3899,7 +3899,6 @@ generate_client_config() {
         addOrUpdateYaml "$client_configfile" "realm.stunServers[3]" "global.stun.twilio.com:3478"
         addOrUpdateYaml "$client_configfile" "realm.stunTimeout" "5s"
         addOrUpdateYaml "$client_configfile" "realm.punchTimeout" "5s"
-        addOrUpdateYaml "$client_configfile" "realm.heartbeatInterval" "30s"
         addOrUpdateYaml "$client_configfile" "realm.insecure" "false"
     else
         yq eval 'del(.realm)' -i "$client_configfile"
