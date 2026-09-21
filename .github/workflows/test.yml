@@ -40,6 +40,7 @@ jobs:
           bash tests/reliability_regression.sh
           bash tests/management_regression.sh
           bash tests/safety_regression.sh
+          bash tests/audit_regression.sh
       - name: Test firewall backends in isolated namespaces
         run: |
           sudo apt-get update

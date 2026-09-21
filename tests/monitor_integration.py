@@ -147,6 +147,9 @@ done
     try:
         result = shell('realtimeMonitor --once', check=False)
         assert result.returncode and config_file.read_bytes() == original_config
+        result = shell('getHysteriaTrafic')
+        assert '192.0.2.1' in result.stdout and 'example.com:443' in result.stdout
+        assert config_file.read_bytes() == original_config, 'statistics enabled IP authentication'
         result = shell('configureRealtimeMonitor enable', check=False, extra_env={'FAIL_MONITOR_RESTART': 'yes'})
         assert result.returncode, result.stdout
         assert config_file.read_bytes() == original_config and backup_file.read_bytes() == original_backup
@@ -163,6 +166,8 @@ done
         result = shell('realtimeMonitor --once', extra_env={'http_proxy': 'http://127.0.0.1:1', 'no_proxy': ''})
         assert '在线来源 IP: 2' in result.stdout and 'example.com:443' in result.stdout, result
         assert password not in result.stdout and secret not in result.stdout
+        result = shell('getHysteriaTrafic')
+        assert '上传: 2.0KiB' in result.stdout and '192.0.2.1' in result.stdout
         assert all(auth == wire_secret and '?' not in path for path, auth in requests), requests
         for response_mode in ('unauthorized', 'missing', 'malformed', 'redirect'):
             result = shell('realtimeMonitor --once', check=False)

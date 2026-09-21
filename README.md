@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.23`
+当前脚本版本：`1.0.24`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -104,6 +104,7 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 - [证书配置与多服务器分发](md/certificate.md)
 - [ECH 配置与 v2.12.3 升级](md/ech.md)
 - [实时监控](md/monitor.md)
+- [2026-09-22 代码审查与复盘](md/audit-2026-09-22.md)
 - [UDP 服务商排雷列表](md/blacklist.md)
 - [延迟和上下行速度设置](md/speed.md)
 - [支持的客户端](md/client.md)
@@ -137,6 +138,7 @@ bash tests/hy2_regression.sh
 bash tests/reliability_regression.sh
 bash tests/management_regression.sh
 bash tests/safety_regression.sh
+bash tests/audit_regression.sh
 sudo env "PATH=$PATH" bash tests/nft_integration.sh
 sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria

@@ -38,7 +38,7 @@ def shell(code, *args, input=None):
 def launch(config, mode, name):
     log = open(root / f'{name}.log', 'w+')
     logs.append(log)
-    proc = subprocess.Popen([str(core), '-c', str(config), mode], stdout=log, stderr=log)
+    proc = subprocess.Popen([str(core), '--disable-update-check', '-c', str(config), mode], stdout=log, stderr=log)
     processes.append(proc)
     return proc, log
 

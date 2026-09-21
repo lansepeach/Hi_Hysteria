@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.23"
+hihyV="ver1.24"
 
 umask 077
 
@@ -214,7 +214,7 @@ installLego() {
     fi
     tar -xzf "$archive" -C "$temp_dir" lego || { rm -rf "$temp_dir"; return 1; }
     "$temp_dir/lego" --version 2>/dev/null | grep -q "version ${HIHY_LEGO_VERSION}" || { rm -rf "$temp_dir"; return 1; }
-    command install -m 755 "$temp_dir/lego" "$HIHY_LEGO_BIN"
+    command install -m 755 "$temp_dir/lego" "$HIHY_LEGO_BIN" || { rm -rf "$temp_dir"; return 1; }
     rm -rf "$temp_dir"
 }
 
@@ -237,7 +237,7 @@ installHihyLauncher() {
     mkdir -p "$bin_dir"
 
     if [ -f "$source_path" ] && [ "$source_path" != "$bin_link" ]; then
-        cp "$source_path" "$bin_link"
+        cp "$source_path" "$bin_link" || return 1
     elif [ ! -f "$bin_link" ]; then
         if ! downloadToFile "$HIHY_REMOTE_SCRIPT_URL" "$bin_link"; then
             downloadToFile "$HIHY_REMOTE_SCRIPT_MIRROR_URL" "$bin_link" || return 1
@@ -246,7 +246,7 @@ installHihyLauncher() {
 
     if [ -f "$bin_link" ]; then
         chmod 755 "$bin_link"
-        return 0
+        return $?
     fi
 
     return 1
@@ -283,6 +283,7 @@ downloadToFile() {
             return 1
         fi
     else
+        rm -f "$tmp_path"
         return 1
     fi
 
@@ -298,7 +299,7 @@ startInstallValidationProcess() {
     local yaml_file="$1"
     local debug_file="${2:-./hihy_debug.info}"
 
-    "$HIHY_ROOT_DIR/bin/appS" -c "$yaml_file" server >"$debug_file" 2>&1 &
+    "$HIHY_ROOT_DIR/bin/appS" --disable-update-check -c "$yaml_file" server >"$debug_file" 2>&1 &
     validation_pid=$!
 }
 
@@ -2551,13 +2552,13 @@ hihyUpdate() {
         fi
     fi
 
-    chmod 755 "$tmp_file"
+    chmod 755 "$tmp_file" || { rm -f "$tmp_file"; return 1; }
     if ! validateDownloadedShell "$tmp_file"; then
         rm -f "$tmp_file"
         echoColor red "下载的 hihy 脚本校验失败，保留当前版本。"
         exit 1
     fi
-    mv "$tmp_file" "$HIHY_BIN_LINK"
+    mv "$tmp_file" "$HIHY_BIN_LINK" || { rm -f "$tmp_file"; return 1; }
 
     rm -f "$HIHY_VERSION_STATUS_FILE"
 
@@ -3064,11 +3065,15 @@ recordOwnedFirewallRule() {
     local backend="$1"
     local protocol="$2"
     local port="$3"
+    local zone="${4:-}" record="backend=${1}|protocol=${2}|port=${3}"
+    if [ "$backend" = firewalld ] && [ -n "$zone" ]; then
+        [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+        record+="|zone=$zone"
+    fi
     ensureHihyDirectories || return 1
-    touch "$HIHY_FIREWALL_STATE_FILE"
-    chmod 600 "$HIHY_FIREWALL_STATE_FILE"
-    if ! grep -qxF "backend=${backend}|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE"; then
-        printf 'backend=%s|protocol=%s|port=%s\n' "$backend" "$protocol" "$port" >>"$HIHY_FIREWALL_STATE_FILE"
+    touch "$HIHY_FIREWALL_STATE_FILE" && chmod 600 "$HIHY_FIREWALL_STATE_FILE" || return 1
+    if ! grep -qxF "$record" "$HIHY_FIREWALL_STATE_FILE"; then
+        printf '%s\n' "$record" >>"$HIHY_FIREWALL_STATE_FILE"
     fi
 }
 
@@ -3341,12 +3346,12 @@ firewallRuleExists() {
     local backend="$1"
     local protocol="$2"
     local port="$3"
-    local zone
+    local zone="${4:-}"
 
     case "$backend" in
-        ufw) ufw status | grep -Eq "(^|[[:space:]])${port}/${protocol}([[:space:]]|$)" ;;
+        ufw) LC_ALL=C ufw status | grep -Eq "^${port}/${protocol}[[:space:]]+ALLOW([[:space:]]+IN)?[[:space:]]+Anywhere([[:space:]]|$)" ;;
         firewalld)
-            zone=$(firewall-cmd --get-default-zone)
+            [ -n "$zone" ] || zone=$(firewall-cmd --get-default-zone) || return 1
             firewall-cmd --zone="$zone" --query-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1
             ;;
         nft) grep -qxF "backend=nft|protocol=${protocol}|port=${port}" "$HIHY_FIREWALL_STATE_FILE" 2>/dev/null ;;
@@ -3359,7 +3364,7 @@ allowPort() {
     local protocol="$1"
     local port="$2"
     local backend
-    local zone
+    local zone="${4:-}"
 
     validate_protocol "$protocol" || return 1
     if [[ "$port" == *:* ]]; then
@@ -3370,6 +3375,10 @@ allowPort() {
 
     backend="${3:-$(detectFirewallBackend)}"
     case "$backend" in ufw | firewalld | iptables | ip6tables | nft | none) ;; *) return 1 ;; esac
+    if [ "$backend" = firewalld ]; then
+        [ -n "$zone" ] || zone=$(firewall-cmd --get-default-zone) || return 1
+        [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    fi
     if [ "$backend" = "none" ]; then
         echoColor yellow "未检测到活动防火墙，请在云安全组中开放 ${port}/${protocol}。"
         return 0
@@ -3385,7 +3394,7 @@ allowPort() {
         return 0
     fi
 
-    if firewallRuleExists "$backend" "$protocol" "$port"; then
+    if firewallRuleExists "$backend" "$protocol" "$port" "$zone"; then
         if [ "$backend" = nft ]; then
             applyNftOwnedRuleset || return 1
             echoColor purple "已重新应用脚本管理的防火墙规则: ${port}/${protocol}"
@@ -3396,10 +3405,19 @@ allowPort() {
     fi
 
     case "$backend" in
-        ufw) ufw allow "${port}/${protocol}" >/dev/null || return 1 ;;
+        ufw)
+            ufw insert 1 allow "${port}/${protocol}" >/dev/null || return 1
+            if ! recordOwnedFirewallRule "$backend" "$protocol" "$port"; then
+                ufw delete allow "${port}/${protocol}" >/dev/null || true
+                return 1
+            fi
+            ;;
         firewalld)
-            zone=$(firewall-cmd --get-default-zone)
             firewall-cmd --zone="$zone" --add-port="${port/:/-}/${protocol}" --permanent >/dev/null || return 1
+            if ! recordOwnedFirewallRule "$backend" "$protocol" "$port" "$zone"; then
+                firewall-cmd --zone="$zone" --remove-port="${port/:/-}/${protocol}" --permanent >/dev/null || true
+                return 1
+            fi
             firewall-cmd --reload >/dev/null || return 1
             ;;
         nft)
@@ -3414,7 +3432,7 @@ allowPort() {
             return 0
             ;;
     esac
-    recordOwnedFirewallRule "$backend" "$protocol" "$port"
+    recordOwnedFirewallRule "$backend" "$protocol" "$port" "$zone" || return 1
     echoColor purple "已自动开放: ${port}/${protocol} (${backend})"
 }
 
@@ -3434,7 +3452,10 @@ removeOwnedFirewallRules() {
             ufw) ufw delete allow "${port}/${protocol}" >/dev/null 2>&1 || result=1 ;;
             firewalld)
                 has_firewalld=true
-                zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo public)
+                zone=$(printf '%s' "$line" | cut -d'|' -f4)
+                zone=${zone#zone=}
+                [ -n "$zone" ] || zone=$(firewall-cmd --get-default-zone 2>/dev/null) || { result=1; continue; }
+                [[ "$zone" =~ ^[A-Za-z0-9_-]+$ ]] || { result=1; continue; }
                 firewall-cmd --zone="$zone" --remove-port="${port/:/-}/${protocol}" --permanent >/dev/null 2>&1 || result=1
                 ;;
             iptables | ip6tables)
@@ -4353,7 +4374,7 @@ restart() {
 checkStatus() {
     if serviceIsActive; then
         echoColor green "hysteria正在运行"
-        version=$(/etc/hihy/bin/appS version | grep "^Version" | awk '{print $2}')
+        version=$("$HIHY_ROOT_DIR/bin/appS" version | grep "^Version" | awk '{print $2}')
         echoColor purple "当前版本: $(echoColor red ${version})"
     else
         echoColor red "hysteria未运行"
@@ -4440,7 +4461,7 @@ realtimeMonitor() {
     local action="${1:-}" answer monitor_config
     case "$action" in
         enable | disable) configureRealtimeMonitor "$action"; return $? ;;
-        '' | --once) ;;
+        '' | --once | --stats) ;;
         *) echoColor yellow "用法: hihy monitor [--once|enable|disable]"; return 1 ;;
     esac
     if ! command -v python3 >/dev/null 2>&1; then
@@ -4448,7 +4469,7 @@ realtimeMonitor() {
         return 1
     fi
     [ -f "$HIHY_CONFIG_FILE" ] || { echoColor red "请先安装并配置 Hysteria2。"; return 1; }
-    if ! monitorIsEnabled; then
+    if [ "$action" != --stats ] && ! monitorIsEnabled; then
         echoColor yellow "按 IP 统计需切换为本地密码校验，客户端密码不变。"
         echoColor yellow "启用会重启正在运行的服务、断开现有连接并清零核心统计；客户端需重连。"
         if [ "$action" = --once ] || [ ! -t 0 ]; then
@@ -4458,7 +4479,7 @@ realtimeMonitor() {
         read -r -p "启用按 IP 统计？[y/N]: " answer || return 1
         case "$answer" in y | Y) configureRealtimeMonitor enable || return 1 ;; *) return 0 ;; esac
     fi
-    [ -x "$HIHY_MONITOR_AUTH_FILE" ] || {
+    [ "$action" = --stats ] || [ -x "$HIHY_MONITOR_AUTH_FILE" ] || {
         echoColor red "IP 认证脚本缺失，请运行 hihy monitor enable 修复。"; return 1;
     }
     # Read the actual API settings, never the proxy password or stale backup port.
@@ -4675,6 +4696,28 @@ def fit(line, width):
     return result
 
 
+def statistics(snapshot, now):
+    traffic, online, streams = snapshot
+    lines = ['Hysteria 统计  ' + now.strftime('%Y-%m-%d %H:%M:%S %Z'),
+             f'客户端连接: {sum(online.values())}  活动 TCP: {len(streams)}',
+             '流量均为客户端视角；累计包含 TCP+UDP，自核心启动或清零起统计。']
+    for identity in sorted(traffic.keys() | online.keys()):
+        value = traffic.get(identity, {'tx': 0, 'rx': 0})
+        label = client_ip(identity) or clean(identity)
+        lines.append(f'{label}  连接: {online.get(identity, 0)}  '
+                     f'上传: {size(value["tx"])}  下载: {size(value["rx"])}')
+    lines += ['', '活动 TCP（请求地址与嗅探域名；UDP 无逐条明细）']
+    for stream in streams:
+        label = client_ip(stream['auth']) or clean(stream['auth'])
+        lines += [f'{label} → {clean(stream["req_addr"])}  [{clean(stream["state"])}]',
+                  f'  嗅探域名: {clean(stream["hooked_req_addr"]) or "-"}  '
+                  f'上传: {size(stream["tx"])}  下载: {size(stream["rx"])}',
+                  f'  开始: {clock_text(stream["initial_at"])}  最后活动: {clock_text(stream["last_active_at"])}']
+    if not streams:
+        lines.append('当前没有活动 TCP 连接。')
+    return lines
+
+
 def wrap(lines, width):
     result = []
     for line in lines:
@@ -4691,7 +4734,7 @@ def wrap(lines, width):
 
 
 def main():
-    once = sys.argv[1] == '--once' or not sys.stdout.isatty()
+    once = sys.argv[1] in ('--once', '--stats') or not sys.stdout.isatty()
     try:
         interval = float(sys.argv[2])
         if not math.isfinite(interval) or not 1 <= interval <= 60:
@@ -4717,7 +4760,8 @@ def main():
             error = None
             try:
                 snapshot = api.snapshot()
-                lines = monitor.render(snapshot, dt.datetime.now().astimezone(), time.monotonic())
+                now = dt.datetime.now().astimezone()
+                lines = statistics(snapshot, now) if sys.argv[1] == '--stats' else monitor.render(snapshot, now, time.monotonic())
             except urllib.error.HTTPError as exc:
                 error = ('统计 API 认证失败，请检查 trafficStats.secret。' if exc.code in (401, 403)
                          else f'统计 API 返回 HTTP {exc.code}；请检查配置和核心版本（hihy 7）。')
@@ -4773,164 +4817,8 @@ if __name__ == '__main__':
 HIHY_MONITOR_PY
 }
 
-# 定义格式化字节大小的函数
-format_bytes() {
-    local bytes=$1
-    if [ $bytes -lt 1024 ]; then
-        echo "${bytes}B"
-    elif [ $bytes -lt $((1024 * 1024)) ]; then
-        echo "$(echo "scale=2; $bytes/1024" | bc)KB"
-    elif [ $bytes -lt $((1024 * 1024 * 1024)) ]; then
-        echo "$(echo "scale=2; $bytes/(1024*1024)" | bc)MB"
-    else
-        echo "$(echo "scale=2; $bytes/(1024*1024*1024)" | bc)GB"
-    fi
-}
-
 getHysteriaTrafic() {
-    local api_port=$(getYamlValue "/etc/hihy/conf/backup.yaml" "trafficPort")
-    local secret=$(getYamlValue "/etc/hihy/conf/config.yaml" "auth.password")
-
-    if [ -n "$secret" ]; then
-        CURL_OPTS=(-H "Authorization: $secret")
-    else
-        CURL_OPTS=()
-    fi
-
-    echo "=========== Hysteria 服务器状态 ==========="
-
-    # 流量统计部分保持不变
-    echoColor green "【流量统计】"
-    curl -s "${CURL_OPTS[@]}" "http://127.0.0.1:${api_port}/traffic" \
-        | grep -oE '"[^"]+":{"tx":[0-9]+,"rx":[0-9]+}' \
-        | while IFS=: read -r user stats; do
-            tx=$(echo $stats | grep -oE '"tx":[0-9]+' | cut -d: -f2)
-            rx=$(echo $stats | grep -oE '"rx":[0-9]+' | cut -d: -f2)
-            user=$(echo $user | tr -d '"')
-            tx_formatted=$(format_bytes $tx)
-            rx_formatted=$(format_bytes $rx)
-            printf "用户: %-20s 上传: %8s  下载: %8s\n" "$user" "$tx_formatted" "$rx_formatted"
-        done
-
-    # 在线用户部分保持不变
-    echoColor green "\n【在线用户】"
-    curl -s "${CURL_OPTS[@]}" "http://127.0.0.1:${api_port}/online" \
-        | grep -oE '"[^"]+":[0-9]+' \
-        | while IFS=: read -r user count; do
-            user=$(echo $user | tr -d '"')
-            count=$(echo $count | tr -d ' ')
-            printf "用户: %-20s 设备数: %d\n" "$user" "$count"
-        done
-
-    echoColor green "\n【活动连接】"
-    STREAMS_OUTPUT=$(curl -s "${CURL_OPTS[@]}" -H "Accept: text/plain" "http://127.0.0.1:${api_port}/dump/streams")
-
-    if [ "$(echo "$STREAMS_OUTPUT" | wc -l)" -le 1 ]; then
-        echo "当前没有活动连接"
-    else
-        # 打印表头
-        printf "%-8s | %-15s | %-10s | %-3s | %-10s | %-10s | %-12s | %-12s | %-20s | %-20s\n" \
-            "状态" "用户" "连接ID" "流数" "上传" "下载" "存活时间" "最后活动" "请求地址" "目标地址"
-        echo "----------|-----------------|------------|------|------------|------------|--------------|--------------|----------------------|----------------------"
-
-        # 使用临时文件存储排序数据
-        temp_file=$(mktemp)
-
-        echo "$STREAMS_OUTPUT" | awk 'BEGIN {
-            status["ESTAB"]="已建立"
-            status["CLOSED"]="已关闭"
-        }
-
-        function format_bytes(bytes) {
-            if (bytes < 1024) return bytes "B"
-            if (bytes < 1024*1024) return sprintf("%.2fKB", bytes/1024)
-            if (bytes < 1024*1024*1024) return sprintf("%.2fMB", bytes/(1024*1024))
-            return sprintf("%.2fGB", bytes/(1024*1024*1024))
-        }
-
-        function format_time(time) {
-            if (time == "-") return 0
-            if (index(time, "ms") > 0) {
-                gsub("ms", "", time)
-                return time/1000
-            }
-            if (index(time, "s") > 0) {
-                gsub("s", "", time)
-                return time
-            }
-            if (index(time, "m") > 0) {
-                gsub("m", "", time)
-                return time * 60
-            }
-            if (index(time, "h") > 0) {
-                gsub("h", "", time)
-                return time * 3600
-            }
-            return time
-        }
-
-        function format_time_display(seconds) {
-            if (seconds < 1) return sprintf("%.0fms", seconds * 1000)
-            if (seconds < 60) return sprintf("%.1f秒", seconds)
-            if (seconds < 3600) return sprintf("%.1f分钟", seconds/60)
-            return sprintf("%.1f小时", seconds/3600)
-        }
-
-        NR > 1 {
-            last_active = format_time($8)
-            printf "%s|%s|%s|%s|%s|%s|%s|%.2f|%s|%s\n", \
-                status[$1], $2, $3, $4, \
-                format_bytes($5), format_bytes($6), \
-                format_time_display(format_time($7)), \
-                last_active, \
-                $9, $10
-        }' | sort -t'|' -k8,8nr >"$temp_file"
-
-        # 读取排序后的数据并格式化输出
-        while IFS='|' read -r state user conn_id flows up down alive last_active req_addr target_addr; do
-            printf "%-8s | %-15s | %-10s | %-3s | %-10s | %-10s | %-12s | %-12s | %-20s | %-20s\n" \
-                "$state" "$user" "$conn_id" "$flows" "$up" "$down" \
-                "$alive" "$(format_time_display $last_active)" "$req_addr" "$target_addr"
-        done <"$temp_file"
-
-        rm -f "$temp_file"
-    fi
-
-    echo "========================================"
-}
-
-# 辅助函数：格式化时间显示
-format_time_display() {
-    local seconds=$1
-
-    # 处理毫秒级别
-    if (($(echo "$seconds < 1" | bc -l))); then
-        printf "%.0f毫秒" $(echo "$seconds * 1000" | bc -l)
-        return
-    fi
-
-    # 处理秒级别
-    if (($(echo "$seconds < 60" | bc -l))); then
-        printf "%.1f秒" "$seconds"
-        return
-    fi
-
-    # 处理分钟级别
-    if (($(echo "$seconds < 3600" | bc -l))); then
-        local minutes=$(echo "$seconds / 60" | bc -l)
-        printf "%.1f分钟" "$minutes"
-        return
-    fi
-
-    # 处理小时级别
-    local hours=$(echo "$seconds / 3600" | bc -l)
-    # 如果小时数小于0.1，显示为分钟
-    if (($(echo "$hours < 0.1" | bc -l))); then
-        local minutes=$(echo "$seconds / 60" | bc -l)
-        printf "%.1f分钟" "$minutes"
-    else
-        printf "%.1f小时" "$hours"
-    fi
+    realtimeMonitor --stats
 }
 
 legacyDelHihyFirewallPortUnsafe() {
@@ -5001,8 +4889,10 @@ delHihyFirewallPort() {
 }
 
 changeIp64() {
-    local socks5_status=$(getYamlValue "/etc/hihy/conf/backup.yaml" "socks5_status")
-    local config_file="/etc/hihy/conf/config.yaml"
+    local socks5_status
+    local config_file="$HIHY_CONFIG_FILE"
+    local mode_now mode_name public_ipv4 public_ipv6 input
+    socks5_status=$(getYamlValue "$HIHY_BACKUP_FILE" socks5_status) || return 1
     if [ "${socks5_status}" == "true" ]; then
         echoColor red "当前已经开启socks5转发,不支持修改优先级,如需分流请使用ACL管理"
         exit 1
@@ -5039,65 +4929,36 @@ changeIp64() {
     echoColor yellow "5) 自动选择"
     echoColor yellow "0) 退出"
     read -r -p "请选择: " input
-    case $input in
-        1)
-            if [ "${mode_now}" == "46" ]; then
-                echoColor yellow "当前已经是ipv4优先模式"
-            else
-                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "46"
-                restart
-                echoColor green "切换成功"
-            fi
-
-            ;;
-        2)
-            if [ "${mode_now}" == "64" ]; then
-                echoColor yellow "当前已经是ipv6优先模式"
-            else
-                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "64"
-                restart
-                echoColor green "切换成功"
-            fi
-
-            ;;
-
-        3)
-            if [ "${mode_now}" == "4" ]; then
-                echoColor yellow "当前已经是仅 IPv4 模式"
-            else
-                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "4"
-                restart
-                echoColor green "已切换为仅 IPv4，所有代理出口只使用 ${public_ipv4:-IPv4}"
-            fi
-            ;;
-        4)
-            if [ "${mode_now}" == "6" ]; then
-                echoColor yellow "当前已经是仅 IPv6 模式"
-            else
-                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "6"
-                restart
-                echoColor green "已切换为仅 IPv6，所有代理出口只使用 ${public_ipv6:-IPv6}"
-            fi
-            ;;
-        5)
-            if [ "${mode_now}" == "auto" ]; then
-                echoColor yellow "当前已经是自动选择模式"
-            else
-                addOrUpdateYaml "$config_file" "outbounds[0].direct.mode" "auto"
-                restart
-                echoColor green "切换成功"
-            fi
-            ;;
-        0) exit 0 ;;
-        *)
-            echoColor red "输入错误!"
-            exit 1
-            ;;
+    case "$input" in
+        1) configureOutboundIPMode 46 ;;
+        2) configureOutboundIPMode 64 ;;
+        3) configureOutboundIPMode 4 ;;
+        4) configureOutboundIPMode 6 ;;
+        5) configureOutboundIPMode auto ;;
+        0) return 0 ;;
+        *) echoColor red "输入错误!"; return 1 ;;
     esac
 }
 
+configureOutboundIPMode() (
+    local mode="$1" stage current
+    case "$mode" in 46 | 64 | 4 | 6 | auto) ;; *) return 1 ;; esac
+    [ -f "$HIHY_CONFIG_FILE" ] && [ -f "$HIHY_BACKUP_FILE" ] || return 1
+    [ "$(getYamlValue "$HIHY_CONFIG_FILE" 'outbounds[0].type')" = direct ] || {
+        echoColor red "当前首选出站不是 direct，不能修改 IP 优先级。"; return 1;
+    }
+    current=$(getYamlValue "$HIHY_CONFIG_FILE" 'outbounds[0].direct.mode') || return 1
+    [ "$current" != "$mode" ] || { echoColor yellow "当前已使用此出口模式。"; return 0; }
+    stage=$(mktemp -d "$HIHY_ROOT_DIR/conf/ip-mode.XXXXXX") || return 1
+    trap 'rm -rf "$stage"' EXIT
+    cp -a "$HIHY_CONFIG_FILE" "$stage/config.yaml" || return 1
+    addOrUpdateYaml "$stage/config.yaml" 'outbounds[0].direct.mode' "$mode" string || return 1
+    applyHihyConfigFiles "$stage/config.yaml" "$HIHY_BACKUP_FILE" || return 1
+    echoColor green "出口模式已切换为 $mode，保留原服务启停状态。"
+)
+
 restoreReconfiguration() {
-    local backup_dir="$1" was_running="$2" backend protocol rule_port result=0
+    local backup_dir="$1" was_running="$2" backend protocol rule_port rule_zone result=0
     local old_port old_realm old_hopping old_start old_end old_tcp
     if ! serviceStop && serviceIsActive; then
         echoColor red "新服务未能停止，尚未恢复文件。"
@@ -5117,9 +4978,9 @@ restoreReconfiguration() {
     fi
     if [ -f "$backup_dir/firewall-owned.state" ]; then
         # 逐条重建实际规则并重新记录所有权，不能只恢复状态文件。
-        while IFS='|' read -r backend protocol rule_port; do
+        while IFS='|' read -r backend protocol rule_port rule_zone; do
             [ -n "$backend" ] || continue
-            allowPort "${protocol#protocol=}" "${rule_port#port=}" "${backend#backend=}" || result=1
+            allowPort "${protocol#protocol=}" "${rule_port#port=}" "${backend#backend=}" "${rule_zone#zone=}" || result=1
         done < "$backup_dir/firewall-owned.state"
     else
         # 兼容尚无所有权记录的旧安装；已有的外部规则不会被接管。
@@ -5202,115 +5063,68 @@ changeServerConfig() {
     echoColor green "配置修改成功，已保留原服务启停状态。"
 }
 
-aclControl() {
-    local acl_file="$HIHY_ACL_FILE"
-    if [ ! -f "${acl_file}" ]; then
-        echoColor red "未找到acl文件"
-        exit 1
+updateACLRule() (
+    local action="$1" domain="${2,,}" target="${3:-}" stage was_running=false restored=true
+    [ -f "$HIHY_ACL_FILE" ] || return 1
+    domain=${domain%.}
+    [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] && [[ "$domain" != *..* ]] &&
+        [ "${#domain}" -le 253 ] || { echoColor red "请输入有效域名，不要包含端口、括号或空白。"; return 1; }
+    case "$action:$target" in add:v4_only | add:v6_only | add:reject | remove:) ;; *) return 1 ;; esac
+    stage=$(mktemp -d "$HIHY_ROOT_DIR/conf/acl-change.XXXXXX") || return 1
+    trap '[ "$restored" = false ] || rm -rf "$stage"' EXIT
+    cp -p "$HIHY_ACL_FILE" "$stage/original" || return 1
+    if [ "$action" = add ]; then
+        if grep -ixF "$target(suffix:$domain)" "$HIHY_ACL_FILE" >/dev/null; then
+            echoColor yellow "规则已存在。"; return 0
+        fi
+        cp -p "$HIHY_ACL_FILE" "$stage/new" || return 1
+        printf '\n%s(suffix:%s)\n' "$target" "$domain" >>"$stage/new" || return 1
+    else
+        HIHY_ACL_DOMAIN="$domain" awk '
+            BEGIN {domain=ENVIRON["HIHY_ACL_DOMAIN"]}
+            {rule=tolower($0); sub(/^[[:space:]]*/, "", rule); sub(/[[:space:]]*$/, "", rule)}
+            rule != "v4_only(suffix:" domain ")" && rule != "v6_only(suffix:" domain ")" &&
+                rule != "reject(suffix:" domain ")" {print}
+        ' "$HIHY_ACL_FILE" >"$stage/new" || return 1
+        cmp -s "$stage/new" "$HIHY_ACL_FILE" && { echoColor yellow "规则不存在。"; return 1; }
     fi
-    echoColor purple "请选择管理操作:"
-    echoColor yellow "1) 添加"
-    echoColor yellow "2) 删除"
-    echoColor yellow "3) 查看"
-    echoColor yellow "0) 退出"
-    read -r -p "请选择: " input
-    case $input in
+    chmod 600 "$stage/new" || return 1
+    serviceIsActive && was_running=true
+    mv -f "$stage/new" "$HIHY_ACL_FILE" || return 1
+    if [ "$was_running" = true ] && { ! serviceRestart || ! waitHihyServiceHealthy; }; then
+        cp -p "$stage/original" "$HIHY_ACL_FILE" || restored=false
+        if ! serviceRestart || ! waitHihyServiceHealthy; then restored=false; fi
+        if [ "$restored" = false ]; then
+            echoColor red "ACL 恢复未完成，备份保留在 $stage"
+        else
+            echoColor yellow "ACL 修改失败，已恢复原规则和服务。"
+        fi
+        return 1
+    fi
+    echoColor green "ACL 修改成功，保留原服务启停状态。"
+)
+
+aclControl() {
+    local input domain target
+    [ -f "$HIHY_ACL_FILE" ] || { echoColor red "未找到 ACL 文件。"; return 1; }
+    echoColor yellow "1) 添加  2) 删除  3) 查看  0) 返回"
+    read -r -p "请选择: " input || return 0
+    case "$input" in
         1)
-            echoColor green "请选择ACL控制方式"
-            echoColor yellow "1) 添加域名ipv4分流"
-            echoColor yellow "2) 添加域名ipv6分流"
-            echoColor yellow "3) 添加屏蔽域名"
-            read -r -p "请选择: " input
-            case $input in
-                1)
-                    read -r -p "请输入要分流ipv4的域名: " domain
-                    if [ -z "${domain}" ]; then
-                        echoColor red "域名不能为空"
-                        exit 1
-                    fi
-                    if grep -qxF "v4_only(suffix:${domain})" "${acl_file}"; then
-                        echoColor red "规则已存在"
-                    else
-                        echo "v4_only(suffix:${domain})" >>"${acl_file}"
-                        echoColor green "添加成功"
-                        restart
-                    fi
-                    ;;
-                2)
-                    read -r -p "请输入要分流ipv6的域名: " domain
-                    if [ -z "${domain}" ]; then
-                        echoColor red "域名不能为空"
-                        exit 1
-                    fi
-                    if grep -qxF "v6_only(suffix:${domain})" "${acl_file}"; then
-                        echoColor red "规则已存在"
-                    else
-                        echo "v6_only(suffix:${domain})" >>"${acl_file}"
-                        echoColor green "添加成功"
-                        restart
-                    fi
-                    ;;
-                3)
-                    read -r -p "请输入要屏蔽的域名: " rejectInput
-                    if [ -z "${rejectInput}" ]; then
-                        echoColor red "域名不能为空"
-                        exit 1
-                    fi
-                    if grep -qxF "reject(suffix:${rejectInput})" "${acl_file}"; then
-                        echoColor red "规则已存在"
-                    else
-                        echo "reject(suffix:${rejectInput})" >>"${acl_file}"
-                        echoColor green "添加成功"
-                        restart
-                    fi
-                    ;;
-                *)
-                    echoColor red "输入错误!"
-                    exit 1
-                    ;;
-            esac
+            echoColor yellow "1) 域名 IPv4 分流  2) 域名 IPv6 分流  3) 屏蔽域名"
+            read -r -p "请选择: " input || return 0
+            case "$input" in 1) target=v4_only ;; 2) target=v6_only ;; 3) target=reject ;; *) return 1 ;; esac
+            read -r -p "请输入域名: " domain || return 0
+            updateACLRule add "$domain" "$target"
             ;;
         2)
-            read -r -p "请输入要删除的域名规则: " domain
-            if [ -z "${domain}" ]; then
-                echoColor red "域名不能为空"
-                exit 1
-            fi
-            local filtered
-            filtered=$(mktemp "${acl_file}.new.XXXXXX") || return 1
-            HIHY_ACL_DOMAIN="$domain" awk '
-                BEGIN {domain=tolower(ENVIRON["HIHY_ACL_DOMAIN"])}
-                {rule=tolower($0); sub(/^[[:space:]]*/, "", rule); sub(/[[:space:]]*$/, "", rule)}
-                rule != "v4_only(suffix:" domain ")" && rule != "v6_only(suffix:" domain ")" &&
-                    rule != "reject(suffix:" domain ")" {print}
-            ' "$acl_file" >"$filtered" || { rm -f "$filtered"; return 1; }
-            if cmp -s "$acl_file" "$filtered"; then
-                rm -f "$filtered"
-                echoColor red "规则不存在"
-                return 1
-            fi
-            cp -p "$acl_file" "${filtered}.backup" || { rm -f "$filtered"; return 1; }
-            mv -f "$filtered" "$acl_file" || return 1
-            if ! restart; then
-                mv -f "${filtered}.backup" "$acl_file"
-                restart >/dev/null 2>&1 || true
-                return 1
-            fi
-            rm -f "${filtered}.backup"
-            echoColor green "删除成功"
-
+            read -r -p "请输入要删除的域名: " domain || return 0
+            updateACLRule remove "$domain"
             ;;
-        3)
-            echoColor purple "当前ACL列表:"
-            cat "${acl_file}"
-            ;;
-        0) exit 0 ;;
-        *)
-            echoColor red "输入错误!"
-            exit 1
-            ;;
+        3) cat "$HIHY_ACL_FILE" ;;
+        0) return 0 ;;
+        *) echoColor red "输入错误。"; return 1 ;;
     esac
-
 }
 
 applyHihyConfigFiles() (
@@ -5413,6 +5227,27 @@ validateWildcardHostname() {
     [ "${#label}" -le 63 ] && [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
+withCertificateOperationLock() {
+    if [ "${HIHY_CERT_OPERATION_HELD:-false}" = true ]; then
+        "$@"
+    else
+        runCertificateOperationLocked "$@"
+    fi
+}
+
+runCertificateOperationLocked() (
+    local lock="${HIHY_CERT_MANAGER_DIR}.operation.lock" HIHY_CERT_OPERATION_HELD=true
+    mkdir -p "$(dirname "$lock")" || return 1
+    mkdir -m 700 "$lock" 2>/dev/null || {
+        echoColor red "已有证书管理任务或遗留锁: $lock"; return 1;
+    }
+    trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '%s\n' "$BASHPID" >"$lock/pid" || return 1
+    "$@"
+)
+
 getCertificateRole() {
     if [ -f "$HIHY_CERT_MANAGER_CONFIG" ]; then
         if [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
@@ -5449,7 +5284,11 @@ getSharedCertificateHostname() {
     printf '%s\n' "${hostname,,}"
 }
 
-publishSharedCertificate() (
+publishSharedCertificate() {
+    withCertificateOperationLock publishSharedCertificateUnlocked "$@"
+}
+
+publishSharedCertificateUnlocked() (
     local source_cert="$1" source_key="$2" domain="$3" release_dir release_id published=false
     validateCertificateBundle "$source_cert" "$source_key" "$domain" || return 1
     ensureCertificateManagerDirectories || return 1
@@ -5494,6 +5333,10 @@ migrateLocalHysteriaToSharedCertificate() (
 )
 
 issueOrRenewWildcardCertificate() {
+    withCertificateOperationLock issueOrRenewWildcardCertificateUnlocked "$@"
+}
+
+issueOrRenewWildcardCertificateUnlocked() {
     local domain email wildcard lego_cert lego_key renew_days action="run"
 
     requireCertificateManager || return 1
@@ -5530,6 +5373,10 @@ getCertificateDaysRemaining() {
 }
 
 renewAndDeployCertificates() {
+    withCertificateOperationLock renewAndDeployCertificatesUnlocked "$@"
+}
+
+renewAndDeployCertificatesUnlocked() {
     local cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem" renew_days days=0
     requireCertificateManager || return 1
     renew_days=$(getCertificateManagerValue renew_days 2>/dev/null) || renew_days=30
@@ -5585,6 +5432,10 @@ EOF
 }
 
 initCertificateManager() {
+    withCertificateOperationLock initCertificateManagerUnlocked "$@"
+}
+
+initCertificateManagerUnlocked() {
     local current_domain domain="" email token hostname input_domain input_email token_stage
     if [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
         echoColor red "本机已有接收端配置，不能直接覆盖为中心端。"; return 1
@@ -5673,6 +5524,10 @@ ensureCertificateDeployKey() {
 }
 
 initCertificateReceiver() {
+    withCertificateOperationLock initCertificateReceiverUnlocked "$@"
+}
+
+initCertificateReceiverUnlocked() {
     local domain="${1:-}" hostname="${2:-}" interactive=false config_file
     if [ -f "$HIHY_CERT_MANAGER_CONFIG" ]; then
         echoColor red "本机已有中心端配置，不能直接覆盖为接收端。"; return 1
@@ -5712,7 +5567,71 @@ getCertificateReceiverDomain() {
     fi
 }
 
-receiveCertificatePackage() (
+extractCertificateArchive() {
+    # Consume the archive on fd 3; never let tar follow archive-controlled links.
+    local kind="$1" destination="$2"
+    command -v python3 >/dev/null 2>&1 || { echoColor red "证书包校验需要 python3。" >&2; return 1; }
+    python3 - "$kind" "$destination" 3<&0 <<'HIHY_ARCHIVE_PY'
+import os
+from pathlib import Path
+import re
+import sys
+import tarfile
+
+kind, destination = sys.argv[1:]
+root = Path(destination)
+allowed = {'fullchain.pem', 'privkey.pem'} if kind == 'certificate' else {
+    'profile/manager.conf', 'profile/cloudflare.token', 'profile/deploy_ed25519',
+    'profile/deploy_ed25519.pub', 'profile/known_hosts'}
+directories = {'.'} if kind == 'certificate' else {'.', 'profile', 'profile/nodes'}
+seen, total = set(), 0
+try:
+    if kind not in ('certificate', 'profile'):
+        raise ValueError('invalid kind')
+    with os.fdopen(3, 'rb') as source, tarfile.open(fileobj=source, mode='r|gz') as archive:
+        for index, member in enumerate(archive):
+            name = member.name
+            while name.startswith('./'):
+                name = name[2:]
+            name = name.rstrip('/') or '.'
+            if index >= 4096:
+                raise ValueError('too many members')
+            if member.isdir() and name in directories:
+                continue
+            node = kind == 'profile' and re.fullmatch(r'profile/nodes/[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\.conf', name)
+            if not member.isfile() or (name not in allowed and not node) or name in seen:
+                raise ValueError('unexpected member')
+            total += member.size
+            if not 0 <= member.size <= 2 * 1024 * 1024 or total > 16 * 1024 * 1024:
+                raise ValueError('archive too large')
+            seen.add(name)
+            target = root / name
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with archive.extractfile(member) as content, target.open('xb') as output:
+                remaining = member.size
+                while remaining:
+                    block = content.read(min(remaining, 65536))
+                    if not block:
+                        raise ValueError('truncated member')
+                    output.write(block)
+                    remaining -= len(block)
+            target.chmod(0o600)
+    required = {'fullchain.pem', 'privkey.pem'} if kind == 'certificate' else {'profile/manager.conf', 'profile/cloudflare.token'}
+    if not required <= seen:
+        raise ValueError('missing files')
+    if kind == 'profile':
+        (root / 'profile/nodes').mkdir(mode=0o700, parents=True, exist_ok=True)
+except (OSError, ValueError, EOFError, tarfile.TarError):
+    print('证书包无效：仅接受规定的普通文件，拒绝链接、特殊文件、重复成员和超限内容。', file=sys.stderr)
+    sys.exit(1)
+HIHY_ARCHIVE_PY
+}
+
+receiveCertificatePackage() {
+    withCertificateOperationLock receiveCertificatePackageUnlocked "$@"
+}
+
+receiveCertificatePackageUnlocked() (
     local domain hostname="" temp_dir cert key previous=""
     domain=$(getCertificateReceiverDomain) || return 1
     if [ -f "$HIHY_CONFIG_FILE" ]; then
@@ -5720,7 +5639,7 @@ receiveCertificatePackage() (
     fi
     temp_dir=$(mktemp -d "$HIHY_ROOT_DIR/.cert-receive.XXXXXX") || return 1
     trap 'rm -rf "$temp_dir"' EXIT
-    tar -xzf - -C "$temp_dir" || return 1
+    extractCertificateArchive certificate "$temp_dir" || return 1
     cert="$temp_dir/fullchain.pem"
     key="$temp_dir/privkey.pem"
     validateCertificateBundle "$cert" "$key" "$domain" || return 1
@@ -5743,16 +5662,20 @@ receiveCertificatePackage() (
 validateCertificateNodeField() {
     local type="$1" value="$2"
     case "$type" in
-        name) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$' ;;
-        host) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9:][A-Za-z0-9.:-]*$' ;;
-        user) printf '%s' "$value" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$' ;;
+        name) [[ "$value" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] ;;
+        host) [[ "$value" =~ ^[A-Za-z0-9:][A-Za-z0-9.:-]*$ ]] ;;
+        user) [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ;;
         port) validate_port "$value" ;;
-        domain) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' ;;
+        domain) [[ "$value" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] ;;
         *) return 1 ;;
     esac
 }
 
 addCertificateNode() {
+    withCertificateOperationLock addCertificateNodeUnlocked "$@"
+}
+
+addCertificateNodeUnlocked() {
     local manager_domain name host port user node_domain node_file public_key auth_line temp_node
     requireCertificateManager || return 1
     manager_domain=$(getCertificateManagerValue domain) || return 1
@@ -5811,7 +5734,11 @@ EOF
     deployCertificateToNode "$node_file"
 }
 
-deployCertificateToNode() (
+deployCertificateToNode() {
+    withCertificateOperationLock deployCertificateToNodeUnlocked "$@"
+}
+
+deployCertificateToNodeUnlocked() (
     local node_file="$1" host port user name cert_dir cert_digest stage status=failed
     requireCertificateManager || return 1
     [ -f "$node_file" ] || return 1
@@ -5849,6 +5776,10 @@ deployCertificateToNode() (
 )
 
 deployCertificateToAllNodes() {
+    withCertificateOperationLock deployCertificateToAllNodesUnlocked "$@"
+}
+
+deployCertificateToAllNodesUnlocked() {
     local mode="${1:-all}" node_file name state_file digest result=0 total=0 skipped=0 success=0 failed=0
     requireCertificateManager || return 1
     case "$mode" in all | pending) ;; *) return 1 ;; esac
@@ -5882,6 +5813,10 @@ deployCertificateToAllNodes() {
 }
 
 removeCertificateNode() {
+    withCertificateOperationLock removeCertificateNodeUnlocked "$@"
+}
+
+removeCertificateNodeUnlocked() {
     local name node_file
     requireCertificateManager || return 1
     echoColor green "请输入要删除的节点名称:"
@@ -5945,19 +5880,23 @@ showCertificateNodes() {
 }
 
 exportCertificateManagerProfile() {
+    withCertificateOperationLock exportCertificateManagerProfileUnlocked "$@"
+}
+
+exportCertificateManagerProfileUnlocked() (
     local output temp_dir archive
     requireCertificateManager || return 1
     command -v gpg >/dev/null 2>&1 || { echoColor yellow "请先安装 gpg 后重试导出。"; return 1; }
     [ -f "$HIHY_CERT_MANAGER_CONFIG" ] && [ -f "$HIHY_CERT_TOKEN_FILE" ] || return 1
     temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-export.XXXXXX") || return 1
-    chmod 700 "$temp_dir"
-    mkdir -p "$temp_dir/profile/nodes"
-    cp -a "$HIHY_CERT_MANAGER_CONFIG" "$temp_dir/profile/manager.conf"
-    cp -a "$HIHY_CERT_TOKEN_FILE" "$temp_dir/profile/cloudflare.token"
-    [ -f "$HIHY_CERT_DEPLOY_KEY" ] && cp -a "$HIHY_CERT_DEPLOY_KEY" "$temp_dir/profile/deploy_ed25519"
-    [ -f "${HIHY_CERT_DEPLOY_KEY}.pub" ] && cp -a "${HIHY_CERT_DEPLOY_KEY}.pub" "$temp_dir/profile/deploy_ed25519.pub"
-    [ -f "$HIHY_CERT_KNOWN_HOSTS" ] && cp -a "$HIHY_CERT_KNOWN_HOSTS" "$temp_dir/profile/known_hosts"
-    cp -a "$HIHY_CERT_MANAGER_DIR"/nodes/. "$temp_dir/profile/nodes/" 2>/dev/null || true
+    trap 'rm -rf "$temp_dir"' EXIT
+    chmod 700 "$temp_dir" && mkdir -p "$temp_dir/profile/nodes" || return 1
+    cp -a "$HIHY_CERT_MANAGER_CONFIG" "$temp_dir/profile/manager.conf" &&
+        cp -a "$HIHY_CERT_TOKEN_FILE" "$temp_dir/profile/cloudflare.token" || return 1
+    if [ -f "$HIHY_CERT_DEPLOY_KEY" ]; then cp -a "$HIHY_CERT_DEPLOY_KEY" "$temp_dir/profile/deploy_ed25519" || return 1; fi
+    if [ -f "${HIHY_CERT_DEPLOY_KEY}.pub" ]; then cp -a "${HIHY_CERT_DEPLOY_KEY}.pub" "$temp_dir/profile/deploy_ed25519.pub" || return 1; fi
+    if [ -f "$HIHY_CERT_KNOWN_HOSTS" ]; then cp -a "$HIHY_CERT_KNOWN_HOSTS" "$temp_dir/profile/known_hosts" || return 1; fi
+    cp -a "$HIHY_CERT_MANAGER_DIR"/nodes/. "$temp_dir/profile/nodes/" || return 1
     archive="$temp_dir/profile.tar.gz"
     tar -czf "$archive" -C "$temp_dir" profile || { rm -rf "$temp_dir"; return 1; }
     output="./hihy-cert-profile-$(getCertificateManagerValue domain)-$(date +%Y%m%d).gpg"
@@ -5966,42 +5905,134 @@ exportCertificateManagerProfile() {
         rm -rf "$temp_dir"
         return 1
     fi
-    chmod 600 "$output"
+    chmod 600 "$output" || return 1
     rm -rf "$temp_dir"
     echoColor green "加密配置包已导出: $output"
+)
+
+readProfileValue() {
+    local file="$1" key="$2"
+    [ "$(grep -c "^${key}=" "$file")" = 1 ] || return 1
+    sed -n "s/^${key}=//p" "$file"
 }
 
+validateCertificateProfile() {
+    local profile="$1" domain email days file name host port user node_domain public_key
+    [ "$(readProfileValue "$profile/manager.conf" mode)" = manager ] || return 1
+    domain=$(readProfileValue "$profile/manager.conf" domain) || return 1
+    email=$(readProfileValue "$profile/manager.conf" email) || return 1
+    days=$(readProfileValue "$profile/manager.conf" renew_days) || return 1
+    validateCertificateNodeField domain "$domain" &&
+        [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] &&
+        [[ "$days" =~ ^[0-9]{1,3}$ ]] && [ "$days" -ge 1 ] && [ "$days" -le 365 ] || return 1
+    [ -s "$profile/cloudflare.token" ] || return 1
+    for file in "$profile"/nodes/*.conf; do
+        [ -f "$file" ] || continue
+        name=$(readProfileValue "$file" name) && host=$(readProfileValue "$file" host) &&
+            port=$(readProfileValue "$file" port) && user=$(readProfileValue "$file" user) &&
+            node_domain=$(readProfileValue "$file" domain) || return 1
+        [ "${file##*/}" = "$name.conf" ] && validateCertificateNodeField name "$name" &&
+            validateCertificateNodeField host "$host" && validateCertificateNodeField port "$port" &&
+            validateCertificateNodeField user "$user" && validateWildcardHostname "$domain" "$node_domain" || return 1
+    done
+    if [ -f "$profile/deploy_ed25519" ]; then
+        public_key=$(ssh-keygen -y -P '' -f "$profile/deploy_ed25519" 2>/dev/null) || return 1
+        # Regenerate the public key from the private key; ignore untrusted comments.
+        printf '%s\n' "$public_key" > "$profile/deploy_ed25519.pub" || return 1
+    elif [ -f "$profile/deploy_ed25519.pub" ]; then
+        return 1
+    fi
+}
+
+applyCertificateProfile() (
+    local profile="$1" transaction committed=false mutated=false restored=true i file
+    local -a names=(manager.conf cloudflare.token nodes state)
+    local -a targets=("$HIHY_CERT_MANAGER_CONFIG" "$HIHY_CERT_TOKEN_FILE" "$HIHY_CERT_MANAGER_DIR/nodes" "$HIHY_CERT_MANAGER_DIR/state")
+    for file in deploy_ed25519 deploy_ed25519.pub known_hosts; do
+        [ -f "$profile/$file" ] || continue
+        names+=("$file")
+        case "$file" in
+            deploy_ed25519) targets+=("$HIHY_CERT_DEPLOY_KEY") ;;
+            deploy_ed25519.pub) targets+=("${HIHY_CERT_DEPLOY_KEY}.pub") ;;
+            known_hosts) targets+=("$HIHY_CERT_KNOWN_HOSTS") ;;
+        esac
+    done
+    transaction=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-apply.XXXXXX") || return 1
+    mkdir "$transaction/old" "$transaction/new" || return 1
+    rollbackProfile() {
+        if [ "$committed" = false ] && [ "$mutated" = true ]; then
+            for ((i=0; i<${#names[@]}; i++)); do
+                rm -rf -- "${targets[$i]}" || restored=false
+                if [ -e "$transaction/old/${names[$i]}" ] || [ -L "$transaction/old/${names[$i]}" ]; then
+                    cp -a "$transaction/old/${names[$i]}" "${targets[$i]}" || restored=false
+                fi
+            done
+        fi
+        if [ "$restored" = true ]; then
+            rm -rf "$transaction"
+        else
+            echoColor red "导入回滚未完成，原文件保留在 $transaction"
+        fi
+    }
+    trap rollbackProfile EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    for ((i=0; i<${#names[@]}; i++)); do
+        if [ -e "${targets[$i]}" ] || [ -L "${targets[$i]}" ]; then
+            cp -a "${targets[$i]}" "$transaction/old/${names[$i]}" || return 1
+        fi
+        if [ "${names[$i]}" = state ]; then
+            mkdir "$transaction/new/state" || return 1
+            if [ -d "$HIHY_CERT_MANAGER_DIR/state" ]; then
+                cp -a "$HIHY_CERT_MANAGER_DIR/state/." "$transaction/new/state/" || return 1
+            fi
+            rm -f "$transaction/new/state"/node-*.state || return 1
+        else
+            cp -a "$profile/${names[$i]}" "$transaction/new/${names[$i]}" || return 1
+        fi
+    done
+    # All backups and candidates exist before the first destination is changed.
+    mutated=true
+    for ((i=0; i<${#names[@]}; i++)); do
+        mkdir -p "$(dirname "${targets[$i]}")" || return 1
+        rm -rf -- "${targets[$i]}" || return 1
+        mv "$transaction/new/${names[$i]}" "${targets[$i]}" || return 1
+    done
+    committed=true
+)
+
 importCertificateManagerProfile() {
-    local input="${1:-}" temp_dir archive profile_dir
+    withCertificateOperationLock importCertificateManagerProfileUnlocked "$@"
+}
+
+importCertificateManagerProfileUnlocked() (
+    local input="${1:-}" temp_dir archive profile_dir domain count
     if [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
         echoColor red "本机已有接收端配置，不能导入中心端配置覆盖角色。"; return 1
     fi
     command -v gpg >/dev/null 2>&1 || { echoColor yellow "请先安装 gpg 后重试导入。"; return 1; }
     if [ -z "$input" ]; then
-        echoColor green "请输入 .gpg 配置包路径:"
-        read -r input || return 1
+        read -r -p "请输入 .gpg 配置包路径: " input || return 1
     fi
     [ -f "$input" ] || return 1
-    echoColor yellow "将导入中心端配置、凭据和节点记录，同名配置会被覆盖。"
-    confirmHihyAction IMPORT || { echoColor yellow "已取消导入。"; return 0; }
     ensureCertificateManagerDirectories || return 1
     temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-import.XXXXXX") || return 1
-    chmod 700 "$temp_dir"
+    trap 'rm -rf "$temp_dir"' EXIT
     archive="$temp_dir/profile.tar.gz"
-    gpg --output "$archive" --decrypt "$input" || { rm -rf "$temp_dir"; return 1; }
-    tar -xzf "$archive" -C "$temp_dir" || { rm -rf "$temp_dir"; return 1; }
+    gpg --output "$archive" --decrypt "$input" || return 1
+    extractCertificateArchive profile "$temp_dir" < "$archive" || return 1
     profile_dir="$temp_dir/profile"
-    [ -f "$profile_dir/manager.conf" ] && [ -f "$profile_dir/cloudflare.token" ] || { rm -rf "$temp_dir"; return 1; }
-    command install -m 600 "$profile_dir/manager.conf" "$HIHY_CERT_MANAGER_CONFIG"
-    command install -m 600 "$profile_dir/cloudflare.token" "$HIHY_CERT_TOKEN_FILE"
-    [ -f "$profile_dir/deploy_ed25519" ] && command install -m 600 "$profile_dir/deploy_ed25519" "$HIHY_CERT_DEPLOY_KEY"
-    [ -f "$profile_dir/deploy_ed25519.pub" ] && command install -m 644 "$profile_dir/deploy_ed25519.pub" "${HIHY_CERT_DEPLOY_KEY}.pub"
-    [ -f "$profile_dir/known_hosts" ] && command install -m 600 "$profile_dir/known_hosts" "$HIHY_CERT_KNOWN_HOSTS"
-    cp -a "$profile_dir"/nodes/. "$HIHY_CERT_MANAGER_DIR/nodes/" 2>/dev/null || true
-    rm -rf "$temp_dir"
-    verifyCloudflareToken || return 1
-    echoColor green "证书中心配置导入完成。"
-}
+    validateCertificateProfile "$profile_dir" || { echoColor red "配置包字段或部署密钥无效，未覆盖本机配置。"; return 1; }
+    HIHY_CERT_TOKEN_FILE="$profile_dir/cloudflare.token" verifyCloudflareToken || {
+        echoColor red "导入的 Token 验证失败，原配置和凭据未改动。"; return 1;
+    }
+    domain=$(readProfileValue "$profile_dir/manager.conf" domain) || return 1
+    count=$(find "$profile_dir/nodes" -type f -name '*.conf' | wc -l)
+    echoColor yellow "将导入中心端 $domain，共 $count 个节点，替换本机节点列表并重置分发状态。"
+    confirmHihyAction IMPORT || { echoColor yellow "已取消导入。"; return 0; }
+    applyCertificateProfile "$profile_dir" || { echoColor red "导入失败，请检查上方回滚结果。"; return 1; }
+    echoColor green "证书中心配置导入完成，请检查证书状态并重新分发。"
+)
 
 showCertificateManagerStatus() {
     local domain cert days issuer serial role

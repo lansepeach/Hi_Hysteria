@@ -78,13 +78,13 @@ startInstallValidationProcess() {
         client_path = root / 'client.json'
         client_path.write_text(json.dumps(client))
         with (root / 'server.log').open('w+') as server_log, (root / 'client.log').open('w+') as client_log:
-            server = subprocess.Popen([str(core), '-c', str(root / 'conf/config.yaml'), 'server'],
+            server = subprocess.Popen([str(core), '--disable-update-check', '-c', str(root / 'conf/config.yaml'), 'server'],
                                       stdout=server_log, stderr=server_log)
             client_proc = None
             try:
                 time.sleep(.4)
                 assert server.poll() is None, 'generated server config failed'
-                client_proc = subprocess.Popen([str(core), '-c', str(client_path), 'client'],
+                client_proc = subprocess.Popen([str(core), '--disable-update-check', '-c', str(client_path), 'client'],
                                                stdout=client_log, stderr=client_log)
                 deadline = time.monotonic() + 8
                 while True:

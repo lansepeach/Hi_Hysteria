@@ -12,6 +12,8 @@ HIHY_MONITOR_INTERVAL=5 hihy monitor # 刷新间隔 1–60 秒
 
 运行监控需要 Python 3 和 yq v4。新安装会自动安装依赖；旧安装若提示缺少 Python，请用发行版包管理器安装 `python3`（Arch 为 `python`）。建议使用 Hysteria v2.12.3 或更高版本。
 
+菜单 13 也使用相同的 JSON 统计接口，读取实际 `trafficStats` 配置。它只输出一次快照，不启用或修改认证方式；使用原 password、userpass 或 HTTP 认证时仍可查看核心已有的统计标识。
+
 ## 可以看到什么
 
 - 来源 IP 数、客户端连接数、活动 TCP 数；同一 IP 的多个客户端连接归为一组。
