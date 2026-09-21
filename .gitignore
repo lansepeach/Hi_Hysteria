@@ -28,3 +28,7 @@ hihy-cert-profile-*.gpg
 
 # Local script backups
 *.bak
+
+# Generated client profiles contain live proxy credentials.
+Hy2-*.yaml
+hihy_debug.info
