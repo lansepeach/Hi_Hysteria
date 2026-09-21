@@ -57,3 +57,5 @@ jobs:
         run: python3 tests/ech_integration.py "$RUNNER_TEMP/hysteria"
       - name: Test generated configurations and certificate migration on loopback
         run: python3 tests/config_integration.py "$RUNNER_TEMP/hysteria"
+      - name: Test real-time monitor and IP authentication on loopback
+        run: python3 tests/monitor_integration.py "$RUNNER_TEMP/hysteria"

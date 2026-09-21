@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.21`
+当前脚本版本：`1.0.22`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -28,6 +28,7 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持 ACL 域名分流和屏蔽规则
 - 支持生成 v2rayN、NekoBox、Clash Meta 等客户端配置
 - 支持查看在线用户、流量统计、活动连接和实时日志
+- 支持实时监控：按客户端来源 IP 显示连接数、流量、速率、TCP 访问目标与时间
 - 支持添加 socks5 出站，包括 WireProxy/WARP
 - 支持安装失败状态恢复、后台版本检查和缓存提示
 - 核心更新强制校验 SHA-256，检查启动稳定性，失败时回滚，并保留原服务启停状态
@@ -80,6 +81,11 @@ hihy 13           # 查看统计信息
 hihy 14           # 查看实时日志
 hihy 15           # 添加 socks5 出站
 hihy 16           # 多服务器证书管理（中心端申请、接收端部署）
+hihy 17           # 实时监控（首次启用时提示重启服务）
+hihy monitor      # 实时监控，每 2 秒刷新，q 退出，j/k 滚动
+hihy monitor --once # 输出一次监控快照
+hihy monitor enable # 启用按 IP 统计，重启正在运行的服务
+hihy monitor disable # 关闭按 IP 统计，恢复原密码认证并重启正在运行的服务
 hihy cert status  # 查看通配符证书和节点部署状态
 hihy cert nodes   # 查看所有 SSH 证书节点
 hihy migrate-service # 将旧版启动方式迁移到原生 systemd
@@ -92,6 +98,7 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 - [防火墙问题](md/firewall.md)
 - [证书配置与多服务器分发](md/certificate.md)
 - [ECH 配置与 v2.12.3 升级](md/ech.md)
+- [实时监控](md/monitor.md)
 - [UDP 服务商排雷列表](md/blacklist.md)
 - [延迟和上下行速度设置](md/speed.md)
 - [支持的客户端](md/client.md)
@@ -128,6 +135,7 @@ sudo env "PATH=$PATH" bash tests/nft_integration.sh
 sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria
 python3 tests/config_integration.py /path/to/hysteria
+python3 tests/monitor_integration.py /path/to/hysteria
 ```
 
 测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，不会调用生产节点或申请真实证书。

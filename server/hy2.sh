@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.21"
+hihyV="ver1.22"
 
 umask 077
 
@@ -29,6 +29,7 @@ HIHY_CERT_KNOWN_HOSTS="${HIHY_CERT_KNOWN_HOSTS:-$HIHY_CERT_MANAGER_DIR/known_hos
 HIHY_SHARED_CERT_DIR="${HIHY_SHARED_CERT_DIR:-$HIHY_ROOT_DIR/cert/shared}"
 HIHY_LEGO_BIN="${HIHY_LEGO_BIN:-$HIHY_CERT_MANAGER_DIR/bin/lego}"
 HIHY_LEGO_VERSION="${HIHY_LEGO_VERSION:-5.4.0}"
+HIHY_MONITOR_AUTH_FILE="${HIHY_MONITOR_AUTH_FILE:-$HIHY_ROOT_DIR/bin/monitor-auth}"
 # ===== 自维护仓库配置 =====
 HIHY_REPO_OWNER="${HIHY_REPO_OWNER:-lansepeach}"
 HIHY_REPO_NAME="${HIHY_REPO_NAME:-Hi_Hysteria}"
@@ -779,7 +780,7 @@ hasSystemDependency() {
 checkSystemForUpdate() {
     local packageManager tool package arch
     local -a install_command refresh_command missing_packages=()
-    local -a required_tools=(wget curl lsof bash iptables bc openssl pkill dig qrencode crontab chrt tar sha256sum install)
+    local -a required_tools=(wget curl lsof bash iptables bc openssl pkill dig qrencode crontab chrt tar sha256sum install python3)
 
     if command -v apt >/dev/null 2>&1; then
         packageManager=apt
@@ -826,6 +827,7 @@ checkSystemForUpdate() {
             qrencode)
                 [ "$packageManager" != apk ] || package=libqrencode-tools ;;
             chrt) package=util-linux ;;
+            python3) [ "$packageManager" != pacman ] || package=python ;;
             sha256sum | install) package=coreutils ;;
         esac
         missing_packages+=("$package")
@@ -2039,6 +2041,10 @@ setHysteriaConfig() (
     fi
     addOrUpdateYaml "$yaml_file" "auth.type" "password" || return 1
     addOrUpdateYaml "$yaml_file" "auth.password" "${auth_secret}" "string" || return 1
+    if monitorIsEnabled && [ -x "$HIHY_MONITOR_AUTH_FILE" ]; then
+        addOrUpdateYaml "$yaml_file" "auth.type" command string || return 1
+        addOrUpdateYaml "$yaml_file" "auth.command" "$HIHY_MONITOR_AUTH_FILE" string || return 1
+    fi
     addOrUpdateYaml "$yaml_file" "ignoreClientBandwidth" "${ignore_client_bandwidth}" || return 1
     if [ "${congestion_mode}" != "brutal" ]; then
         addOrUpdateYaml "$yaml_file" "congestion.type" "${congestion_type}" || return 1
@@ -4315,6 +4321,418 @@ checkStatus() {
     fi
 }
 
+monitorIsEnabled() {
+    [ "$(getYamlValue "$HIHY_CONFIG_FILE" auth.type)" = command ] &&
+        [ "$(getYamlValue "$HIHY_CONFIG_FILE" auth.command)" = "$HIHY_MONITOR_AUTH_FILE" ]
+}
+
+configureRealtimeMonitor() (
+    local action="${1:-enable}" stage auth_type yq_path api_port
+    case "$action" in enable | disable) ;; *) return 1 ;; esac
+    [ -f "$HIHY_CONFIG_FILE" ] && [ -f "$HIHY_BACKUP_FILE" ] || {
+        echoColor red "请先安装并配置 Hysteria2。"; return 1;
+    }
+    auth_type=$(getYamlValue "$HIHY_CONFIG_FILE" auth.type) || return 1
+    if monitorIsEnabled; then
+        if [ "$action" = enable ] && [ -x "$HIHY_MONITOR_AUTH_FILE" ]; then
+            echoColor green "按 IP 统计已启用。"
+            return 0
+        fi
+    elif [ "$action" = disable ]; then
+        echoColor yellow "当前未启用按 IP 统计。"
+        return 0
+    elif [ "$auth_type" != password ]; then
+        echoColor red "按 IP 统计目前仅支持脚本的 password 认证，不会覆盖自定义认证。"
+        return 1
+    fi
+    # Preserve auth.password so all existing client exporters keep working.
+    yq -e '.auth.password | tag == "!!str" and length > 0' "$HIHY_CONFIG_FILE" >/dev/null 2>&1 || {
+        echoColor red "未找到有效的原认证密码。"; return 1;
+    }
+    stage=$(mktemp -d "$HIHY_ROOT_DIR/conf/monitor.XXXXXX") || return 1
+    trap 'rm -rf "$stage"' EXIT
+    cp -a "$HIHY_CONFIG_FILE" "$stage/config.yaml" && cp -a "$HIHY_BACKUP_FILE" "$stage/backup.yaml" || return 1
+    if [ "$action" = enable ]; then
+        yq_path=$(command -v yq) || return 1
+        mkdir -p "$(dirname "$HIHY_MONITOR_AUTH_FILE")" || return 1
+        {
+            printf '#!/bin/bash\n# Hi_Hysteria: validate the existing password, then identify the source IP.\n'
+            printf 'config_file=%q\nyq_bin=%q\n' "$HIHY_CONFIG_FILE" "$yq_path"
+            cat <<'AUTH'
+# Append a sentinel to preserve trailing newlines in passwords.
+expected=$("$yq_bin" -r '.auth.password' "$config_file" && printf '.') || exit 1
+expected=${expected%$'\n.'}
+[ -n "$expected" ] && [ "${2-}" = "$expected" ] || exit 1
+peer=${1%:*}
+peer=${peer#[}
+peer=${peer%]}
+case "$peer" in '' | *[!0-9a-fA-F:.%a-zA-Z_-]*) exit 1 ;; esac
+printf 'hihy-ip:%s\n' "$peer"
+AUTH
+        } >"$stage/monitor-auth" || return 1
+        chmod 700 "$stage/monitor-auth" || return 1
+        # The helper reads the live configuration; it remains valid after rollback.
+        # Retain it on failure because an incomplete config rollback may still reference it.
+        command install -m 700 "$stage/monitor-auth" "$HIHY_MONITOR_AUTH_FILE" || return 1
+        addOrUpdateYaml "$stage/config.yaml" auth.type command string || return 1
+        addOrUpdateYaml "$stage/config.yaml" auth.command "$HIHY_MONITOR_AUTH_FILE" string || return 1
+        if [ "$(getYamlValue "$stage/config.yaml" trafficStats.listen)" = null ] ||
+            [ -z "$(getYamlValue "$stage/config.yaml" trafficStats.listen)" ]; then
+            command -v python3 >/dev/null 2>&1 || { echoColor red "请先安装 python3。"; return 1; }
+            api_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])') || return 1
+            addOrUpdateYaml "$stage/config.yaml" trafficStats.listen "127.0.0.1:$api_port" string || return 1
+            addOrUpdateYaml "$stage/config.yaml" trafficStats.secret "$(generate_uuid)" string || return 1
+            addOrUpdateYaml "$stage/backup.yaml" trafficPort "$api_port" || return 1
+        fi
+    else
+        addOrUpdateYaml "$stage/config.yaml" auth.type password string || return 1
+        yq -i 'del(.auth.command)' "$stage/config.yaml" || return 1
+    fi
+    applyHihyConfigFiles "$stage/config.yaml" "$stage/backup.yaml" || return 1
+    if [ "$action" = enable ]; then
+        echoColor green "已启用按 IP 统计，客户端继续使用原密码。"
+    else
+        echoColor green "已关闭按 IP 统计，恢复 password 认证。"
+    fi
+)
+
+realtimeMonitor() {
+    local action="${1:-}" answer monitor_config
+    case "$action" in
+        enable | disable) configureRealtimeMonitor "$action"; return $? ;;
+        '' | --once) ;;
+        *) echoColor yellow "用法: hihy monitor [--once|enable|disable]"; return 1 ;;
+    esac
+    if ! command -v python3 >/dev/null 2>&1; then
+        echoColor red "实时监控需要 Python 3，请先安装 python3（Arch 安装 python）。"
+        return 1
+    fi
+    [ -f "$HIHY_CONFIG_FILE" ] || { echoColor red "请先安装并配置 Hysteria2。"; return 1; }
+    if ! monitorIsEnabled; then
+        echoColor yellow "按 IP 统计需切换为本地密码校验，客户端密码不变。"
+        echoColor yellow "启用会重启正在运行的服务、断开现有连接并清零核心统计；客户端需重连。"
+        if [ "$action" = --once ] || [ ! -t 0 ]; then
+            echoColor yellow "请先运行 hihy monitor enable 启用。"
+            return 1
+        fi
+        read -r -p "启用按 IP 统计？[y/N]: " answer || return 1
+        case "$answer" in y | Y) configureRealtimeMonitor enable || return 1 ;; *) return 0 ;; esac
+    fi
+    [ -x "$HIHY_MONITOR_AUTH_FILE" ] || {
+        echoColor red "IP 认证脚本缺失，请运行 hihy monitor enable 修复。"; return 1;
+    }
+    # Read the actual API settings, never the proxy password or stale backup port.
+    monitor_config=$(yq -o=json '.trafficStats' "$HIHY_CONFIG_FILE") || return 1
+    python3 - "$action" "${HIHY_MONITOR_INTERVAL:-2}" 3<<<"$monitor_config" <<'HIHY_MONITOR_PY'
+import collections
+import datetime as dt
+import ipaddress
+import json
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import sys
+import termios
+import time
+import tty
+import unicodedata
+import urllib.error
+import urllib.request
+
+
+def client_ip(identity):
+    if not isinstance(identity, str) or not identity.startswith('hihy-ip:'):
+        return None
+    try:
+        ip = ipaddress.ip_address(identity[8:])
+        return str(getattr(ip, 'ipv4_mapped', None) or ip)
+    except ValueError:
+        return None
+
+
+def clean(value):
+    return ''.join(c for c in str(value) if not unicodedata.category(c).startswith('C'))
+
+
+def size(value):
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if value < 1024 or unit == 'TiB':
+            return f'{value:.1f}{unit}'
+        value /= 1024
+
+
+def date(value):
+    try:
+        # Go emits RFC3339Nano; also support distro Python versions before fromisoformat.
+        match = re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})', value)
+        if not match:
+            return None
+        base, fraction, zone = match.groups()
+        offset = dt.timedelta()
+        if zone != 'Z':
+            offset = dt.timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6]))
+            if zone[0] == '-':
+                offset = -offset
+        return dt.datetime.strptime(base, '%Y-%m-%dT%H:%M:%S').replace(
+            microsecond=int((fraction or '').ljust(6, '0')[:6]), tzinfo=dt.timezone(offset)).astimezone()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def clock_text(value):
+    timestamp = date(value)
+    return timestamp.strftime('%m-%d %H:%M:%S') if timestamp else '-'
+
+
+def counter(value):
+    if type(value) is not int or value < 0:
+        raise ValueError('invalid counter')
+    return value
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+class API:
+    def __init__(self, config):
+        listen = config.get('listen', '')
+        host, port = listen.rsplit(':', 1)
+        host = host.strip('[]')
+        if host in ('', '0.0.0.0', 'localhost'):
+            host = '127.0.0.1'
+        elif host == '::':
+            host = '::1'
+        if not ipaddress.ip_address(host).is_loopback or not 0 < int(port) < 65536:
+            raise ValueError('local API required')
+        self.url = f'http://[{host}]:{port}' if ':' in host else f'http://{host}:{port}'
+        self.secret = config.get('secret') or ''
+        if not isinstance(self.secret, str) or any(c in self.secret for c in '\r\n'):
+            raise ValueError('invalid secret')
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def get(self, path):
+        request = urllib.request.Request(self.url + path, headers={
+            'Authorization': self.secret.encode('utf-8'), 'Accept': 'application/json'})
+        with self.opener.open(request, timeout=3) as response:
+            raw = response.read(16 * 1024 * 1024 + 1)
+        if len(raw) > 16 * 1024 * 1024:
+            raise ValueError('response too large')
+        return json.loads(raw)
+
+    def snapshot(self):
+        traffic, online, dump = self.get('/traffic'), self.get('/online'), self.get('/dump/streams')
+        if not isinstance(traffic, dict) or not isinstance(online, dict) or not isinstance(dump, dict):
+            raise ValueError('invalid API response')
+        for value in traffic.values():
+            counter(value['tx'])
+            counter(value['rx'])
+        for value in online.values():
+            counter(value)
+        streams = dump['streams']
+        if not isinstance(streams, list):
+            raise ValueError('invalid streams')
+        for stream in streams:
+            for field in ('connection', 'stream', 'tx', 'rx'):
+                counter(stream[field])
+            for field in ('auth', 'state', 'req_addr', 'hooked_req_addr', 'initial_at', 'last_active_at'):
+                if not isinstance(stream[field], str):
+                    raise ValueError('invalid stream field')
+        return traffic, online, streams
+
+
+class Monitor:
+    def __init__(self):
+        self.previous = {}
+        self.previous_at = None
+        self.first_seen = {}
+        self.recent = collections.OrderedDict()
+
+    def render(self, snapshot, now, monotonic):
+        traffic, online, streams = snapshot
+        groups = {}
+        unknown = 0
+        for identity in traffic.keys() | online.keys():
+            ip = client_ip(identity)
+            if ip is None:
+                unknown += 1
+                continue
+            group = groups.setdefault(ip, {'tx': 0, 'rx': 0, 'devices': 0, 'streams': 0, 'up': 0, 'down': 0})
+            value = traffic.get(identity, {'tx': 0, 'rx': 0})
+            for field in ('tx', 'rx'):
+                group[field] += value[field]
+            group['devices'] += online.get(identity, 0)
+            previous = self.previous.get(identity)
+            if previous is not None and self.previous_at is not None:
+                elapsed = max(monotonic - self.previous_at, .001)
+                # A core restart or an external clear resets the baseline, never produces negative speed.
+                if value['tx'] >= previous['tx'] and value['rx'] >= previous['rx']:
+                    group['up'] += (value['tx'] - previous['tx']) / elapsed
+                    group['down'] += (value['rx'] - previous['rx']) / elapsed
+        live = set()
+        for stream in streams:
+            ip = client_ip(stream['auth'])
+            if ip is None:
+                continue
+            group = groups.setdefault(ip, {'tx': 0, 'rx': 0, 'devices': 0, 'streams': 0, 'up': 0, 'down': 0})
+            group['streams'] += 1
+            key = (ip, stream['connection'], stream['stream'], stream['initial_at'])
+            live.add(key)
+            self.recent[key] = dict(stream, ip=ip)
+            self.recent.move_to_end(key)
+        # Bound in-memory sampled history, including on long-running busy servers.
+        while len(self.recent) > 500:
+            self.recent.popitem(last=False)
+        active_ips = {ip for ip, g in groups.items() if g['devices'] or g['streams']}
+        self.first_seen = {ip: self.first_seen.get(ip, now) for ip in active_ips}
+        lines = ['实时监控  ' + now.strftime('%Y-%m-%d %H:%M:%S %Z'),
+                 f'在线来源 IP: {len(active_ips)}  客户端连接: {sum(online.values())}  活动 TCP: {len(streams)}',
+                 '上传/下载均为客户端视角；总流量含 TCP+UDP，自核心启动或统计清零起累计。',
+                 'IP 为服务端看到的来源，同一 NAT 出口合并；首次观察时间不等于登录时间。',
+                 'UDP 无逐条目标记录；短 TCP 连接可能漏采，已结束记录的流量为最后采样值。', '']
+        if unknown:
+            lines.append(f'提示: {unknown} 个统计标识无法归属到 IP（可能是启用前的连接）。')
+        lines.append('客户端 IP 与流量')
+        for ip, group in sorted(groups.items(), key=lambda item: (item[0] not in active_ips, item[0])):
+            seen = self.first_seen.get(ip)
+            lines += [f'{ip}  客户端连接: {group["devices"]}  TCP: {group["streams"]}  '
+                      + ('本次在线首次观察: ' + seen.strftime('%m-%d %H:%M:%S') if seen else '离线'),
+                      f'  累计上传: {size(group["tx"])}  下载: {size(group["rx"])}  '
+                      f'速率 ↑{size(group["up"])}/s  ↓{size(group["down"])}/s']
+        if not groups:
+            lines.append('当前没有客户端 IP 统计，等待客户端连接。')
+        lines += ['', 'TCP 访问记录（活动优先，最近采样最多 500 条）']
+        states = {'init': '初始化', 'hook': '嗅探中', 'connect': '连接中', 'estab': '已建立', 'closed': '已关闭'}
+        records = sorted(self.recent.items(), key=lambda item: (item[0] in live, item[1]['last_active_at']), reverse=True)
+        for key, stream in records:
+            start = date(stream['initial_at'])
+            end = now if key in live else date(stream['last_active_at'])
+            age = f'{max(0, int((end - start).total_seconds()))}s' if start and end else '-'
+            state = states.get(stream['state'], '未知') if key in live else '已结束(采样)'
+            lines += [f'{stream["ip"]} → {clean(stream["req_addr"]) or "-"}  [{state}]',
+                      f'  嗅探域名: {clean(stream["hooked_req_addr"]) or "-"}  '
+                      f'上传: {size(stream["tx"])}  下载: {size(stream["rx"])}',
+                      f'  开始: {clock_text(stream["initial_at"])}  '
+                      f'最后活动: {clock_text(stream["last_active_at"])}  时长: {age}']
+        if not records:
+            lines.append('当前没有采样到 TCP 访问。')
+        self.previous, self.previous_at = traffic, monotonic
+        return lines
+
+
+def fit(line, width):
+    result, used = '', 0
+    for char in line:
+        length = 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+        if used + length > width - 1:
+            return result + '…'
+        result += char
+        used += length
+    return result
+
+
+def wrap(lines, width):
+    result = []
+    for line in lines:
+        part, used = '', 0
+        for char in line:
+            length = 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+            if used + length > max(2, width - 1):
+                result.append(part)
+                part, used = '', 0
+            part += char
+            used += length
+        result.append(part)
+    return result
+
+
+def main():
+    once = sys.argv[1] == '--once' or not sys.stdout.isatty()
+    try:
+        interval = float(sys.argv[2])
+        if not math.isfinite(interval) or not 1 <= interval <= 60:
+            raise ValueError('interval')
+        with os.fdopen(3) as source:
+            api = API(json.load(source))
+    except (ValueError, TypeError, AttributeError, OSError):
+        print('监控配置无效：请检查本机 trafficStats.listen/secret，刷新间隔需为 1–60 秒。')
+        return 1
+    monitor, terminal, old_settings, offset = Monitor(), None, None, 0
+    try:
+        if not once:
+            try:
+                terminal = open('/dev/tty', 'rb', buffering=0)
+                old_settings = termios.tcgetattr(terminal)
+                tty.setcbreak(terminal)
+            except (OSError, termios.error):
+                if terminal:
+                    terminal.close()
+                terminal = None
+            print('\033[?1049h\033[?25l', end='', flush=True)
+        while True:
+            error = None
+            try:
+                snapshot = api.snapshot()
+                lines = monitor.render(snapshot, dt.datetime.now().astimezone(), time.monotonic())
+            except urllib.error.HTTPError as exc:
+                error = ('统计 API 认证失败，请检查 trafficStats.secret。' if exc.code in (401, 403)
+                         else f'统计 API 返回 HTTP {exc.code}；请检查配置和核心版本（hihy 7）。')
+            except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
+                error = '无法读取统计 API：请检查服务已启动（hihy 6）、监听地址与核心版本。'
+            if error:
+                # Do not display stale data as current activity after an outage.
+                lines = ['实时监控  ' + dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), error, '恢复后自动重试。']
+                monitor = Monitor()
+            if once:
+                print('\n'.join(lines))
+                return 1 if error else 0
+            columns, rows = shutil.get_terminal_size((120, 30))
+            lines = wrap(lines, columns)
+            page = max(1, rows - 2)
+            offset = min(offset, max(0, len(lines) - page))
+            footer = f'每 {interval:g}s 刷新 | q 退出，j/k 滚动，g 回顶部 | 行 {offset + 1}–{min(offset + page, len(lines))}/{len(lines)}'
+            print('\033[H\033[2J' + '\n'.join(fit(line, columns) for line in lines[offset:offset + page])
+                  + '\n' + fit(footer, columns), end='', flush=True)
+            deadline = time.monotonic() + interval
+            while time.monotonic() < deadline:
+                remaining = max(0, deadline - time.monotonic())
+                if terminal and select.select([terminal], [], [], remaining)[0]:
+                    key = terminal.read(1)
+                    if key in (b'q', b'Q', b'\x04'):
+                        return 0
+                    if key == b'j':
+                        offset += max(1, page // 2)
+                    elif key == b'k':
+                        offset = max(0, offset - max(1, page // 2))
+                    elif key == b'g':
+                        offset = 0
+                    break
+                elif not terminal:
+                    time.sleep(remaining)
+    finally:
+        if terminal:
+            try:
+                if old_settings is not None:
+                    termios.tcsetattr(terminal, termios.TCSADRAIN, old_settings)
+            finally:
+                terminal.close()
+        if not once:
+            print('\033[?25h\033[?1049l', end='', flush=True)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+HIHY_MONITOR_PY
+}
+
 # 定义格式化字节大小的函数
 format_bytes() {
     local bytes=$1
@@ -5527,6 +5945,7 @@ show_menu() {
     echo -e "$(echoColor yellow "14) 查看实时日志")"
     echo -e "$(echoColor yellow "15) 添加socks5出站[支持自动配置warp]")"
     echo -e "$(echoColor lightCyan "16) 多服务器证书管理")"
+    echo -e "$(echoColor skyBlue "17) 实时监控")"
 
     echo -e "$(echoColor purple "###############################")"
 
@@ -5610,6 +6029,10 @@ menu() {
                 ;;
             16)
                 certificateManagerMenu
+                wait_for_continue
+                ;;
+            17)
+                realtimeMonitor
                 wait_for_continue
                 ;;
             0) exit 0 ;;
@@ -5700,6 +6123,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
                 receive) receiveCertificatePackage ;;
                 *) certificateManagerMenu ;;
             esac
+            ;;
+        monitor | 17)
+            realtimeMonitor "${2:-}"
             ;;
         migrate-service)
             if migrateLegacyService; then

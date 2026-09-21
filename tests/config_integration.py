@@ -126,8 +126,13 @@ startInstallValidationProcess() {
             assert 'bandwidth' not in config
         assert config['sniff']['enable'] is True
         assert 'enabled' not in config['sniff']
+        if mode != 'brutal':
+            assert config['auth']['type'] == 'command', 'reconfiguration disabled IP monitoring'
+            assert config['auth']['password'] == 'test-password'
         assert not list((root / 'conf').glob('.configure.*')), 'staging directory leaked'
         connect(cert, 'helloworld.com')
+        if mode == 'brutal':
+            shell('configureRealtimeMonitor enable')
 
     cert, key = certificate('shared', '*.example.com')
     shell('publishSharedCertificate "$HIHY_ROOT_DIR/shared.crt" "$HIHY_ROOT_DIR/shared.key" example.com; '
