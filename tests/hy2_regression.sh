@@ -197,7 +197,9 @@ assert_eq "$(yq '.tls.ech' "$scratch/client.yaml")" null
     downloadHysteriaCore() { return 1; }
     setHysteriaConfig() { touch "$scratch/unexpected-config"; return 0; }
     installHihyService() { return 1; }
-    if install; then fail 'failed installation reported success'; fi
+    HIHY_CONFIG_FILE="$scratch/fresh-config.yaml"
+    HIHY_BACKUP_FILE="$scratch/fresh-backup.yaml"
+    if install <<< INSTALL; then fail 'failed installation reported success'; fi
     [ ! -e "$scratch/unexpected-config" ] || fail 'configured after failed download'
 )
 

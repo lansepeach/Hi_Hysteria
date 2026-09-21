@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.22"
+hihyV="ver1.23"
 
 umask 077
 
@@ -961,11 +961,11 @@ getInstallFailureMarker() {
 }
 
 getHihyServiceScriptPrimary() {
-    echo "${1:-/etc/init.d/hihy}"
+    echo "${1:-$HIHY_INIT_SERVICE}"
 }
 
 getHihyServiceScriptFallback() {
-    echo "${1:-/etc/rc.d/hihy}"
+    echo "${1:-$HIHY_LEGACY_SERVICE}"
 }
 
 classifyInstallState() {
@@ -981,10 +981,8 @@ classifyInstallState() {
         "$HIHY_SERVICE_FILE"
         "$service_primary"
         "$service_fallback"
-        "$bin_link"
     )
     local has_any_artifact="false"
-    local has_core_assets="false"
     local has_service_assets="false"
     local path
 
@@ -992,9 +990,6 @@ classifyInstallState() {
         if [ -e "$path" ]; then
             has_any_artifact="true"
             case "$path" in
-                "$root_dir/bin/appS" | "$root_dir/conf/config.yaml" | "$root_dir/conf/backup.yaml")
-                    has_core_assets="true"
-                    ;;
                 "$HIHY_SERVICE_FILE" | "$service_primary" | "$service_fallback")
                     has_service_assets="true"
                     ;;
@@ -1007,7 +1002,8 @@ classifyInstallState() {
         return
     fi
 
-    if [ "$has_core_assets" = "true" ] && [ "$has_service_assets" = "true" ] && [ -f "$bin_link" ]; then
+    if [ -x "$root_dir/bin/appS" ] && [ -s "$root_dir/conf/config.yaml" ] &&
+        [ "$has_service_assets" = "true" ] && [ -f "$bin_link" ]; then
         echo "installed"
         return
     fi
@@ -1019,6 +1015,27 @@ classifyInstallState() {
 
     echo "not-installed"
 }
+
+confirmHihyAction() {
+    local word="$1" answer=""
+    read -r -p "输入 ${word} 确认，其他输入或直接回车取消: " answer || return 1
+    [ "$answer" = "$word" ]
+}
+
+withHihyOperationLock() (
+    # Outside the installation directory so uninstall cannot remove an active lock.
+    local lock="${HIHY_ROOT_DIR}.operation.lock"
+    if ! mkdir -m 700 "$lock" 2>/dev/null; then
+        echoColor red "已有安装/卸载任务，或遗留锁目录: $lock"
+        echoColor yellow "请等待任务结束；若任务已异常退出，确认没有运行中的任务后再删除该锁目录。"
+        return 1
+    fi
+    trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf '%s\n' "$BASHPID" >"$lock/pid" || return 1
+    "$@"
+)
 
 markInstallFailed() {
     local phase="$1"
@@ -3489,20 +3506,33 @@ uninstall_rc_local_for_arch() {
 }
 
 install() {
+    withHihyOperationLock installHihyConfirmed
+}
+
+installHihyConfirmed() {
     local install_state
     install_state=$(classifyInstallState)
 
-    if [ "$install_state" = "installed" ]; then
-        echoColor green "你已经成功安装hysteria,如需修改配置请使用选项9/12"
-        exit 0
+    if [ "$install_state" = "installed" ] || [ -e "$HIHY_CONFIG_FILE" ] || [ -L "$HIHY_CONFIG_FILE" ] ||
+        [ -e "$HIHY_BACKUP_FILE" ] || [ -L "$HIHY_BACKUP_FILE" ]; then
+        echoColor yellow "检测到已有安装或配置，已阻止重复安装，不会覆盖现有配置。"
+        echoColor yellow "更新核心用选项 7，修改配置用选项 9；确需重装请先备份并从选项 2 卸载。"
+        return 0
     fi
 
     if [ "$install_state" = "partially-installed" ]; then
-        echoColor yellow "检测到未完成的安装残留，正在清理脚本管理的文件后继续安装..."
-        cleanupLegacyPortHoppingNatIfPresent >/dev/null 2>&1 || true
-        delHihyFirewallPort udp >/dev/null 2>&1 || true
-        delHihyFirewallPort tcp >/dev/null 2>&1 || true
-        recoverPartialInstallState
+        echoColor yellow "检测到无配置的安装残留，继续将清理脚本管理的服务和防火墙规则后重新安装。"
+    else
+        echoColor yellow "将安装 Hysteria2、配置服务并设置防火墙。"
+    fi
+    confirmHihyAction INSTALL || { echoColor yellow "已取消安装。"; return 0; }
+
+    if [ "$install_state" = "partially-installed" ]; then
+        if ! serviceStop && serviceIsActive; then
+            echoColor red "服务未能停止，已中止安装。"; return 1
+        fi
+        removeOwnedFirewallRules || { echoColor red "防火墙清理失败，已中止安装。"; return 1; }
+        recoverPartialInstallState || return 1
         echoColor purple "已完成部分安装状态恢复，继续执行安装。"
     fi
 
@@ -3718,17 +3748,27 @@ checkRoot() {
 }
 
 uninstall() {
+    withHihyOperationLock uninstallHihyConfirmed
+}
+
+uninstallHihyConfirmed() {
     local install_state
     install_state=$(classifyInstallState)
-    portHoppingStatus=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStatus" "false")
-    if [ "$install_state" = "not-installed" ]; then
-        echoColor red "Hysteria 未安装!"
-        exit 1
+    if [ "$install_state" = "not-installed" ] && [ ! -d "$HIHY_CERT_MANAGER_DIR" ]; then
+        echoColor yellow "Hysteria 未安装，无需重复卸载。"
+        return 0
     fi
 
     if [ "$install_state" = "partially-installed" ]; then
-        echoColor yellow "检测到未完成的安装残留，正在按部分安装状态执行卸载清理..."
+        echoColor yellow "检测到未完成的安装残留。"
     fi
+    echoColor red "将停止 Hysteria，删除本机配置、证书、日志、定时任务和 hihy 命令。"
+    if [ -d "$HIHY_CERT_MANAGER_DIR" ]; then
+        echoColor yellow "也会删除本机证书管理配置、DNS Token、部署密钥及节点记录；其他服务器不会被卸载。"
+        echoColor yellow "中心端请先使用选项 16 导出配置包，并安排好后续证书续期。"
+    fi
+    confirmHihyAction UNINSTALL || { echoColor yellow "已取消卸载。"; return 0; }
+    portHoppingStatus=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStatus" "false")
 
     if ! serviceStop && serviceIsActive; then
         echoColor red "服务未能停止，卸载已中止。"
@@ -3778,8 +3818,8 @@ uninstall() {
         echoColor purple "\n->检测到WARP/WireProxy安装"
         echoColor green "是否卸载WARP/WireProxy?"
         echo -e "\033[33m\033[01m1、卸载\n2、保留\033[0m\033[32m\n\n输入序号:\033[0m"
-        read -r warpUninstallChoice
-        if [ -z "${warpUninstallChoice}" ] || [ "${warpUninstallChoice}" == "1" ]; then
+        read -r warpUninstallChoice || warpUninstallChoice=2
+        if [ "${warpUninstallChoice}" = "1" ]; then
             echoColor purple "\n->正在卸载WARP/WireProxy..."
             warp u || true
             echoColor purple "\n->WARP/WireProxy卸载完成"
@@ -3792,7 +3832,7 @@ uninstall() {
         echoColor green "Hysteria 已完全卸载!"
     else
         echoColor red "卸载过程中发生错误，请检查是否有残留文件或进程。"
-        exit 1
+        return 1
     fi
 }
 
@@ -5373,6 +5413,27 @@ validateWildcardHostname() {
     [ "${#label}" -le 63 ] && [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
+getCertificateRole() {
+    if [ -f "$HIHY_CERT_MANAGER_CONFIG" ]; then
+        if [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
+            echo conflict
+        else
+            echo manager
+        fi
+    elif [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
+        echo receiver
+    else
+        echo unconfigured
+    fi
+}
+
+requireCertificateManager() {
+    if [ "$(getCertificateRole)" != manager ]; then
+        echoColor yellow "此操作需要证书中心端。请先完成中心端设置；接收端无需申请或分发证书。"
+        return 1
+    fi
+}
+
 getSharedCertificateHostname() {
     local domain="$1" hostname="${2:-}" receiver="$HIHY_CERT_MANAGER_DIR/config/receiver.conf"
     if [ -z "$hostname" ] && [ -f "$receiver" ]; then
@@ -5435,6 +5496,7 @@ migrateLocalHysteriaToSharedCertificate() (
 issueOrRenewWildcardCertificate() {
     local domain email wildcard lego_cert lego_key renew_days action="run"
 
+    requireCertificateManager || return 1
     domain=$(getCertificateManagerValue domain) || return 1
     email=$(getCertificateManagerValue email) || return 1
     wildcard="*.${domain}"
@@ -5469,6 +5531,7 @@ getCertificateDaysRemaining() {
 
 renewAndDeployCertificates() {
     local cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem" renew_days days=0
+    requireCertificateManager || return 1
     renew_days=$(getCertificateManagerValue renew_days 2>/dev/null) || renew_days=30
     [[ "$renew_days" =~ ^[0-9]+$ ]] && [ "$renew_days" -gt 0 ] || return 1
     if [ -f "$cert" ]; then
@@ -5522,51 +5585,75 @@ EOF
 }
 
 initCertificateManager() {
-    local current_domain domain="" email token hostname
-    current_domain=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.domains" 2>/dev/null)
-    current_domain=${current_domain#*.}
-    current_domain=${current_domain#[}
-    current_domain=${current_domain%]}
-    current_domain=${current_domain//\"/}
-    if printf '%s' "$current_domain" | grep -q '\.'; then
-        domain=$(printf '%s' "$current_domain" | awk -F. '{print $(NF-1)"."$NF}')
+    local current_domain domain="" email token hostname input_domain input_email token_stage
+    if [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
+        echoColor red "本机已有接收端配置，不能直接覆盖为中心端。"; return 1
     fi
-    email=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.email" 2>/dev/null)
+    if [ -f "$HIHY_CERT_MANAGER_CONFIG" ]; then
+        echoColor yellow "本机已有中心端配置；续期请使用选项 3。本操作会重新设置本机中心端。"
+        confirmHihyAction RECONFIGURE || { echoColor yellow "已取消中心端设置。"; return 0; }
+        domain=$(getCertificateManagerValue domain)
+        email=$(getCertificateManagerValue email)
+    else
+        current_domain=""
+        case "$(yq '.acme.domains | tag' "$HIHY_CONFIG_FILE" 2>/dev/null)" in
+            '!!seq') current_domain=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.domains[0]") || current_domain="" ;;
+            '!!str') current_domain=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.domains") || current_domain="" ;;
+        esac
+        # A public suffix can have multiple labels (example.co.uk); never guess the last two.
+        if [[ "$current_domain" == \*.* ]]; then domain=${current_domain#*.}; fi
+        email=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.email" 2>/dev/null) || email=""
+    fi
 
     if [ -n "$domain" ]; then
         echoColor green "主域名(默认:${domain}):"
     else
         echoColor green "请输入用于通配符证书的主域名(例如 example.com):"
     fi
-    read -r input_domain
+    read -r input_domain || return 1
     [ -n "$input_domain" ] && domain="$input_domain"
+    domain=${domain,,}
+    if [ -f "$HIHY_CERT_MANAGER_CONFIG" ] && [ "$domain" != "$(getCertificateManagerValue domain)" ]; then
+        echoColor red "已有中心端不能直接更换主域名，请先备份并迁移原证书及节点。"; return 1
+    fi
     printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' || {
         echoColor red "请输入有效的主域名。"
         return 1
     }
     [ -n "$email" ] && [ "$email" != "null" ] || email="admin@${domain}"
     echoColor green "ACME 邮箱(默认:${email}):"
-    read -r input_email
+    read -r input_email || return 1
     [ -n "$input_email" ] && email="$input_email"
+    printf '%s' "$email" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || {
+        echoColor red "请输入有效的 ACME 邮箱。"; return 1;
+    }
     hostname=$(getSharedCertificateHostname "$domain" 2>/dev/null) || {
         echoColor green "请输入本机客户端连接域名（例如 node.${domain}，必须是一级子域名）:"
         read -r hostname || return 1
         validateWildcardHostname "$domain" "$hostname" || { echoColor red "连接域名不在证书覆盖范围内。"; return 1; }
     }
-    writeCertificateManagerConfig "$domain" "$email" || return 1
-
-    token=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.dns.config.cloudflare_api_token" 2>/dev/null)
+    if [ -s "$HIHY_CERT_TOKEN_FILE" ]; then
+        token=$(cat "$HIHY_CERT_TOKEN_FILE") || return 1
+    else
+        token=$(getYamlValue "$HIHY_CONFIG_FILE" "acme.dns.config.cloudflare_api_token" 2>/dev/null) || token=""
+    fi
     if [ -z "$token" ] || [ "$token" = "null" ]; then
         echoColor green "请输入 Cloudflare API Token(输入不回显):"
-        read -r -s token
+        read -r -s token || return 1
         echo
     else
-        echoColor purple "已从当前 Hysteria 配置导入 Cloudflare Token。"
+        echoColor purple "复用本机已有 Cloudflare Token。"
     fi
     [ -n "$token" ] || return 1
-    printf '%s' "$token" >"$HIHY_CERT_TOKEN_FILE"
-    chmod 600 "$HIHY_CERT_TOKEN_FILE"
-    verifyCloudflareToken || { echoColor red "Cloudflare Token 验证失败。"; return 1; }
+    ensureCertificateManagerDirectories || return 1
+    token_stage=$(mktemp "$HIHY_CERT_MANAGER_DIR/credentials/.token.XXXXXX") || return 1
+    printf '%s' "$token" >"$token_stage" && chmod 600 "$token_stage" || { rm -f "$token_stage"; return 1; }
+    if ! HIHY_CERT_TOKEN_FILE="$token_stage" verifyCloudflareToken; then
+        rm -f "$token_stage"
+        echoColor red "Cloudflare Token 验证失败，原配置和凭据未改动。"; return 1
+    fi
+    writeCertificateManagerConfig "$domain" "$email" || { rm -f "$token_stage"; return 1; }
+    mv -f "$token_stage" "$HIHY_CERT_TOKEN_FILE" || return 1
     installLego || return 1
     issueOrRenewWildcardCertificate || return 1
     migrateLocalHysteriaToSharedCertificate "$domain" "$hostname" || return 1
@@ -5587,6 +5674,9 @@ ensureCertificateDeployKey() {
 
 initCertificateReceiver() {
     local domain="${1:-}" hostname="${2:-}" interactive=false config_file
+    if [ -f "$HIHY_CERT_MANAGER_CONFIG" ]; then
+        echoColor red "本机已有中心端配置，不能直接覆盖为接收端。"; return 1
+    fi
     if [ -z "$domain" ]; then
         interactive=true
         echoColor green "请输入共享通配符证书的主域名(例如 example.com):"
@@ -5653,8 +5743,8 @@ receiveCertificatePackage() (
 validateCertificateNodeField() {
     local type="$1" value="$2"
     case "$type" in
-        name) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9._-]+$' ;;
-        host) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9.:-]+$' ;;
+        name) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$' ;;
+        host) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9:][A-Za-z0-9.:-]*$' ;;
         user) printf '%s' "$value" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$' ;;
         port) validate_port "$value" ;;
         domain) printf '%s' "$value" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' ;;
@@ -5663,21 +5753,30 @@ validateCertificateNodeField() {
 }
 
 addCertificateNode() {
-    local manager_domain name host port user node_domain node_file public_key auth_line
+    local manager_domain name host port user node_domain node_file public_key auth_line temp_node
+    requireCertificateManager || return 1
     manager_domain=$(getCertificateManagerValue domain) || return 1
-    ensureCertificateDeployKey || return 1
     echoColor green "节点名称:"
-    read -r name
+    read -r name || return 1
+    validateCertificateNodeField name "$name" || { echoColor red "节点名称无效。"; return 1; }
+    node_file="$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf"
+    if [ -e "$node_file" ] || [ -L "$node_file" ]; then
+        echoColor yellow "节点 ${name} 已存在，未覆盖。请用分发功能重试；更换节点请先删除旧记录。"
+        return 1
+    fi
+    [ -f "$HIHY_SHARED_CERT_DIR/current/fullchain.pem" ] || {
+        echoColor yellow "请先申请并发布中心端证书（选项 3），再添加节点。"; return 1;
+    }
     echoColor green "SSH 地址:"
-    read -r host
+    read -r host || return 1
     echoColor green "SSH 端口(默认22):"
-    read -r port
+    read -r port || return 1
     [ -n "$port" ] || port=22
     echoColor green "SSH 用户(默认root):"
-    read -r user
+    read -r user || return 1
     [ -n "$user" ] || user=root
     echoColor green "节点证书域名:"
-    read -r node_domain
+    read -r node_domain || return 1
     validateCertificateNodeField name "$name" && validateCertificateNodeField host "$host" && \
         validateCertificateNodeField port "$port" && validateCertificateNodeField user "$user" && \
         validateCertificateNodeField domain "$node_domain" || return 1
@@ -5685,90 +5784,129 @@ addCertificateNode() {
         echoColor red "节点域名不在 *.${manager_domain} 覆盖范围内，请使用一级子域名。"; return 1;
     }
 
-    ssh-keyscan -p "$port" -H "$host" 2>/dev/null >>"$HIHY_CERT_KNOWN_HOSTS" || return 1
+    ensureCertificateDeployKey || return 1
+    ssh-keyscan -T 10 -p "$port" -H "$host" 2>/dev/null >>"$HIHY_CERT_KNOWN_HOSTS" || return 1
     sort -u "$HIHY_CERT_KNOWN_HOSTS" -o "$HIHY_CERT_KNOWN_HOSTS"
     public_key=$(cat "${HIHY_CERT_DEPLOY_KEY}.pub")
     auth_line="restrict,command=\"${HIHY_BIN_LINK} cert receive\" ${public_key}"
     echoColor yellow "将通过当前 SSH 登录权限初始化接收节点并安装受限部署公钥。"
-    if ! ssh -p "$port" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HIHY_CERT_KNOWN_HOSTS" \
+    if ! ssh -p "$port" -o ConnectTimeout=10 -o ConnectionAttempts=1 \
+        -o ServerAliveInterval=10 -o ServerAliveCountMax=2 \
+        -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HIHY_CERT_KNOWN_HOSTS" \
         "${user}@${host}" "set -e; ${HIHY_BIN_LINK} cert receiver-init '${manager_domain}' '${node_domain}'; mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; if ! grep -qF '${public_key}' ~/.ssh/authorized_keys; then printf '%s\\n' '${auth_line}' >> ~/.ssh/authorized_keys; fi; chmod 600 ~/.ssh/authorized_keys"; then
         return 1
     fi
-    node_file="$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf"
-    cat >"$node_file" <<EOF
+    temp_node=$(mktemp "$HIHY_CERT_MANAGER_DIR/nodes/.node.XXXXXX") || return 1
+    cat >"$temp_node" <<EOF
 name=${name}
 host=${host}
 port=${port}
 user=${user}
 domain=${node_domain}
 EOF
-    chmod 600 "$node_file"
+    chmod 600 "$temp_node" || { rm -f "$temp_node"; return 1; }
+    # link(2) fails if another terminal created the same node while SSH was running.
+    if ! ln "$temp_node" "$node_file"; then rm -f "$temp_node"; return 1; fi
+    rm -f "$temp_node"
     deployCertificateToNode "$node_file"
 }
 
-deployCertificateToNode() {
-    local node_file="$1" host port user name cert key cert_digest
+deployCertificateToNode() (
+    local node_file="$1" host port user name cert_dir cert_digest stage status=failed
+    requireCertificateManager || return 1
     [ -f "$node_file" ] || return 1
     host=$(grep '^host=' "$node_file" | cut -d= -f2-)
     port=$(grep '^port=' "$node_file" | cut -d= -f2-)
     user=$(grep '^user=' "$node_file" | cut -d= -f2-)
     name=$(grep '^name=' "$node_file" | cut -d= -f2-)
-    cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
-    key="$HIHY_SHARED_CERT_DIR/current/privkey.pem"
-    [ -f "$cert" ] && [ -f "$key" ] || return 1
-    cert_digest=$(sha256sum "$cert") || return 1
+    validateCertificateNodeField name "$name" && validateCertificateNodeField host "$host" &&
+        validateCertificateNodeField port "$port" && validateCertificateNodeField user "$user" || {
+        echoColor red "节点配置无效: $node_file"; return 1;
+    }
+    cert_dir=$(readlink -f "$HIHY_SHARED_CERT_DIR/current") || return 1
+    stage=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.deploy.XXXXXX") || return 1
+    trap 'rm -rf "$stage"' EXIT
+    # Pin one release and compute the digest from the actual package contents.
+    cp "$cert_dir/fullchain.pem" "$stage/fullchain.pem" &&
+        cp "$cert_dir/privkey.pem" "$stage/privkey.pem" || return 1
+    cert_digest=$(sha256sum "$stage/fullchain.pem") || return 1
     cert_digest=${cert_digest%% *}
-    if (set -o pipefail; tar -czf - -C "$HIHY_SHARED_CERT_DIR/current" fullchain.pem privkey.pem \
+    if (set -o pipefail; tar -czf - -C "$stage" fullchain.pem privkey.pem \
         | ssh -i "$HIHY_CERT_DEPLOY_KEY" -p "$port" -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 \
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HIHY_CERT_KNOWN_HOSTS" \
             "${user}@${host}"); then
-        printf 'node=%s\nstatus=success\ndeployed_at=%s\ncert_sha256=%s\n' "$name" "$(date +%s)" "$cert_digest" >"$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
-        chmod 600 "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+        status=success
+    fi
+    printf 'node=%s\nstatus=%s\ndeployed_at=%s\ncert_sha256=%s\n' "$name" "$status" "$(date +%s)" "$cert_digest" >"$stage/node.state" || return 1
+    chmod 600 "$stage/node.state" && mv -f "$stage/node.state" "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state" || return 1
+    if [ "$status" = success ]; then
         echoColor green "节点 ${name} 证书分发成功。"
         return 0
     fi
-    printf 'node=%s\nstatus=failed\ndeployed_at=%s\n' "$name" "$(date +%s)" >"$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
-    chmod 600 "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
     echoColor red "节点 ${name} 证书分发失败。"
     return 1
-}
+)
 
 deployCertificateToAllNodes() {
-    local mode="${1:-all}" node_file name state_file digest result=0
-    [ -d "$HIHY_CERT_MANAGER_DIR/nodes" ] || return 0
-    digest=$(sha256sum "$HIHY_SHARED_CERT_DIR/current/fullchain.pem") || return 1
+    local mode="${1:-all}" node_file name state_file digest result=0 total=0 skipped=0 success=0 failed=0
+    requireCertificateManager || return 1
+    case "$mode" in all | pending) ;; *) return 1 ;; esac
+    for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
+        [ ! -f "$node_file" ] || total=$((total + 1))
+    done
+    [ "$total" -gt 0 ] || { echoColor yellow "尚未添加 SSH 节点。"; return 0; }
+    digest=$(sha256sum "$HIHY_SHARED_CERT_DIR/current/fullchain.pem" 2>/dev/null) || {
+        echoColor yellow "尚未发布共享证书，请先申请/续期证书。"; return 1;
+    }
     digest=${digest%% *}
     for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
         [ -f "$node_file" ] || continue
         name=$(grep '^name=' "$node_file" | cut -d= -f2-)
-        validateCertificateNodeField name "$name" || { result=1; continue; }
+        validateCertificateNodeField name "$name" || { result=1; failed=$((failed + 1)); continue; }
         state_file="$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
         if [ "$mode" = pending ] && [ -f "$state_file" ] &&
             grep -qx 'status=success' "$state_file" && grep -qx "cert_sha256=$digest" "$state_file"; then
+            skipped=$((skipped + 1))
             continue
         fi
-        deployCertificateToNode "$node_file" || result=1
+        if deployCertificateToNode "$node_file"; then
+            success=$((success + 1))
+        else
+            result=1
+            failed=$((failed + 1))
+        fi
     done
+    echoColor purple "分发结果: 总计 ${total}，成功 ${success}，失败 ${failed}，已同步跳过 ${skipped}。"
     return "$result"
 }
 
 removeCertificateNode() {
-    local name
+    local name node_file
+    requireCertificateManager || return 1
     echoColor green "请输入要删除的节点名称:"
-    read -r name
+    read -r name || return 1
     validateCertificateNodeField name "$name" || return 1
-    rm -f "$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf" "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
+    node_file="$HIHY_CERT_MANAGER_DIR/nodes/${name}.conf"
+    [ -f "$node_file" ] || { echoColor yellow "节点不存在，未执行删除。"; return 1; }
+    echoColor yellow "将删除本机节点 ${name} 的分发记录；不会删除远端证书或撤销远端 SSH 授权。"
+    confirmHihyAction "$name" || { echoColor yellow "已取消删除节点。"; return 0; }
+    rm -f "$node_file" "$HIHY_CERT_MANAGER_DIR/state/node-${name}.state" || return 1
+    echoColor green "节点 ${name} 已从分发列表移除。"
 }
 
 showCertificateNodes() {
-    local node_file state_file name host port user domain status deployed_at deployed_time count=0
+    local node_file state_file name host port user domain status deployed_at deployed_time digest="" count=0
+    digest=$(sha256sum "$HIHY_SHARED_CERT_DIR/current/fullchain.pem" 2>/dev/null) || digest=""
+    digest=${digest%% *}
     echoColor purple "已配置的 SSH 证书节点"
     printf '%-16s %-30s %-8s %-12s %-30s %-12s %s\n' \
-        "节点名称" "SSH 地址" "端口" "用户" "证书域名" "分发状态" "最近分发时间"
+        "节点名称" "SSH 地址" "端口" "用户" "证书域名" "分发状态" "最近尝试时间"
     printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
     for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
         [ -f "$node_file" ] || continue
         name=$(grep '^name=' "$node_file" | head -n 1 | cut -d= -f2-)
+        validateCertificateNodeField name "$name" || { echoColor red "节点名称无效: $node_file"; continue; }
         host=$(grep '^host=' "$node_file" | head -n 1 | cut -d= -f2-)
         port=$(grep '^port=' "$node_file" | head -n 1 | cut -d= -f2-)
         user=$(grep '^user=' "$node_file" | head -n 1 | cut -d= -f2-)
@@ -5780,7 +5918,13 @@ showCertificateNodes() {
             status=$(grep '^status=' "$state_file" | head -n 1 | cut -d= -f2-)
             deployed_at=$(grep '^deployed_at=' "$state_file" | head -n 1 | cut -d= -f2-)
             case "$status" in
-                success) status="成功" ;;
+                success)
+                    if [ -n "$digest" ] && grep -qx "cert_sha256=$digest" "$state_file"; then
+                        status="已同步"
+                    else
+                        status="待同步"
+                    fi
+                    ;;
                 failed) status="失败" ;;
                 "") status="未知" ;;
             esac
@@ -5802,7 +5946,8 @@ showCertificateNodes() {
 
 exportCertificateManagerProfile() {
     local output temp_dir archive
-    command -v gpg >/dev/null 2>&1 || return 1
+    requireCertificateManager || return 1
+    command -v gpg >/dev/null 2>&1 || { echoColor yellow "请先安装 gpg 后重试导出。"; return 1; }
     [ -f "$HIHY_CERT_MANAGER_CONFIG" ] && [ -f "$HIHY_CERT_TOKEN_FILE" ] || return 1
     temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-export.XXXXXX") || return 1
     chmod 700 "$temp_dir"
@@ -5827,13 +5972,18 @@ exportCertificateManagerProfile() {
 }
 
 importCertificateManagerProfile() {
-    local input="$1" temp_dir archive profile_dir
-    command -v gpg >/dev/null 2>&1 || return 1
+    local input="${1:-}" temp_dir archive profile_dir
+    if [ -f "$HIHY_CERT_MANAGER_DIR/config/receiver.conf" ]; then
+        echoColor red "本机已有接收端配置，不能导入中心端配置覆盖角色。"; return 1
+    fi
+    command -v gpg >/dev/null 2>&1 || { echoColor yellow "请先安装 gpg 后重试导入。"; return 1; }
     if [ -z "$input" ]; then
         echoColor green "请输入 .gpg 配置包路径:"
-        read -r input
+        read -r input || return 1
     fi
     [ -f "$input" ] || return 1
+    echoColor yellow "将导入中心端配置、凭据和节点记录，同名配置会被覆盖。"
+    confirmHihyAction IMPORT || { echoColor yellow "已取消导入。"; return 0; }
     ensureCertificateManagerDirectories || return 1
     temp_dir=$(mktemp -d "$HIHY_CERT_MANAGER_DIR/.profile-import.XXXXXX") || return 1
     chmod 700 "$temp_dir"
@@ -5854,10 +6004,17 @@ importCertificateManagerProfile() {
 }
 
 showCertificateManagerStatus() {
-    local domain cert days issuer serial node_file name state
+    local domain cert days issuer serial role
     domain=$(getCertificateManagerValue domain 2>/dev/null || getCertificateReceiverDomain 2>/dev/null || true)
     cert="$HIHY_SHARED_CERT_DIR/current/fullchain.pem"
-    echoColor purple "证书角色: $(getCertificateManagerValue mode 2>/dev/null || echo receiver)"
+    role=$(getCertificateRole)
+    case "$role" in
+        manager) role="中心端" ;;
+        receiver) role="接收端" ;;
+        conflict) role="角色配置冲突（同时存在中心端和接收端配置）" ;;
+        *) role="未配置" ;;
+    esac
+    echoColor purple "证书角色: $role"
     echoColor purple "主域名: ${domain:-未配置}"
     if [ -f "$cert" ]; then
         days=$(getCertificateDaysRemaining "$cert" 2>/dev/null || echo unknown)
@@ -5870,47 +6027,50 @@ showCertificateManagerStatus() {
     else
         echoColor yellow "尚未发布共享证书。"
     fi
-    for node_file in "$HIHY_CERT_MANAGER_DIR"/nodes/*.conf; do
-        [ -f "$node_file" ] || continue
-        name=$(grep '^name=' "$node_file" | cut -d= -f2-)
-        state="$HIHY_CERT_MANAGER_DIR/state/node-${name}.state"
-        if [ -f "$state" ]; then
-            echoColor yellow "节点 ${name}: $(grep '^status=' "$state" | cut -d= -f2-)"
-        else
-            echoColor yellow "节点 ${name}: 尚未分发"
-        fi
-    done
+    showCertificateNodes
 }
 
 certificateManagerMenu() {
-    echoColor purple "多服务器证书管理"
-    echoColor purple "中心端负责申请通配符证书并分发；接收端负责接收并供本机 Hysteria 使用。"
-    echoColor yellow "1) 设置本机为中心端(申请和分发证书)"
-    echoColor yellow "2) 设置本机为接收端(接收中心端证书)"
-    echoColor yellow "3) 申请/续期并发布通配符证书"
-    echoColor yellow "4) 添加并初始化 SSH 节点"
-    echoColor yellow "5) 删除节点"
-    echoColor yellow "6) 向全部节点分发证书"
-    echoColor yellow "7) 查看证书和节点状态"
-    echoColor yellow "8) 导出 GPG 加密配置包"
-    echoColor yellow "9) 导入 GPG 加密配置包"
-    echoColor yellow "10) 查看所有 SSH 节点"
-    echoColor yellow "0) 返回"
-    read -r cert_choice
-    case "$cert_choice" in
-        1) initCertificateManager ;;
-        2) initCertificateReceiver ;;
-        3) issueOrRenewWildcardCertificate && deployCertificateToAllNodes ;;
-        4) addCertificateNode ;;
-        5) removeCertificateNode ;;
-        6) deployCertificateToAllNodes ;;
-        7) showCertificateManagerStatus ;;
-        8) exportCertificateManagerProfile ;;
-        9) importCertificateManagerProfile ;;
-        10) showCertificateNodes ;;
-        0) return 0 ;;
-        *) return 1 ;;
-    esac
+    local cert_choice role
+    while true; do
+        role=$(getCertificateRole)
+        case "$role" in manager) role="中心端" ;; receiver) role="接收端" ;; conflict) role="角色冲突" ;; *) role="未配置" ;; esac
+        echoColor purple "多服务器证书管理 · 当前角色: $role"
+        echoColor purple "中心端申请并分发证书；接收端只需设置一次，等待中心端分发。"
+        echoColor yellow "1) 设置本机为中心端(申请和分发证书)"
+        echoColor yellow "2) 设置本机为接收端(接收中心端证书)"
+        echoColor yellow "3) 申请/续期并发布通配符证书"
+        echoColor yellow "4) 添加并初始化 SSH 节点"
+        echoColor yellow "5) 删除节点"
+        echoColor yellow "6) 向全部节点分发证书"
+        echoColor yellow "7) 查看证书和节点状态"
+        echoColor yellow "8) 导出 GPG 加密配置包"
+        echoColor yellow "9) 导入 GPG 加密配置包"
+        echoColor yellow "10) 查看所有 SSH 节点"
+        echoColor yellow "11) 只重试未同步节点(失败/旧证书/尚未分发)"
+        echoColor yellow "0) 返回主菜单"
+        read -r -p "请选择证书操作: " cert_choice || return 0
+        if case "$cert_choice" in
+            1) initCertificateManager ;;
+            2) initCertificateReceiver ;;
+            3) issueOrRenewWildcardCertificate && deployCertificateToAllNodes ;;
+            4) addCertificateNode ;;
+            5) removeCertificateNode ;;
+            6) deployCertificateToAllNodes ;;
+            7) showCertificateManagerStatus ;;
+            8) exportCertificateManagerProfile ;;
+            9) importCertificateManagerProfile ;;
+            10) showCertificateNodes ;;
+            11) deployCertificateToAllNodes pending ;;
+            0) return 0 ;;
+            *) echoColor yellow "请输入 0–11。" ;;
+        esac; then
+            :
+        else
+            echoColor yellow "操作未完成，请根据上方提示处理后重试。"
+        fi
+        echo
+    done
 }
 
 show_menu() {
@@ -5965,15 +6125,15 @@ wait_for_continue() {
 menu() {
     while true; do
         show_menu
-        read -r -p "请选择: " input
+        read -r -p "请选择: " input || return 0
         case $input in
             1)
                 install
-                exit $?
+                wait_for_continue
                 ;;
             2)
-                uninstall
-                exit $?
+                if uninstall && [ ! -d "$HIHY_ROOT_DIR" ]; then exit 0; fi
+                wait_for_continue
                 ;;
             3)
                 start
@@ -6113,13 +6273,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
                 receiver-init) initCertificateReceiver "${3:-}" "${4:-}" ;;
                 issue) issueOrRenewWildcardCertificate ;;
                 renew-auto) renewAndDeployCertificates ;;
-                deploy) deployCertificateToAllNodes ;;
+                deploy) deployCertificateToAllNodes "${3:-all}" ;;
                 node-add) addCertificateNode ;;
                 node-remove) removeCertificateNode ;;
                 status) showCertificateManagerStatus ;;
                 nodes) showCertificateNodes ;;
                 export) exportCertificateManagerProfile ;;
-                import) importCertificateManagerProfile "$3" ;;
+                import) importCertificateManagerProfile "${3:-}" ;;
                 receive) receiveCertificatePackage ;;
                 *) certificateManagerMenu ;;
             esac

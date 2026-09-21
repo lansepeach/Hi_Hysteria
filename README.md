@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.22`
+当前脚本版本：`1.0.23`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -29,6 +29,8 @@ Hysteria2 是一个基于修改版 QUIC 协议的网络工具，适合研究高�
 - 支持生成 v2rayN、NekoBox、Clash Meta 等客户端配置
 - 支持查看在线用户、流量统计、活动连接和实时日志
 - 支持实时监控：按客户端来源 IP 显示连接数、流量、速率、TCP 访问目标与时间
+- 安装/卸载需输入确认词；已有配置阻止重装，并防止多个终端同时安装或卸载
+- 证书管理支持节点防覆盖、删除确认、分发结果汇总和仅重试未同步节点
 - 支持添加 socks5 出站，包括 WireProxy/WARP
 - 支持安装失败状态恢复、后台版本检查和缓存提示
 - 核心更新强制校验 SHA-256，检查启动稳定性，失败时回滚，并保留原服务启停状态
@@ -88,10 +90,13 @@ hihy monitor enable # 启用按 IP 统计，重启正在运行的服务
 hihy monitor disable # 关闭按 IP 统计，恢复原密码认证并重启正在运行的服务
 hihy cert status  # 查看通配符证书和节点部署状态
 hihy cert nodes   # 查看所有 SSH 证书节点
+hihy cert deploy pending # 仅重试失败、旧证书或尚未分发的节点
 hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 ```
 
 脚本更新完成后会自动重新载入新版菜单。远程版本由仓库根目录的 `VERSION` 提供，完整脚本下载失败时不会覆盖当前安装。
+
+安装需输入 `INSTALL`，卸载需输入 `UNINSTALL`；回车、其他输入或输入结束均取消。已有配置不会被选项 1 覆盖，更新核心用选项 7，修改配置用选项 9。卸载会删除本机证书管理凭据和节点记录，中心端请先从选项 16 导出配置包并安排后续续期。安装与卸载共用操作锁，正常结束或收到退出信号时自动释放。
 
 ## 文档
 
@@ -131,6 +136,7 @@ hihy 9
 bash tests/hy2_regression.sh
 bash tests/reliability_regression.sh
 bash tests/management_regression.sh
+bash tests/safety_regression.sh
 sudo env "PATH=$PATH" bash tests/nft_integration.sh
 sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria

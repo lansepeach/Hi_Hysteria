@@ -216,7 +216,7 @@ assert_eq "$(cat "$scratch/service-state")" stopped
     removeOwnedFirewallRules() { return 1; }
     touch "$HIHY_BIN_LINK"
     echo 'backend=iptables|protocol=udp|port=44443' > "$HIHY_FIREWALL_STATE_FILE"
-    if uninstall; then fail 'failed cleanup reported successful uninstall'; fi
+    if uninstall <<< UNINSTALL; then fail 'failed cleanup reported successful uninstall'; fi
     [ -f "$HIHY_CONFIG_FILE" ] && [ -f "$HIHY_FIREWALL_STATE_FILE" ] && [ -f "$HIHY_BIN_LINK" ] || fail 'uninstall deleted recovery files'
 )
 
