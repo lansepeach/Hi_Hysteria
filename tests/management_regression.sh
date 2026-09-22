@@ -100,7 +100,7 @@ INPUT
     allowPort() { return 0; }
     serviceStop() { echo stopped > "$scratch/service-state"; }
     serviceStart() { echo running > "$scratch/service-state"; }
-    setHysteriaConfig() { echo broken > "$HIHY_CONFIG_FILE"; exit 7; }
+    setHysteriaConfig() { beginReconfiguration "$2" || return 1; echo broken > "$HIHY_CONFIG_FILE"; exit 7; }
     echo running > "$scratch/service-state"
     if changeServerConfig > "$scratch/exit.log"; then fail 'child exit accepted'; fi
     assert_eq "$(yq '.auth.password' "$HIHY_CONFIG_FILE")" test-secret

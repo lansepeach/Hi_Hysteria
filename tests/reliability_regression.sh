@@ -103,6 +103,9 @@ YAML
         printf 'backend=%s|protocol=%s|port=%s\n' "${3:-nft}" "$1" "$2" >> "$HIHY_FIREWALL_STATE_FILE"
     }
     setHysteriaConfig() {
+        # The interactive generator only enters its mutation phase after input.
+        assert_eq "$(cat "$HIHY_ROOT_DIR/service-state")" "$initial"
+        beginReconfiguration "$2" || return 1
         portHoppingStatus=false; portHoppingStart=50000; portHoppingEnd=51000; masquerade_tcp=false
         echo 'phase: new' > "$HIHY_CONFIG_FILE"
         echo new-acl > "$HIHY_ACL_FILE"

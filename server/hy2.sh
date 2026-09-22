@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.24"
+hihyV="ver1.25"
 
 umask 077
 
@@ -1023,11 +1023,19 @@ confirmHihyAction() {
     [ "$answer" = "$word" ]
 }
 
-withHihyOperationLock() (
+withHihyOperationLock() {
+    if [ "${HIHY_OPERATION_HELD:-false}" = true ]; then
+        "$@"
+    else
+        runHihyOperationLocked "$@"
+    fi
+}
+
+runHihyOperationLocked() (
     # Outside the installation directory so uninstall cannot remove an active lock.
-    local lock="${HIHY_ROOT_DIR}.operation.lock"
+    local lock="${HIHY_ROOT_DIR}.operation.lock" HIHY_OPERATION_HELD=true
     if ! mkdir -m 700 "$lock" 2>/dev/null; then
-        echoColor red "已有安装/卸载任务，或遗留锁目录: $lock"
+        echoColor red "已有配置/服务管理任务，或遗留锁目录: $lock"
         echoColor yellow "请等待任务结束；若任务已异常退出，确认没有运行中的任务后再删除该锁目录。"
         return 1
     fi
@@ -1260,8 +1268,78 @@ exportClientECH() {
     fi
 }
 
+calculateBrutalWindows() {
+    local delay_ms="$1" bandwidth_mbps="$2"
+    is_uint "$delay_ms" && is_uint "$bandwidth_mbps" || return 1
+    [ "$delay_ms" -ge 1 ] && [ "$delay_ms" -le 60000 ] &&
+        [ "$bandwidth_mbps" -ge 1 ] && [ "$bandwidth_mbps" -le 1100000 ] || return 1
+    # Two bandwidth-delay products, in bytes. Keep at least the core's default
+    # windows; bound large inputs without altering the host's global sysctls.
+    CRW=$((delay_ms * bandwidth_mbps * 1000000 / 1000 / 8 * 2))
+    [ "$CRW" -ge 20971520 ] || CRW=20971520
+    if [ "$CRW" -gt 67108864 ]; then
+        CRW=67108864
+        echoColor yellow "估算窗口过大，已限制初始连接窗口为 64 MiB。" >&2
+    fi
+    SRW=$((CRW * 2 / 5))
+    max_CRW=$((CRW * 3 / 2))
+    max_SRW=$((SRW * 3 / 2))
+}
+
+prepareLocalTrafficStats() {
+    local config="$1" backup="$2" old_password="${3:-}" listen secret password api_port
+    listen=$(getYamlValue "$config" trafficStats.listen) || return 1
+    secret=$(getYamlValue "$config" trafficStats.secret) || return 1
+    password=$(getYamlValue "$config" auth.password) || return 1
+    api_port=${listen##*:}
+    if ! validate_port "$api_port"; then
+        api_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])') || return 1
+    fi
+    if [ -z "$secret" ] || [ "$secret" = null ] || [ "$secret" = "$password" ] ||
+        { [ -n "$old_password" ] && [ "$secret" = "$old_password" ]; }; then
+        secret=$(openssl rand -hex 32) || return 1
+    fi
+    addOrUpdateYaml "$config" trafficStats.listen "127.0.0.1:$api_port" string &&
+        addOrUpdateYaml "$config" trafficStats.secret "$secret" string &&
+        addOrUpdateYaml "$backup" trafficPort "$api_port" number
+}
+
+prepareConfigurationACL() {
+    local old_config="$1" target="$2" block_http3="$3" source_acl=""
+    : > "$target" || return 1
+    if [ -f "$old_config" ]; then
+        source_acl=$(getYamlValue "$old_config" acl.file) || return 1
+        if [ -n "$source_acl" ] && [ "$source_acl" != null ]; then
+            # Relative paths depend on the service manager's working directory.
+            # Refuse ambiguous paths instead of silently dropping their rules.
+            [[ "$source_acl" = /* ]] || { echoColor red "请先将 acl.file 改为绝对路径。"; return 1; }
+            [ -r "$source_acl" ] || { echoColor red "无法读取原 ACL: $source_acl"; return 1; }
+            cat "$source_acl" > "$target" || return 1
+        elif yq -e '.acl.inline != null' "$old_config" >/dev/null 2>&1; then
+            yq -r '.acl.inline[]' "$old_config" > "$target" || return 1
+        elif [ -f "$HIHY_ACL_FILE" ]; then
+            cat "$HIHY_ACL_FILE" > "$target" || return 1
+        fi
+    fi
+    # Only the wizard's exact UDP/443 rule is controlled by this switch.
+    sed '/^[[:space:]]*reject(all, udp\/443)[[:space:]]*$/d' "$target" > "$target.rules" || return 1
+    : > "$target" || return 1
+    if [ "$block_http3" = true ]; then
+        printf 'reject(all, udp/443)\n' >> "$target" || return 1
+    fi
+    cat "$target.rules" >> "$target" && rm -f "$target.rules"
+}
+
+beginReconfiguration() {
+    local backup_dir="$1"
+    : > "$backup_dir/apply-started" || return 1
+    if serviceIsActive; then serviceStop || return 1; fi
+    removeOwnedFirewallRules
+}
+
 setHysteriaConfig() (
     local ech_key_path="" old_ech_path="" yaml_file="" backup_file="" validation_pid="" debug_file="" config_stage=""
+    local reconfigure_dir="${2:-}" old_auth_password="" owned_pid=""
     trap 'if [ -n "$validation_pid" ]; then kill "$validation_pid" 2>/dev/null || true; wait "$validation_pid" 2>/dev/null || true; fi; rm -rf -- "$config_stage"' EXIT
     if [ "$#" -gt 0 ]; then
         ech_key_path="$1"
@@ -1327,31 +1405,7 @@ setHysteriaConfig() (
         echo -e "\033[33m\033[01m1、跳过(默认)\n2、安装WARP\033[0m\033[32m\n\n输入序号:\033[0m"
         read -r warpChoice || return 1
         if [ "${warpChoice}" == "2" ]; then
-            echoColor purple "\n->开始安装WARP,请稍候..."
-            echoColor purple "请在WARP安装菜单中选择 [全局] 工作模式(出现菜单时手动选择全局)"
-            wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh 2>/dev/null
-            bash menu.sh d
-            if [ -f "/etc/wireguard/warp.conf" ]; then
-                current_mtu=$(grep -oP '^MTU = \K\d+' /etc/wireguard/warp.conf)
-                if [ -n "${current_mtu}" ] && [ "${current_mtu}" -lt 1320 ]; then
-                    sed -i "s/^MTU = ${current_mtu}/MTU = 1320/g" /etc/wireguard/warp.conf
-                    echoColor purple "\n->MTU已从 ${current_mtu} 调整为 1320"
-                elif [ -n "${current_mtu}" ]; then
-                    echoColor purple "\n->当前MTU=${current_mtu},无需调整(≥1320)"
-                fi
-                echoColor purple "\n->正在开启WARP..."
-                warp o
-                sleep 3
-                echoColor purple "\n->正在重新开启WARP以确保连接稳定..."
-                warp o
-                warpEnabled="true"
-                echoColor purple "\n->WARP安装完成,Hysteria2将通过Cloudflare WARP IP打洞连接"
-            else
-                echoColor red "\n->WARP安装失败: 未找到/etc/wireguard/warp.conf"
-                echoColor red "请手动执行: wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh d"
-                echoColor red "WARP未成功安装,终止脚本执行"
-                return 1
-            fi
+            echoColor yellow "将在配置录入完成后安装 WARP。"
         else
             warpEnabled="false"
             echoColor purple "\n->跳过WARP安装,直接使用服务器真实IP"
@@ -1742,7 +1796,11 @@ setHysteriaConfig() (
                 echoColor red "端口范围错误,请重新输入!"
                 continue
             fi
-            pIDa=$(lsof -i udp:${port} | grep -v "PID" | awk '{print $2}')
+            pIDa=$(lsof -t -i "udp:${port}" 2>/dev/null || true)
+            if [ -n "$reconfigure_dir" ]; then
+                owned_pid=$(getHihyServicePID 2>/dev/null || true)
+                pIDa=$(printf '%s\n' "$pIDa" | awk -v own="$owned_pid" 'NF && $0 != own')
+            fi
             if [ "$pIDa" != "" ]; then
                 echoColor red "\n->端口${port}被占用,PID:${pIDa}!请重新输入或者运行kill -9 ${pIDa}后重新安装!"
             else
@@ -1963,6 +2021,9 @@ setHysteriaConfig() (
                 masquerade_proxy="https://www.helloworld.org"
             fi
             echo -e "\n->伪装代理地址:"$(echoColor red ${masquerade_proxy})"\n"
+            echoColor green "是否跳过伪装上游 TLS 证书验证?"
+            echoColor yellow "1、不跳过，验证证书(推荐/默认)  2、跳过验证(仅自签或特殊上游)"
+            read -r masquerade_insecure_choice || return 1
             echo -e "\033[32m是否附加 X-Forwarded-For / Host / Proto 请求头:\n\n\033[0m\033[33m\033[01m1、启用(默认)\n2、关闭\033[0m\033[32m\n\n输入序号:\033[0m"
             read -r masquerade_xforwarded || return 1
             if [ -z "${masquerade_xforwarded}" ] || [ "${masquerade_xforwarded}" == "1" ]; then
@@ -2020,22 +2081,56 @@ setHysteriaConfig() (
     read -r remarks || return 1
     echoColor green "\n配置录入完成!\n"
     echoColor yellowBlack "执行配置..."
+    if [ -n "$reconfigure_dir" ]; then
+        beginReconfiguration "$reconfigure_dir" || return 1
+    fi
+    if [ "${realmMode}" = true ] && [ "${warpChoice:-}" = 2 ]; then
+        echoColor purple "\n->开始安装WARP,请稍候..."
+        echoColor purple "请在WARP安装菜单中选择 [全局] 工作模式(出现菜单时手动选择全局)"
+        wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh 2>/dev/null && bash menu.sh d || return 1
+        if [ -f "/etc/wireguard/warp.conf" ]; then
+            current_mtu=$(grep -oP '^MTU = \K\d+' /etc/wireguard/warp.conf)
+            if [ -n "${current_mtu}" ] && [ "${current_mtu}" -lt 1320 ]; then
+                sed -i "s/^MTU = ${current_mtu}/MTU = 1320/g" /etc/wireguard/warp.conf
+                echoColor purple "\n->MTU已从 ${current_mtu} 调整为 1320"
+            elif [ -n "${current_mtu}" ]; then
+                echoColor purple "\n->当前MTU=${current_mtu},无需调整(≥1320)"
+            fi
+            echoColor purple "\n->正在开启WARP..."
+            warp o
+            sleep 3
+            echoColor purple "\n->正在重新开启WARP以确保连接稳定..."
+            warp o
+            warpEnabled="true"
+            echoColor purple "\n->WARP安装完成,Hysteria2将通过Cloudflare WARP IP打洞连接"
+        else
+            echoColor red "\n->WARP安装失败: 未找到/etc/wireguard/warp.conf"
+            echoColor red "请手动执行: wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh d"
+            echoColor red "WARP未成功安装,终止脚本执行"
+            return 1
+        fi
+    fi
     max_CRW=0
     if [ "${congestion_mode}" == "brutal" ]; then
         download=$(($download + $download / 10))
         upload=$(($upload + $upload / 10))
-        CRW=$(($delay * $download * 1000000 / 1000 * 2))
-        SRW=$(($CRW / 5 * 2))
-        max_CRW=$(($CRW * 3 / 2))
-        max_SRW=$(($SRW * 3 / 2))
+        calculateBrutalWindows "$delay" "$download" || return 1
         server_upload=${download}
         server_download=${upload}
     fi
 
     config_stage=$(mktemp -d "$HIHY_ROOT_DIR/conf/.configure.XXXXXX") || return 1
     yaml_file="$config_stage/config.yaml"
-    : > "$yaml_file" || return 1
-    : > "$acl_file" || return 1
+    backup_file="$config_stage/backup.yaml"
+    if [ -f "$HIHY_CONFIG_FILE" ]; then
+        cp -a "$HIHY_CONFIG_FILE" "$yaml_file" || return 1
+        old_auth_password=$(getYamlValue "$HIHY_CONFIG_FILE" auth.password) || return 1
+        # Preserve resolver, outbounds, ACL metadata and other advanced options.
+        yq -i 'del(.tls, .acme, .ech, .masquerade, .congestion, .obfs, .bandwidth)' "$yaml_file" || return 1
+    else
+        : > "$yaml_file" || return 1
+    fi
+    prepareConfigurationACL "$HIHY_CONFIG_FILE" "$config_stage/acl.txt" "$block_http3" || return 1
     if [ -n "$ech_key_path" ]; then
         addOrUpdateYaml "$yaml_file" "ech.keyPath" "$ech_key_path" "string" || return 1
     fi
@@ -2096,7 +2191,9 @@ setHysteriaConfig() (
     else
         yq eval 'del(.bandwidth)' -i "$yaml_file" || return 1
     fi
-    addOrUpdateYaml "$yaml_file" "acl.file" "${acl_file}" "string" || return 1
+    # Validate using the staged ACL; publish it together with the configuration.
+    yq -i 'del(.acl.inline)' "$yaml_file" || return 1
+    addOrUpdateYaml "$yaml_file" "acl.file" "$config_stage/acl.txt" "string" || return 1
     case ${masquerade_type} in
         "string")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "string" || return 1
@@ -2109,9 +2206,6 @@ setHysteriaConfig() (
             addOrUpdateYaml "$yaml_file" "masquerade.type" "proxy" || return 1
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.url" "${masquerade_proxy}" "string" || return 1
             addOrUpdateYaml "$yaml_file" "masquerade.proxy.rewriteHost" "true" || return 1
-            echoColor green "是否跳过伪装上游 TLS 证书验证?"
-            echoColor yellow "1、不跳过，验证证书(推荐/默认)  2、跳过验证(仅自签或特殊上游)"
-            read -r masquerade_insecure_choice || return 1
             if [ "$masquerade_insecure_choice" = "2" ]; then
                 addOrUpdateYaml "$yaml_file" "masquerade.proxy.insecure" "true" "bool" || return 1
             else
@@ -2242,43 +2336,28 @@ setHysteriaConfig() (
         u_host="${realmURI}"
     fi
 
-    addOrUpdateYaml "$yaml_file" "sniff.enable" "true" || return 1
-    addOrUpdateYaml "$yaml_file" "sniff.timeout" "2s" || return 1
-    addOrUpdateYaml "$yaml_file" "sniff.rewriteDomain" "false" || return 1
-    addOrUpdateYaml "$yaml_file" "sniff.tcpPorts" "80,443" || return 1
-    addOrUpdateYaml "$yaml_file" "sniff.udpPorts" "80,443" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[0].name" "hihy" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[0].type" "direct" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[0].direct.mode" "auto" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[0].direct.fastOpen" "false" "bool" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[1].name" "v4_only" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[1].type" "direct" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[1].direct.mode" "4" "number" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[1].direct.fastOpen" "false" "bool" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[2].name" "v6_only" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[2].type" "direct" "string" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[2].direct.mode" "6" "number" || return 1
-    addOrUpdateYaml "$yaml_file" "outbounds[2].direct.fastOpen" "false" "bool" || return 1
-    trafficPort=$(($(od -An -N2 -i /dev/urandom) % (65534 - 10001) + 10001))
-    if [ "$trafficPort" == "${port}" ]; then
-        trafficPort=$((${port} + 1))
+    if ! yq -e '.sniff != null' "$yaml_file" >/dev/null 2>&1; then
+        addOrUpdateYaml "$yaml_file" "sniff.enable" "true" || return 1
+        addOrUpdateYaml "$yaml_file" "sniff.timeout" "2s" || return 1
+        addOrUpdateYaml "$yaml_file" "sniff.rewriteDomain" "false" || return 1
+        addOrUpdateYaml "$yaml_file" "sniff.tcpPorts" "80,443" || return 1
+        addOrUpdateYaml "$yaml_file" "sniff.udpPorts" "80,443" || return 1
     fi
-    addOrUpdateYaml "$yaml_file" "trafficStats.listen" "127.0.0.1:${trafficPort}" || return 1
-    addOrUpdateYaml "$yaml_file" "trafficStats.secret" "${auth_secret}" "string" || return 1
-    if [ ${block_http3} == "true" ]; then
-        echo -e "reject(all, udp/443)" >${acl_file}
+    if ! yq -e '.outbounds | length > 0' "$yaml_file" >/dev/null 2>&1; then
+        addOrUpdateYaml "$yaml_file" "outbounds[0].name" "hihy" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[0].type" "direct" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[0].direct.mode" "auto" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[0].direct.fastOpen" "false" "bool" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[1].name" "v4_only" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[1].type" "direct" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[1].direct.mode" "4" "number" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[1].direct.fastOpen" "false" "bool" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[2].name" "v6_only" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[2].type" "direct" "string" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[2].direct.mode" "6" "number" || return 1
+        addOrUpdateYaml "$yaml_file" "outbounds[2].direct.fastOpen" "false" "bool" || return 1
     fi
-    if [ ${max_CRW} -gt 0 ]; then
-        sysctl -w net.core.rmem_max=${max_CRW}
-        sysctl -w net.core.wmem_max=${max_CRW}
-    fi
-    if echo "${portHoppingStatus}" | grep -q "true"; then
-        sysctl -w net.ipv4.ip_forward=1
-        sysctl -w net.ipv6.conf.all.forwarding=1
-    fi
-    if [ -f /etc/sysctl.conf ]; then
-        sysctl -p
-    fi
+    prepareLocalTrafficStats "$yaml_file" "$backup_file" "$old_auth_password" || return 1
     echo -e "\033[1;;35m\nTest config...\n\033[0m"
     debug_file="$config_stage/debug.log"
     startInstallValidationProcess "$yaml_file" "$debug_file" || return 1
@@ -2342,7 +2421,6 @@ setHysteriaConfig() (
             return 1
             ;;
     esac
-    backup_file="$config_stage/backup.yaml"
     addOrUpdateYaml ${backup_file} "remarks" "${remarks}" "string" || return 1
     addOrUpdateYaml ${backup_file} "serverAddress" "${u_host}" "string" || return 1
     addOrUpdateYaml ${backup_file} "serverPort" "${port}" || return 1
@@ -2360,8 +2438,7 @@ setHysteriaConfig() (
     addOrUpdateYaml ${backup_file} "portHoppingMinHopInterval" "${portHoppingMinHopInterval}" || return 1
     addOrUpdateYaml ${backup_file} "portHoppingMaxHopInterval" "${portHoppingMaxHopInterval}" || return 1
     addOrUpdateYaml ${backup_file} "domain" "${domain}" "string" || return 1
-    addOrUpdateYaml ${backup_file} "trafficPort" "${trafficPort}" || return 1
-    addOrUpdateYaml ${backup_file} "socks5_status" "false" || return 1
+    addOrUpdateYaml "$backup_file" socks5_status "$(yq '.outbounds[0].type == "socks5"' "$yaml_file")" bool || return 1
     addOrUpdateYaml ${backup_file} "realmMode" "${realmMode}" || return 1
     if [ "${realmMode}" == "true" ]; then
         addOrUpdateYaml ${backup_file} "realmURI" "${realmURI}" "string" || return 1
@@ -2378,7 +2455,9 @@ setHysteriaConfig() (
     else
         addOrUpdateYaml ${backup_file} "insecure" "false" || return 1
     fi
-    mv -f "$yaml_file" "$HIHY_CONFIG_FILE" && mv -f "$backup_file" "$HIHY_BACKUP_FILE" || return 1
+    addOrUpdateYaml "$yaml_file" acl.file "$HIHY_ACL_FILE" string || return 1
+    mv -f "$config_stage/acl.txt" "$HIHY_ACL_FILE" &&
+        mv -f "$yaml_file" "$HIHY_CONFIG_FILE" && mv -f "$backup_file" "$HIHY_BACKUP_FILE" || return 1
     secureHihyPermissions || return 1
     if ! installHihyLauncher; then
         markInstallFailed "launcher" "failed to install hihy launcher"
@@ -2482,7 +2561,9 @@ waitHihyServiceHealthy() {
     done
 }
 
-updateHysteriaCore() (
+updateHysteriaCore() { withHihyOperationLock updateHysteriaCoreUnlocked "$@"; }
+
+updateHysteriaCoreUnlocked() (
     local core="$HIHY_ROOT_DIR/bin/appS" rollback_core="$HIHY_ROOT_DIR/bin/appS.rollback"
     local local_version version stage="" was_running=false lock="$HIHY_ROOT_DIR/bin/.core-update.lock"
     [ -x "$core" ] || { echoColor red "Hysteria core not found."; return 1; }
@@ -4022,6 +4103,7 @@ generate_client_config() {
     addOrUpdateYaml "$client_configfile" "socks5.listen" "127.0.0.1:20808"
     if [ "${realmMode}" == "true" ]; then
         url=""
+        native_url=""
     else
         url_base="hy2://$(encodeURIComponent "$auth_secret")@${uri_host}"
 
@@ -4044,6 +4126,11 @@ generate_client_config() {
             url_base="${url_base}&ech=$(encodeECHQuery "$ech_config")"
         fi
         url="${url_base}&sni=$(encodeURIComponent "$tls_sni")#$(encodeURIComponent "Hy2-${remarks}")"
+        native_url="$url"
+        if [ "${portHoppingStatus}" = true ]; then
+            # Native Hysteria reads port ranges from the authority, not mport.
+            native_url="hy2://$(encodeURIComponent "$auth_secret")@${uri_host}:${port},${serverPortRange}/?${url#*\?}"
+        fi
     fi
     # 在生成配置前添加分隔线
     echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -4088,6 +4175,11 @@ generate_client_config() {
         echoColor green "${url}"
         echo -e "\n"
         generate_qr "${url}"
+        if [ "${portHoppingStatus}" = true ]; then
+            echoColor purple "官方 Hysteria 核心的端口范围链接:"
+            echoColor green "$native_url"
+        fi
+        echoColor yellow "分享链接不包含拥塞控制档位和自定义跳跃间隔；完整保留参数请使用原生 YAML。"
     fi
 
     if [ "${realmMode}" == "true" ]; then
@@ -4102,7 +4194,7 @@ generate_client_config() {
     if [ -n "$ech_config" ]; then
         echoColor yellow "ECH 已写入原生 YAML 和可用的分享链接；暂不生成 Clash Meta 配置。"
     elif [ "${realmMode}" != "true" ]; then
-        generateMetaYaml
+        generateMetaYaml || return 1
     fi
 
     echo -e "\n✅ 配置生成完成!"
@@ -4128,13 +4220,13 @@ generateMetaYaml() {
 
     cat <<EOF >${metaFile}
 mixed-port: 7890
-allow-lan: true
+allow-lan: false
 mode: rule
 log-level: info
 ipv6: true
 dns:
   enable: true
-  listen: 0.0.0.0:53
+  listen: 127.0.0.1:1053
   ipv6: true
   default-nameserver:
     - 114.114.114.114
@@ -4306,7 +4398,25 @@ EOF
         addOrUpdateYaml "${metaFile}" "proxies[0].port" "${port}"
         if [ "${portHoppingStatus}" == "true" ]; then
             addOrUpdateYaml "${metaFile}" "proxies[0].ports" "${portHoppingStart}-${portHoppingEnd}"
+            local hop_mode hop_min hop_max hop_fixed
+            hop_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingIntervalMode fixed)
+            if [ "$hop_mode" = random ]; then
+                hop_min=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMinHopInterval 10s)
+                hop_max=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMaxHopInterval 30s)
+                addOrUpdateYaml "$metaFile" 'proxies[0].hop-interval' "${hop_min%s}-${hop_max%s}" string || return 1
+            else
+                hop_fixed=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingHopInterval 30s)
+                addOrUpdateYaml "$metaFile" 'proxies[0].hop-interval' "${hop_fixed%s}" string || return 1
+            fi
         fi
+    fi
+    local meta_congestion meta_profile
+    meta_congestion=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" congestionMode brutal)
+    if [ "$meta_congestion" = bbr ]; then
+        meta_profile=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" congestionBbrProfile standard)
+        addOrUpdateYaml "$metaFile" 'proxies[0].bbr-profile' "$meta_profile" string || return 1
+    elif [ "$meta_congestion" = reno ]; then
+        echoColor yellow "Mihomo 导出仅服务端下行使用 Reno，客户端上行仍为 BBR；双向 Reno 请使用原生 YAML。"
     fi
     addOrUpdateYaml "${metaFile}" "proxies[0].password" "${auth_secret}" "string"
     # BBR/Reno 不设置固定带宽，不能导出空的 " Mbps"。
@@ -4347,7 +4457,9 @@ checkLogs() {
         echoColor red "日志文件不存在!"
     fi
 }
-start() {
+start() { withHihyOperationLock startHihyUnlocked "$@"; }
+
+startHihyUnlocked() {
     if serviceStart; then
         echoColor green "启动成功!"
     else
@@ -4355,7 +4467,9 @@ start() {
         return 1
     fi
 }
-stop() {
+stop() { withHihyOperationLock stopHihyUnlocked "$@"; }
+
+stopHihyUnlocked() {
     if serviceStop; then
         echoColor green "停止成功!"
     else
@@ -4363,7 +4477,9 @@ stop() {
         return 1
     fi
 }
-restart() {
+restart() { withHihyOperationLock restartHihyUnlocked "$@"; }
+
+restartHihyUnlocked() {
     if serviceRestart; then
         echoColor green "重启成功!"
     else
@@ -4387,18 +4503,19 @@ monitorIsEnabled() {
         [ "$(getYamlValue "$HIHY_CONFIG_FILE" auth.command)" = "$HIHY_MONITOR_AUTH_FILE" ]
 }
 
-configureRealtimeMonitor() (
-    local action="${1:-enable}" stage auth_type yq_path api_port
-    case "$action" in enable | disable) ;; *) return 1 ;; esac
+configureRealtimeMonitor() { withHihyOperationLock configureRealtimeMonitorUnlocked "$@"; }
+
+configureRealtimeMonitorUnlocked() (
+    local action="${1:-enable}" stage auth_type yq_path
+    case "$action" in enable | disable | secure) ;; *) return 1 ;; esac
     [ -f "$HIHY_CONFIG_FILE" ] && [ -f "$HIHY_BACKUP_FILE" ] || {
         echoColor red "请先安装并配置 Hysteria2。"; return 1;
     }
     auth_type=$(getYamlValue "$HIHY_CONFIG_FILE" auth.type) || return 1
-    if monitorIsEnabled; then
-        if [ "$action" = enable ] && [ -x "$HIHY_MONITOR_AUTH_FILE" ]; then
-            echoColor green "按 IP 统计已启用。"
-            return 0
-        fi
+    if [ "$action" = secure ]; then
+        : # API-only migration preserves password, userpass, HTTP and command auth.
+    elif monitorIsEnabled; then
+        :
     elif [ "$action" = disable ]; then
         echoColor yellow "当前未启用按 IP 统计。"
         return 0
@@ -4407,9 +4524,11 @@ configureRealtimeMonitor() (
         return 1
     fi
     # Preserve auth.password so all existing client exporters keep working.
-    yq -e '.auth.password | tag == "!!str" and length > 0' "$HIHY_CONFIG_FILE" >/dev/null 2>&1 || {
-        echoColor red "未找到有效的原认证密码。"; return 1;
-    }
+    if [ "$action" != secure ]; then
+        yq -e '.auth.password | tag == "!!str" and length > 0' "$HIHY_CONFIG_FILE" >/dev/null 2>&1 || {
+            echoColor red "未找到有效的原认证密码。"; return 1;
+        }
+    fi
     stage=$(mktemp -d "$HIHY_ROOT_DIR/conf/monitor.XXXXXX") || return 1
     trap 'rm -rf "$stage"' EXIT
     cp -a "$HIHY_CONFIG_FILE" "$stage/config.yaml" && cp -a "$HIHY_BACKUP_FILE" "$stage/backup.yaml" || return 1
@@ -4437,20 +4556,19 @@ AUTH
         command install -m 700 "$stage/monitor-auth" "$HIHY_MONITOR_AUTH_FILE" || return 1
         addOrUpdateYaml "$stage/config.yaml" auth.type command string || return 1
         addOrUpdateYaml "$stage/config.yaml" auth.command "$HIHY_MONITOR_AUTH_FILE" string || return 1
-        if [ "$(getYamlValue "$stage/config.yaml" trafficStats.listen)" = null ] ||
-            [ -z "$(getYamlValue "$stage/config.yaml" trafficStats.listen)" ]; then
-            command -v python3 >/dev/null 2>&1 || { echoColor red "请先安装 python3。"; return 1; }
-            api_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])') || return 1
-            addOrUpdateYaml "$stage/config.yaml" trafficStats.listen "127.0.0.1:$api_port" string || return 1
-            addOrUpdateYaml "$stage/config.yaml" trafficStats.secret "$(generate_uuid)" string || return 1
-            addOrUpdateYaml "$stage/backup.yaml" trafficPort "$api_port" || return 1
-        fi
-    else
+    elif [ "$action" = disable ]; then
         addOrUpdateYaml "$stage/config.yaml" auth.type password string || return 1
         yq -i 'del(.auth.command)' "$stage/config.yaml" || return 1
     fi
+    prepareLocalTrafficStats "$stage/config.yaml" "$stage/backup.yaml" || return 1
+    if cmp -s "$stage/config.yaml" "$HIHY_CONFIG_FILE" && cmp -s "$stage/backup.yaml" "$HIHY_BACKUP_FILE"; then
+        echoColor green "配置已满足要求，无需重启服务。"
+        return 0
+    fi
     applyHihyConfigFiles "$stage/config.yaml" "$stage/backup.yaml" || return 1
-    if [ "$action" = enable ]; then
+    if [ "$action" = secure ]; then
+        echoColor green "统计 API 已限制为本机回环监听并使用独立密钥，原认证及服务启停状态已保留。"
+    elif [ "$action" = enable ]; then
         echoColor green "已启用按 IP 统计，客户端继续使用原密码。"
     else
         echoColor green "已关闭按 IP 统计，恢复 password 认证。"
@@ -4460,9 +4578,9 @@ AUTH
 realtimeMonitor() {
     local action="${1:-}" answer monitor_config
     case "$action" in
-        enable | disable) configureRealtimeMonitor "$action"; return $? ;;
+        enable | disable | secure) configureRealtimeMonitor "$action"; return $? ;;
         '' | --once | --stats) ;;
-        *) echoColor yellow "用法: hihy monitor [--once|enable|disable]"; return 1 ;;
+        *) echoColor yellow "用法: hihy monitor [--once|enable|disable|secure]"; return 1 ;;
     esac
     if ! command -v python3 >/dev/null 2>&1; then
         echoColor red "实时监控需要 Python 3，请先安装 python3（Arch 安装 python）。"
@@ -4940,7 +5058,9 @@ changeIp64() {
     esac
 }
 
-configureOutboundIPMode() (
+configureOutboundIPMode() { withHihyOperationLock configureOutboundIPModeUnlocked "$@"; }
+
+configureOutboundIPModeUnlocked() (
     local mode="$1" stage current
     case "$mode" in 46 | 64 | 4 | 6 | auto) ;; *) return 1 ;; esac
     [ -f "$HIHY_CONFIG_FILE" ] && [ -f "$HIHY_BACKUP_FILE" ] || return 1
@@ -5015,11 +5135,20 @@ restoreReconfiguration() {
 }
 
 changeServerConfig() {
-    local backup_dir was_running=false failed=false
+    withHihyOperationLock changeServerConfigUnlocked "$@"
+}
+
+changeServerConfigUnlocked() (
+    local backup_dir="" was_running=false committed=false auth_type snapshot
     if [ "$(classifyInstallState)" != installed ]; then
         echoColor red "请先安装hysteria2,再去修改配置..."
         return 1
     fi
+    auth_type=$(getYamlValue "$HIHY_CONFIG_FILE" auth.type) || return 1
+    case "$auth_type" in
+        password | null | '') ;;
+        *) monitorIsEnabled || { echoColor red "当前使用自定义认证，完整配置向导不会覆盖它；请直接编辑配置。"; return 1; } ;;
+    esac
     local old_ech_path ech_key_path=""
     old_ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" ech.keyPath) || return 1
     prepareECH "$old_ech_path" || return 1
@@ -5036,34 +5165,47 @@ changeServerConfig() {
         cp -a "$HIHY_ROOT_DIR/cert" "$backup_dir/cert" || { rm -rf "$backup_dir"; return 1; }
     fi
     serviceIsActive && was_running=true
+    finishReconfiguration() {
+        local result=$?
+        if [ "$committed" != true ]; then
+            if [ -f "$backup_dir/apply-started" ]; then
+                echoColor yellow "重新配置未完成，正在恢复旧状态。"
+                if restoreReconfiguration "$backup_dir" "$was_running"; then
+                    rm -rf "$backup_dir"
+                else
+                    echoColor red "恢复未完全成功，备份保留在 $backup_dir，请检查日志和防火墙。"
+                fi
+            else
+                rm -rf "$backup_dir"
+                echoColor yellow "配置录入已取消，原服务和配置保持不变。"
+            fi
+        fi
+        return "$result"
+    }
+    trap finishReconfiguration EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    echoColor yellow "录入期间服务继续运行；完成后应用配置，保留 ACL、出站和其他高级选项。"
+    (setHysteriaConfig "$ech_key_path" "$backup_dir") || return 1
     if [ "$was_running" = true ]; then
-        serviceStop || { echoColor red "停止服务失败，备份保留在 $backup_dir"; return 1; }
+        serviceStart && waitHihyServiceHealthy || return 1
     fi
-    if ! removeOwnedFirewallRules || ! (setHysteriaConfig "$ech_key_path"); then
-        failed=true
-    elif [ "$was_running" = true ]; then
-        if ! serviceStart || ! waitHihyServiceHealthy; then
-            failed=true
-        fi
-    fi
-    if [ "$failed" = true ]; then
-        echoColor yellow "重新配置未完成，正在恢复旧状态。"
-        if restoreReconfiguration "$backup_dir" "$was_running"; then
-            rm -rf "$backup_dir"
-        else
-            echoColor red "恢复未完全成功，备份保留在 $backup_dir，请检查日志和防火墙。"
-        fi
-        return 1
-    fi
+    committed=true
     if ! generate_client_config; then
         echoColor yellow "服务端配置已保存，但客户端导出失败。旧配置备份: $backup_dir"
         return 1
     fi
-    rm -rf "$backup_dir"
-    echoColor green "配置修改成功，已保留原服务启停状态。"
-}
+    snapshot="$HIHY_ROOT_DIR/result/snapshots/${backup_dir##*/}"
+    if mkdir -p "$(dirname "$snapshot")" && mv "$backup_dir" "$snapshot"; then
+        echoColor green "配置修改成功，已保留原服务启停状态。旧配置快照: $snapshot"
+    else
+        echoColor yellow "配置已生效，旧配置备份保留在 $backup_dir"
+    fi
+)
 
-updateACLRule() (
+updateACLRule() { withHihyOperationLock updateACLRuleUnlocked "$@"; }
+
+updateACLRuleUnlocked() (
     local action="$1" domain="${2,,}" target="${3:-}" stage was_running=false restored=true
     [ -f "$HIHY_ACL_FILE" ] || return 1
     domain=${domain%.}
@@ -5161,7 +5303,9 @@ applyHihyConfigFiles() (
     rm -rf "$transaction"
 )
 
-configureSocks5Outbound() (
+configureSocks5Outbound() { withHihyOperationLock configureSocks5OutboundUnlocked "$@"; }
+
+configureSocks5OutboundUnlocked() (
     local name="$1" address="${2:-}" username="${3:-}" password="${4:-}" stage current
     [ -f "$HIHY_CONFIG_FILE" ] && [ -f "$HIHY_BACKUP_FILE" ] || return 1
     stage=$(mktemp -d "$HIHY_ROOT_DIR/conf/socks5.XXXXXX") || return 1
@@ -5231,7 +5375,7 @@ withCertificateOperationLock() {
     if [ "${HIHY_CERT_OPERATION_HELD:-false}" = true ]; then
         "$@"
     else
-        runCertificateOperationLocked "$@"
+        withHihyOperationLock runCertificateOperationLocked "$@"
     fi
 }
 

@@ -246,9 +246,11 @@ done
         server_port, socks_port, stats_port = port(socket.SOCK_DGRAM), port(), port()
         config = dict(listen=f'127.0.0.1:{server_port}', tls=dict(cert=str(cert), key=str(key)),
                       auth=dict(type='password', password=password),
-                      trafficStats=dict(listen=f'127.0.0.1:{stats_port}', secret=secret))
+                      trafficStats=dict(listen=f'127.0.0.1:{stats_port}', secret=password))
         config_file.write_text(json.dumps(config))
         shell('configureRealtimeMonitor enable')
+        migrated = json.loads(shell('yq -o=json . "$HIHY_CONFIG_FILE"').stdout)
+        assert migrated['trafficStats']['secret'] != password
         client_file = root / 'client.json'
         client_file.write_text(json.dumps(dict(server=f'127.0.0.1:{server_port}', auth=password,
                                                tls=dict(insecure=True),
@@ -292,6 +294,25 @@ done
                 assert '在线来源 IP: 1' in result.stdout and '127.0.0.1 → 127.0.0.1:' in result.stdout, result.stdout
                 assert '累计上传: 2.0KiB  下载: 8.0KiB' in result.stdout, result.stdout
                 assert '已建立' in result.stdout and '开始:' in result.stdout, result.stdout
+                # A valid proxy user can reach loopback through the tunnel, but
+                # its proxy password must not authorize management operations.
+                for path in ('/traffic?clear=true', '/kick'):
+                    with socket.create_connection(('127.0.0.1', socks_port), timeout=5) as api_proxy:
+                        stream = api_proxy.makefile('rb')
+                        try:
+                            api_proxy.sendall(b'\x05\x01\x00')
+                            assert stream.read(2) == b'\x05\x00'
+                            api_proxy.sendall(b'\x05\x01\x00\x01' + socket.inet_aton('127.0.0.1')
+                                              + stats_port.to_bytes(2, 'big'))
+                            assert stream.read(10)[:2] == b'\x05\x00'
+                            method = 'POST' if path == '/kick' else 'GET'
+                            body = '["hihy-ip:127.0.0.1"]' if method == 'POST' else ''
+                            api_proxy.sendall((f'{method} {path} HTTP/1.1\r\nHost: localhost\r\n'
+                                               f'Authorization: {password}\r\nContent-Length: {len(body)}\r\n'
+                                               f'Connection: close\r\n\r\n{body}').encode())
+                            assert b' 401 ' in stream.readline(), 'proxy password authorized management API'
+                        finally:
+                            stream.close()
             except Exception:
                 server_log.seek(0)
                 client_log.seek(0)

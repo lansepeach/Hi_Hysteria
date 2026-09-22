@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.24`
+当前脚本版本：`1.0.25`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -88,6 +88,7 @@ hihy monitor      # 实时监控，每 2 秒刷新，q 退出，j/k 滚动
 hihy monitor --once # 输出一次监控快照
 hihy monitor enable # 启用按 IP 统计，重启正在运行的服务
 hihy monitor disable # 关闭按 IP 统计，恢复原密码认证并重启正在运行的服务
+hihy monitor secure # 统计 API 迁移为回环监听与独立密钥，保留认证方式
 hihy cert status  # 查看通配符证书和节点部署状态
 hihy cert nodes   # 查看所有 SSH 证书节点
 hihy cert deploy pending # 仅重试失败、旧证书或尚未分发的节点
@@ -110,6 +111,14 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 - [支持的客户端](md/client.md)
 - [常见问题](md/issues.md)
 - [伪装网站](md/masquerade.md)
+
+## 1.0.25 修复说明
+
+- 完整重配置在录入结束后才停服，保留 ACL、SOCKS5/WARP 出站、DNS resolver 和嗅探设置；成功后旧配置留在 `/etc/hihy/result/snapshots/`。
+- 安装、卸载、核心更新、完整重配置、出口/ACL/监控修改、启停服务和证书管理共用操作锁。
+- 统计 API 使用独立管理密钥并只监听 `127.0.0.1`。旧安装更新脚本后执行 `hihy monitor secure`；需要修改时会重启正在运行的服务，原本停止的服务保持停止。菜单 13 和 SSH 实时监控用法不变。
+- 修正 Brutal 窗口的字节换算，并加入上下限；配置过程不再修改全局 sysctl 或开启 IP forwarding。
+- Clash/Mihomo 导出保留固定/随机跳跃间隔与 BBR 档位，明确提示 Reno 的方向差异；同时提供官方核心可识别端口范围的 URI。新导出默认关闭局域网代理，DNS 监听 `127.0.0.1:1053`。
 
 ## 更新说明
 
@@ -139,6 +148,7 @@ bash tests/reliability_regression.sh
 bash tests/management_regression.sh
 bash tests/safety_regression.sh
 bash tests/audit_regression.sh
+bash tests/compatibility_regression.sh
 sudo env "PATH=$PATH" bash tests/nft_integration.sh
 sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria

@@ -1,5 +1,12 @@
 ## 支持的客户端
 
+1.0.25 导出规则：
+
+- 原生 Hysteria YAML 保留拥塞控制、窗口、跳跃时间和 ECH 等参数。开启跳跃时，额外输出端口范围位于地址中的官方 URI；第三方兼容 URI 继续使用 `mport`。URI 不包含拥塞控制档位和自定义跳跃时间，完整配置优先使用 YAML。
+- Clash/Mihomo YAML 导出 `hop-interval`（固定秒数或 `最小-最大`）及 `bbr-profile`。这些参数需要客户端内置核心支持。Reno 模式导出会提示：服务端下行使用 Reno，Mihomo 客户端上行仍使用 BBR；双向 Reno 使用原生核心。
+- 新导出的 Clash 配置默认 `allow-lan: false`，DNS 只监听 `127.0.0.1:1053`。需要向局域网提供代理或 DNS 时，自行显式修改监听设置。
+- ECH/Realm 的 Mihomo 导出仍留待专门联调，目前继续提供原生 YAML。
+
 [https://v2.hysteria.network/zh/docs/getting-started/3rd-party-apps/](https://v2.hysteria.network/zh/docs/getting-started/3rd-party-apps/)
 
 ### Tips
