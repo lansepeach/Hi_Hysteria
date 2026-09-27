@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.25`
+当前脚本版本：`1.0.26`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -112,6 +112,13 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 - [常见问题](md/issues.md)
 - [伪装网站](md/masquerade.md)
 
+## 1.0.26 修复说明
+
+- 证书接收成功后才清理旧版本，连续失败重试保留回滚证书。
+- 完整重配置同步 systemd 防火墙依赖，切换 Realm 后不再依赖已删除的服务；失败恢复原 unit。
+- 跳跃间隔支持输入 `30` 或 `30s`，统一导出为带单位的时间；旧配置执行 `hihy 8` 可修复纯数字间隔。
+- 导入证书中心配置后自动安装续期 timer/cron，安装失败会明确报错；修复后可重新导入重试。
+
 ## 1.0.25 修复说明
 
 - 完整重配置在录入结束后才停服，保留 ACL、SOCKS5/WARP 出站、DNS resolver 和嗅探设置；成功后旧配置留在 `/etc/hihy/result/snapshots/`。
@@ -149,6 +156,7 @@ bash tests/management_regression.sh
 bash tests/safety_regression.sh
 bash tests/audit_regression.sh
 bash tests/compatibility_regression.sh
+bash tests/review_regression.sh
 sudo env "PATH=$PATH" bash tests/nft_integration.sh
 sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria

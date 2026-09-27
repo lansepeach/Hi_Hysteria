@@ -42,6 +42,7 @@ jobs:
           bash tests/safety_regression.sh
           bash tests/audit_regression.sh
           bash tests/compatibility_regression.sh
+          bash tests/review_regression.sh
       - name: Test firewall backends in isolated namespaces
         run: |
           sudo apt-get update

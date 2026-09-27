@@ -106,6 +106,7 @@ printf 'name=new\nhost=new.example.com\nport=22\nuser=root\ndomain=new.example.c
 tar -czf "$scratch/profile.tgz" -C "$scratch/package" profile
 touch "$scratch/profile.gpg"
 gpg() { [ "$1" = --output ] || fail 'unexpected gpg command'; cp "$scratch/profile.tgz" "$2"; }
+installCertificateRenewTimer() { return 0; }
 writeCertificateManagerConfig example.com original@example.com
 printf original-token > "$HIHY_CERT_TOKEN_FILE"
 printf 'name=old\n' > "$HIHY_CERT_MANAGER_DIR/nodes/old.conf"

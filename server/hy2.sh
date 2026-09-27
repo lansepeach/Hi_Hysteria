@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.25"
+hihyV="ver1.26"
 
 umask 077
 
@@ -29,6 +29,8 @@ HIHY_CERT_KNOWN_HOSTS="${HIHY_CERT_KNOWN_HOSTS:-$HIHY_CERT_MANAGER_DIR/known_hos
 HIHY_SHARED_CERT_DIR="${HIHY_SHARED_CERT_DIR:-$HIHY_ROOT_DIR/cert/shared}"
 HIHY_LEGO_BIN="${HIHY_LEGO_BIN:-$HIHY_CERT_MANAGER_DIR/bin/lego}"
 HIHY_LEGO_VERSION="${HIHY_LEGO_VERSION:-5.4.0}"
+HIHY_CERT_RENEW_SERVICE_FILE="${HIHY_CERT_RENEW_SERVICE_FILE:-/etc/systemd/system/hihy-cert-renew.service}"
+HIHY_CERT_RENEW_TIMER_FILE="${HIHY_CERT_RENEW_TIMER_FILE:-/etc/systemd/system/hihy-cert-renew.timer}"
 HIHY_MONITOR_AUTH_FILE="${HIHY_MONITOR_AUTH_FILE:-$HIHY_ROOT_DIR/bin/monitor-auth}"
 # ===== 自维护仓库配置 =====
 HIHY_REPO_OWNER="${HIHY_REPO_OWNER:-lansepeach}"
@@ -480,6 +482,14 @@ is_uint() {
 validate_port() {
     local p="$1"
     is_uint "$p" && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
+
+normalizeHopInterval() {
+    local seconds="${1%s}"
+    [[ "$seconds" =~ ^[0-9]{1,10}$ ]] || return 1
+    seconds=$((10#$seconds))
+    [ "$seconds" -ge 5 ] && [ "$seconds" -le 2147483647 ] || return 1
+    printf '%ss\n' "$seconds"
 }
 
 readPositiveInteger() {
@@ -1858,8 +1868,7 @@ setHysteriaConfig() (
                         portHoppingHopInterval="30s"
                     fi
                     echo -e "\n->固定跳跃间隔:"$(echoColor red ${portHoppingHopInterval})"\n"
-                    hopSeconds=$(echo "${portHoppingHopInterval}" | sed 's/s$//')
-                    if ! echo "${hopSeconds}" | grep -Eq '^[0-9]+$' || [ "${hopSeconds}" -lt 5 ]; then
+                    if ! portHoppingHopInterval=$(normalizeHopInterval "$portHoppingHopInterval"); then
                         echoColor red "\n->固定跳跃间隔格式错误,请输入不小于5s的秒数,例如30s"
                         continue
                     fi
@@ -1877,8 +1886,7 @@ setHysteriaConfig() (
                         portHoppingMinHopInterval="10s"
                     fi
                     echo -e "\n->最小跳跃间隔:"$(echoColor red ${portHoppingMinHopInterval})"\n"
-                    minHopSeconds=$(echo "${portHoppingMinHopInterval}" | sed 's/s$//')
-                    if ! echo "${minHopSeconds}" | grep -Eq '^[0-9]+$' || [ "${minHopSeconds}" -lt 5 ]; then
+                    if ! portHoppingMinHopInterval=$(normalizeHopInterval "$portHoppingMinHopInterval"); then
                         echoColor red "\n->最小跳跃间隔格式错误,请输入不小于5s的秒数,例如10s"
                         continue
                     fi
@@ -1888,8 +1896,8 @@ setHysteriaConfig() (
                         portHoppingMaxHopInterval="30s"
                     fi
                     echo -e "\n->最大跳跃间隔:"$(echoColor red ${portHoppingMaxHopInterval})"\n"
-                    maxHopSeconds=$(echo "${portHoppingMaxHopInterval}" | sed 's/s$//')
-                    if ! echo "${maxHopSeconds}" | grep -Eq '^[0-9]+$' || [ "${maxHopSeconds}" -lt "${minHopSeconds}" ]; then
+                    if ! portHoppingMaxHopInterval=$(normalizeHopInterval "$portHoppingMaxHopInterval") ||
+                        [ "${portHoppingMaxHopInterval%s}" -lt "${portHoppingMinHopInterval%s}" ]; then
                         echoColor red "\n->最大跳跃间隔格式错误,请输入大于等于最小间隔的秒数,例如30s"
                         continue
                     fi
@@ -2764,6 +2772,29 @@ EOF
     [ -n "$backup_file" ] && rm -f "$backup_file"
     return 0
 }
+
+syncHihyFirewallServiceDependency() (
+    local temp_file needs_firewall=false
+    [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = systemd ] || return 0
+    if grep -q '^backend=nft|' "$HIHY_FIREWALL_STATE_FILE" 2>/dev/null; then
+        needs_firewall=true
+    fi
+    temp_file=$(mktemp "${HIHY_SERVICE_FILE}.tmp.XXXXXX") || return 1
+    trap 'rm -f "$temp_file"' EXIT
+    cp -p "$HIHY_SERVICE_FILE" "$temp_file" || return 1
+    # Update only the dependencies written by this script; retain local unit settings.
+    awk -v needed="$needs_firewall" '
+        /^Requires=hihy-firewall.service$/ || /^After=hihy-firewall.service$/ {next}
+        {print}
+        /^\[Unit\]$/ && needed == "true" {
+            print "Requires=hihy-firewall.service"
+            print "After=hihy-firewall.service"
+        }
+    ' "$HIHY_SERVICE_FILE" > "$temp_file" || return 1
+    cmp -s "$temp_file" "$HIHY_SERVICE_FILE" && return 0
+    mv -f "$temp_file" "$HIHY_SERVICE_FILE" || return 1
+    systemctl daemon-reload
+)
 
 writeOpenRcService() {
     cat >"$HIHY_INIT_SERVICE" <<EOF
@@ -3886,7 +3917,7 @@ uninstallHihyConfirmed() {
     fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl disable --now hihy-cert-renew.timer >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/hihy-cert-renew.timer /etc/systemd/system/hihy-cert-renew.service
+        rm -f "$HIHY_CERT_RENEW_TIMER_FILE" "$HIHY_CERT_RENEW_SERVICE_FILE"
     fi
     case "$(detectServiceManager)" in
         systemd)
@@ -4017,9 +4048,13 @@ generate_client_config() {
         portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}")
         portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}")
         portHoppingIntervalMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingIntervalMode" "fixed")
-        portHoppingHopInterval=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingHopInterval" "30s")
-        portHoppingMinHopInterval=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingMinHopInterval" "10s")
-        portHoppingMaxHopInterval=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingMaxHopInterval" "30s")
+        if [ "$portHoppingIntervalMode" = random ]; then
+            portHoppingMinHopInterval=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMinHopInterval 10s)") || return 1
+            portHoppingMaxHopInterval=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMaxHopInterval 30s)") || return 1
+            [ "${portHoppingMaxHopInterval%s}" -ge "${portHoppingMinHopInterval%s}" ] || return 1
+        else
+            portHoppingHopInterval=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingHopInterval 30s)") || return 1
+        fi
         serverPortRange="${portHoppingStart}-${portHoppingEnd}"
     fi
     safe_remarks=$(sanitizeFileComponent "$remarks")
@@ -4063,11 +4098,11 @@ generate_client_config() {
     addOrUpdateYaml "$client_configfile" "transport.type" "udp"
     if [ "${portHoppingStatus}" == "true" ]; then
         if [ "${portHoppingIntervalMode}" == "random" ]; then
-            addOrUpdateYaml "$client_configfile" "transport.udp.minHopInterval" "${portHoppingMinHopInterval}"
-            addOrUpdateYaml "$client_configfile" "transport.udp.maxHopInterval" "${portHoppingMaxHopInterval}"
+            addOrUpdateYaml "$client_configfile" "transport.udp.minHopInterval" "${portHoppingMinHopInterval}" string || return 1
+            addOrUpdateYaml "$client_configfile" "transport.udp.maxHopInterval" "${portHoppingMaxHopInterval}" string || return 1
             yq eval 'del(.transport.udp.hopInterval)' -i "$client_configfile"
         else
-            addOrUpdateYaml "$client_configfile" "transport.udp.hopInterval" "${portHoppingHopInterval}"
+            addOrUpdateYaml "$client_configfile" "transport.udp.hopInterval" "${portHoppingHopInterval}" string || return 1
             yq eval 'del(.transport.udp.minHopInterval, .transport.udp.maxHopInterval)' -i "$client_configfile"
         fi
     fi
@@ -4401,11 +4436,12 @@ EOF
             local hop_mode hop_min hop_max hop_fixed
             hop_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingIntervalMode fixed)
             if [ "$hop_mode" = random ]; then
-                hop_min=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMinHopInterval 10s)
-                hop_max=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMaxHopInterval 30s)
+                hop_min=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMinHopInterval 10s)") || return 1
+                hop_max=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMaxHopInterval 30s)") || return 1
+                [ "${hop_max%s}" -ge "${hop_min%s}" ] || return 1
                 addOrUpdateYaml "$metaFile" 'proxies[0].hop-interval' "${hop_min%s}-${hop_max%s}" string || return 1
             else
-                hop_fixed=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingHopInterval 30s)
+                hop_fixed=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingHopInterval 30s)") || return 1
                 addOrUpdateYaml "$metaFile" 'proxies[0].hop-interval' "${hop_fixed%s}" string || return 1
             fi
         fi
@@ -5120,6 +5156,10 @@ restoreReconfiguration() {
             fi
         fi
     fi
+    if [ -f "$backup_dir/systemd.service" ]; then
+        cp -a "$backup_dir/systemd.service" "$HIHY_SERVICE_FILE" || result=1
+        systemctl daemon-reload || result=1
+    fi
     secureHihyPermissions || result=1
     if [ "$was_running" = true ]; then
         if ! serviceStart || ! waitHihyServiceHealthy; then
@@ -5164,6 +5204,9 @@ changeServerConfigUnlocked() (
     if [ -d "$HIHY_ROOT_DIR/cert" ]; then
         cp -a "$HIHY_ROOT_DIR/cert" "$backup_dir/cert" || { rm -rf "$backup_dir"; return 1; }
     fi
+    if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = systemd ]; then
+        cp -a "$HIHY_SERVICE_FILE" "$backup_dir/systemd.service" || { rm -rf "$backup_dir"; return 1; }
+    fi
     serviceIsActive && was_running=true
     finishReconfiguration() {
         local result=$?
@@ -5187,6 +5230,7 @@ changeServerConfigUnlocked() (
     trap 'exit 143' TERM
     echoColor yellow "录入期间服务继续运行；完成后应用配置，保留 ACL、出站和其他高级选项。"
     (setHysteriaConfig "$ech_key_path" "$backup_dir") || return 1
+    syncHihyFirewallServiceDependency || return 1
     if [ "$was_running" = true ]; then
         serviceStart && waitHihyServiceHealthy || return 1
     fi
@@ -5432,8 +5476,27 @@ publishSharedCertificate() {
     withCertificateOperationLock publishSharedCertificateUnlocked "$@"
 }
 
+pruneSharedCertificateReleases() {
+    local current releases old_release kept=1
+    current=$(readlink -f "$HIHY_SHARED_CERT_DIR/current") || return 1
+    releases=$(readlink -f "$HIHY_SHARED_CERT_DIR/releases") || return 1
+    [ -d "$current" ] && [ "$(dirname "$current")" = "$releases" ] || return 1
+    # Always retain the active release, even after a rollback to an older version.
+    while IFS= read -r old_release; do
+        [ "$old_release" != "$current" ] || continue
+        if [ "$kept" -lt 3 ]; then
+            kept=$((kept + 1))
+        else
+            rm -rf -- "$old_release" || return 1
+        fi
+    done < <(find "$releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+        | sort -nr | cut -d' ' -f2-)
+}
+
 publishSharedCertificateUnlocked() (
     local source_cert="$1" source_key="$2" domain="$3" release_dir release_id published=false
+    local cleanup="${4:-prune}"
+    case "$cleanup" in prune | defer) ;; *) return 1 ;; esac
     validateCertificateBundle "$source_cert" "$source_key" "$domain" || return 1
     ensureCertificateManagerDirectories || return 1
     release_dir=$(mktemp -d "$HIHY_SHARED_CERT_DIR/releases/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || return 1
@@ -5446,10 +5509,9 @@ publishSharedCertificateUnlocked() (
     ln -s "releases/$release_id" "$release_dir/current.new" || return 1
     mv -Tf "$release_dir/current.new" "$HIHY_SHARED_CERT_DIR/current" || return 1
     published=true
-    find "$HIHY_SHARED_CERT_DIR/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
-        | sort -nr | cut -d' ' -f2- | sed -n '4,$p' | while IFS= read -r old_release; do
-            rm -rf "$old_release"
-        done
+    if [ "$cleanup" = prune ]; then
+        pruneSharedCertificateReleases || echoColor yellow "证书已发布，但旧版本清理失败。"
+    fi
 )
 
 migrateLocalHysteriaToSharedCertificate() (
@@ -5541,15 +5603,20 @@ installCertificateRenewTimer() {
         command -v crontab >/dev/null 2>&1 || return 1
         temp_file=$(mktemp) || return 1
         crontab -l 2>/dev/null >"$temp_file" || true
-        sed -i '/# hihy-managed: certificate-renewal/d;/\/usr\/bin\/hihy cert renew-auto/d' "$temp_file"
+        awk -v launcher="$HIHY_BIN_LINK" '
+            $0 == "# hihy-managed: certificate-renewal" {next}
+            ($6 == launcher || $6 == "/usr/bin/hihy") && $7 == "cert" && $8 == "renew-auto" && NF == 8 {next}
+            {print}
+        ' "$temp_file" > "$temp_file.clean" || { rm -f "$temp_file" "$temp_file.clean"; return 1; }
+        mv -f "$temp_file.clean" "$temp_file" || { rm -f "$temp_file" "$temp_file.clean"; return 1; }
         printf '%s\n' '# hihy-managed: certificate-renewal' >>"$temp_file"
-        printf '%s\n' '17 3 * * * /usr/bin/hihy cert renew-auto' >>"$temp_file"
+        printf '17 3 * * * %s cert renew-auto\n' "$HIHY_BIN_LINK" >>"$temp_file"
         crontab "$temp_file"
         local result=$?
         rm -f "$temp_file"
         return "$result"
     fi
-    cat >/etc/systemd/system/hihy-cert-renew.service <<EOF
+    cat >"$HIHY_CERT_RENEW_SERVICE_FILE" <<EOF || return 1
 [Unit]
 Description=Renew and deploy Hi_Hysteria shared wildcard certificate
 After=network-online.target
@@ -5559,7 +5626,7 @@ Type=oneshot
 UMask=0077
 ExecStart=${HIHY_BIN_LINK} cert renew-auto
 EOF
-    cat >/etc/systemd/system/hihy-cert-renew.timer <<'EOF'
+    cat >"$HIHY_CERT_RENEW_TIMER_FILE" <<'EOF' || return 1
 [Unit]
 Description=Daily Hi_Hysteria certificate renewal check
 
@@ -5571,8 +5638,9 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    chmod 644 /etc/systemd/system/hihy-cert-renew.service /etc/systemd/system/hihy-cert-renew.timer
-    systemctl daemon-reload && systemctl enable --now hihy-cert-renew.timer
+    chmod 644 "$HIHY_CERT_RENEW_SERVICE_FILE" "$HIHY_CERT_RENEW_TIMER_FILE" || return 1
+    systemctl daemon-reload && systemctl enable --now hihy-cert-renew.timer &&
+        systemctl is-enabled --quiet hihy-cert-renew.timer && systemctl is-active --quiet hihy-cert-renew.timer
 }
 
 initCertificateManager() {
@@ -5776,7 +5844,7 @@ receiveCertificatePackage() {
 }
 
 receiveCertificatePackageUnlocked() (
-    local domain hostname="" temp_dir cert key previous=""
+    local domain hostname="" temp_dir cert key previous="" received_release
     domain=$(getCertificateReceiverDomain) || return 1
     if [ -f "$HIHY_CONFIG_FILE" ]; then
         hostname=$(getSharedCertificateHostname "$domain") || return 1
@@ -5790,16 +5858,20 @@ receiveCertificatePackageUnlocked() (
     if [ -L "$HIHY_SHARED_CERT_DIR/current" ]; then
         previous=$(readlink "$HIHY_SHARED_CERT_DIR/current") || return 1
     fi
-    publishSharedCertificate "$cert" "$key" "$domain" || return 1
+    # The previous release must remain available until config/service migration commits.
+    publishSharedCertificate "$cert" "$key" "$domain" defer || return 1
+    received_release=$(readlink -f "$HIHY_SHARED_CERT_DIR/current") || return 1
     if [ -f "$HIHY_CONFIG_FILE" ]; then
         if ! migrateLocalHysteriaToSharedCertificate "$domain" "$hostname"; then
             if [ -n "$previous" ]; then
                 ln -s "$previous" "$temp_dir/current.previous" &&
                     mv -Tf "$temp_dir/current.previous" "$HIHY_SHARED_CERT_DIR/current" || return 1
+                rm -rf -- "$received_release" || return 1
             fi
             return 1
         fi
     fi
+    pruneSharedCertificateReleases || echoColor yellow "证书已接收，但旧版本清理失败。"
     echo "certificate received"
 )
 
@@ -6175,7 +6247,11 @@ importCertificateManagerProfileUnlocked() (
     echoColor yellow "将导入中心端 $domain，共 $count 个节点，替换本机节点列表并重置分发状态。"
     confirmHihyAction IMPORT || { echoColor yellow "已取消导入。"; return 0; }
     applyCertificateProfile "$profile_dir" || { echoColor red "导入失败，请检查上方回滚结果。"; return 1; }
-    echoColor green "证书中心配置导入完成，请检查证书状态并重新分发。"
+    if ! installCertificateRenewTimer; then
+        echoColor red "配置已导入，但自动续期任务安装失败。请修复 systemd/cron 后重新导入以重试；当前尚不能自动续期。"
+        return 1
+    fi
+    echoColor green "证书中心配置导入完成，自动续期任务已安装，请检查证书状态并重新分发。"
 )
 
 showCertificateManagerStatus() {
