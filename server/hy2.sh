@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.26"
+hihyV="ver1.28"
 
 umask 077
 
@@ -2346,6 +2346,7 @@ setHysteriaConfig() (
 
     if ! yq -e '.sniff != null' "$yaml_file" >/dev/null 2>&1; then
         addOrUpdateYaml "$yaml_file" "sniff.enable" "true" || return 1
+        # Since Hysteria v2.13.0 this timeout only applies to TCP sniffing.
         addOrUpdateYaml "$yaml_file" "sniff.timeout" "2s" || return 1
         addOrUpdateYaml "$yaml_file" "sniff.rewriteDomain" "false" || return 1
         addOrUpdateYaml "$yaml_file" "sniff.tcpPorts" "80,443" || return 1
@@ -3990,36 +3991,37 @@ generate_qr() {
     fi
 }
 
-generate_client_config() {
+buildNativeClientConfig() {
+    local client_file="$1"
     if [ ! -f "$HIHY_CONFIG_FILE" ] || [ ! -x "$HIHY_ROOT_DIR/bin/appS" ]; then
         echoColor red "hysteria2 未安装!"
-        exit 1
+        return 1
     fi
-    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" "remarks")
-    serverAddress=$(getYamlValue "$HIHY_BACKUP_FILE" "serverAddress")
-    realmMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "realmMode" "false")
+    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" "remarks") || return 1
+    serverAddress=$(getYamlValue "$HIHY_BACKUP_FILE" "serverAddress") || return 1
+    realmMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "realmMode" "false") || return 1
     if [ "${realmMode}" == "true" ]; then
-        realmURI=$(getYamlValue "$HIHY_BACKUP_FILE" "realmURI")
+        realmURI=$(getYamlValue "$HIHY_BACKUP_FILE" "realmURI") || return 1
     fi
-    listen_value=$(getYamlValue "$HIHY_CONFIG_FILE" "listen")
-    port=$(getListenPrimaryPort "${listen_value}")
-    auth_secret=$(getYamlValue "$HIHY_CONFIG_FILE" "auth.password")
-    tls_sni=$(getYamlValue "$HIHY_BACKUP_FILE" "domain")
-    insecure=$(getYamlValue "$HIHY_BACKUP_FILE" "insecure")
-    masquerade_tcp=$(getYamlValue "$HIHY_BACKUP_FILE" "masquerade_tcp")
-    obfs_type=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.type")
+    listen_value=$(getYamlValue "$HIHY_CONFIG_FILE" "listen") || return 1
+    port=$(getListenPrimaryPort "${listen_value}") || return 1
+    auth_secret=$(getYamlValue "$HIHY_CONFIG_FILE" "auth.password") || return 1
+    tls_sni=$(getYamlValue "$HIHY_BACKUP_FILE" "domain") || return 1
+    insecure=$(getYamlValue "$HIHY_BACKUP_FILE" "insecure") || return 1
+    masquerade_listener=$(getYamlValue "$HIHY_CONFIG_FILE" "masquerade.listenHTTPS") || return 1
+    obfs_type=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.type") || return 1
     if [ "${obfs_type}" == "salamander" ] || [ "${obfs_type}" == "gecko" ]; then
         obfs_status="true"
-        obfs_pass=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.${obfs_type}.password")
+        obfs_pass=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.${obfs_type}.password") || return 1
     else
         obfs_status="false"
         obfs_type=""
         obfs_pass=""
     fi
-    SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initStreamReceiveWindow")
-    CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initConnReceiveWindow")
-    max_CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxConnReceiveWindow")
-    max_SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxStreamReceiveWindow")
+    SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initStreamReceiveWindow") || return 1
+    CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initConnReceiveWindow") || return 1
+    max_CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxConnReceiveWindow") || return 1
+    max_SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxStreamReceiveWindow") || return 1
     if [ "${SRW}" = "null" ]; then
         SRW=""
     fi
@@ -4032,22 +4034,22 @@ generate_client_config() {
     if [ "${max_SRW}" = "null" ]; then
         max_SRW=""
     fi
-    congestion_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionMode" "brutal")
-    congestion_type=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionType" "")
-    congestion_bbr_profile=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionBbrProfile" "standard")
-    download=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.up")
-    upload=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.down")
+    congestion_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionMode" "brutal") || return 1
+    congestion_type=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionType" "") || return 1
+    congestion_bbr_profile=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "congestionBbrProfile" "standard") || return 1
+    download=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.up") || return 1
+    upload=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.down") || return 1
     if [ "${download}" = "null" ]; then
         download=""
     fi
     if [ "${upload}" = "null" ]; then
         upload=""
     fi
-    portHoppingStatus=$(getYamlValue "$HIHY_BACKUP_FILE" "portHoppingStatus")
+    portHoppingStatus=$(getYamlValue "$HIHY_BACKUP_FILE" "portHoppingStatus") || return 1
     if [ "${portHoppingStatus}" == "true" ]; then
-        portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}")
-        portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}")
-        portHoppingIntervalMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingIntervalMode" "fixed")
+        portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}") || return 1
+        portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}") || return 1
+        portHoppingIntervalMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingIntervalMode" "fixed") || return 1
         if [ "$portHoppingIntervalMode" = random ]; then
             portHoppingMinHopInterval=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMinHopInterval 10s)") || return 1
             portHoppingMaxHopInterval=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMaxHopInterval 30s)") || return 1
@@ -4057,85 +4059,77 @@ generate_client_config() {
         fi
         serverPortRange="${portHoppingStart}-${portHoppingEnd}"
     fi
-    safe_remarks=$(sanitizeFileComponent "$remarks")
-    client_configfile="./Hy2-${safe_remarks}-v2rayN.yaml"
-    if [ -f "${client_configfile}" ]; then
-        rm -f "${client_configfile}"
-    fi
-    touch ${client_configfile}
-    chmod 600 "$client_configfile"
     local uri_host native_host
-    uri_host=$(formatURIHost "$serverAddress")
-    native_host=$(formatURIHost "$serverAddress" native)
+    uri_host=$(formatURIHost "$serverAddress") || return 1
+    native_host=$(formatURIHost "$serverAddress" native) || return 1
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "server" "${realmURI}" "string"
+        addOrUpdateYaml "$client_file" "server" "${realmURI}" "string" || return 1
     elif [ "${portHoppingStatus}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "server" "${native_host}:${port},${serverPortRange}" "string"
+        addOrUpdateYaml "$client_file" "server" "${native_host}:${port},${serverPortRange}" "string" || return 1
     else
-        addOrUpdateYaml "$client_configfile" "server" "${native_host}:${port}" "string"
+        addOrUpdateYaml "$client_file" "server" "${native_host}:${port}" "string" || return 1
     fi
-    addOrUpdateYaml "$client_configfile" "auth" "$auth_secret" "string"
+    addOrUpdateYaml "$client_file" "auth" "$auth_secret" "string" || return 1
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "realm.stunServers[0]" "stun.chat.bilibili.com:3478"
-        addOrUpdateYaml "$client_configfile" "realm.stunServers[1]" "stun.miwifi.com:3478"
-        addOrUpdateYaml "$client_configfile" "realm.stunServers[2]" "stun.nextcloud.com:3478"
-        addOrUpdateYaml "$client_configfile" "realm.stunServers[3]" "global.stun.twilio.com:3478"
-        addOrUpdateYaml "$client_configfile" "realm.stunTimeout" "5s"
-        addOrUpdateYaml "$client_configfile" "realm.punchTimeout" "5s"
-        addOrUpdateYaml "$client_configfile" "realm.insecure" "false"
+        addOrUpdateYaml "$client_file" "realm.stunServers[0]" "stun.chat.bilibili.com:3478" || return 1
+        addOrUpdateYaml "$client_file" "realm.stunServers[1]" "stun.miwifi.com:3478" || return 1
+        addOrUpdateYaml "$client_file" "realm.stunServers[2]" "stun.nextcloud.com:3478" || return 1
+        addOrUpdateYaml "$client_file" "realm.stunServers[3]" "global.stun.twilio.com:3478" || return 1
+        addOrUpdateYaml "$client_file" "realm.stunTimeout" "5s" || return 1
+        addOrUpdateYaml "$client_file" "realm.punchTimeout" "5s" || return 1
+        addOrUpdateYaml "$client_file" "realm.insecure" "false" || return 1
     else
-        yq eval 'del(.realm)' -i "$client_configfile"
+        yq eval 'del(.realm)' -i "$client_file" || return 1
     fi
 
-    local ech_config=""
-    exportClientECH "$HIHY_CONFIG_FILE" "$client_configfile" || return 1
-    addOrUpdateYaml "$client_configfile" "tls.sni" "${tls_sni}" "string"
+    exportClientECH "$HIHY_CONFIG_FILE" "$client_file" || return 1
+    addOrUpdateYaml "$client_file" "tls.sni" "${tls_sni}" "string" || return 1
     if [ "${insecure}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "tls.insecure" "true"
+        addOrUpdateYaml "$client_file" "tls.insecure" "true" || return 1
     elif [ "${insecure}" == "false" ]; then
-        addOrUpdateYaml "$client_configfile" "tls.insecure" "false"
+        addOrUpdateYaml "$client_file" "tls.insecure" "false" || return 1
     fi
-    addOrUpdateYaml "$client_configfile" "transport.type" "udp"
+    addOrUpdateYaml "$client_file" "transport.type" "udp" || return 1
     if [ "${portHoppingStatus}" == "true" ]; then
         if [ "${portHoppingIntervalMode}" == "random" ]; then
-            addOrUpdateYaml "$client_configfile" "transport.udp.minHopInterval" "${portHoppingMinHopInterval}" string || return 1
-            addOrUpdateYaml "$client_configfile" "transport.udp.maxHopInterval" "${portHoppingMaxHopInterval}" string || return 1
-            yq eval 'del(.transport.udp.hopInterval)' -i "$client_configfile"
+            addOrUpdateYaml "$client_file" "transport.udp.minHopInterval" "${portHoppingMinHopInterval}" string || return 1
+            addOrUpdateYaml "$client_file" "transport.udp.maxHopInterval" "${portHoppingMaxHopInterval}" string || return 1
+            yq eval 'del(.transport.udp.hopInterval)' -i "$client_file" || return 1
         else
-            addOrUpdateYaml "$client_configfile" "transport.udp.hopInterval" "${portHoppingHopInterval}" string || return 1
-            yq eval 'del(.transport.udp.minHopInterval, .transport.udp.maxHopInterval)' -i "$client_configfile"
+            addOrUpdateYaml "$client_file" "transport.udp.hopInterval" "${portHoppingHopInterval}" string || return 1
+            yq eval 'del(.transport.udp.minHopInterval, .transport.udp.maxHopInterval)' -i "$client_file" || return 1
         fi
     fi
     if [ "${obfs_status}" == "true" ]; then
-        addOrUpdateYaml "$client_configfile" "obfs.type" "${obfs_type}"
-        addOrUpdateYaml "$client_configfile" "obfs.${obfs_type}.password" "${obfs_pass}" "string"
+        addOrUpdateYaml "$client_file" "obfs.type" "${obfs_type}" || return 1
+        addOrUpdateYaml "$client_file" "obfs.${obfs_type}.password" "${obfs_pass}" "string" || return 1
     else
-        yq eval 'del(.obfs)' -i "$client_configfile"
+        yq eval 'del(.obfs)' -i "$client_file" || return 1
     fi
     if [ "${congestion_mode}" != "brutal" ]; then
-        addOrUpdateYaml "$client_configfile" "congestion.type" "${congestion_type}"
+        addOrUpdateYaml "$client_file" "congestion.type" "${congestion_type}" || return 1
         if [ "${congestion_type}" == "bbr" ]; then
-            addOrUpdateYaml "$client_configfile" "congestion.bbrProfile" "${congestion_bbr_profile}"
+            addOrUpdateYaml "$client_file" "congestion.bbrProfile" "${congestion_bbr_profile}" || return 1
         fi
     fi
     if [ "${congestion_mode}" == "brutal" ]; then
-        addOrUpdateYaml "$client_configfile" "quic.initStreamReceiveWindow" "${SRW}"
-        addOrUpdateYaml "$client_configfile" "quic.initConnReceiveWindow" "${CRW}"
-        addOrUpdateYaml "$client_configfile" "quic.maxConnReceiveWindow" "${max_CRW}"
-        addOrUpdateYaml "$client_configfile" "quic.maxStreamReceiveWindow" "${max_SRW}"
+        addOrUpdateYaml "$client_file" "quic.initStreamReceiveWindow" "${SRW}" || return 1
+        addOrUpdateYaml "$client_file" "quic.initConnReceiveWindow" "${CRW}" || return 1
+        addOrUpdateYaml "$client_file" "quic.maxConnReceiveWindow" "${max_CRW}" || return 1
+        addOrUpdateYaml "$client_file" "quic.maxStreamReceiveWindow" "${max_SRW}" || return 1
     else
-        yq eval 'del(.quic.initStreamReceiveWindow, .quic.initConnReceiveWindow, .quic.maxConnReceiveWindow, .quic.maxStreamReceiveWindow)' -i "$client_configfile"
+        yq eval 'del(.quic.initStreamReceiveWindow, .quic.initConnReceiveWindow, .quic.maxConnReceiveWindow, .quic.maxStreamReceiveWindow)' -i "$client_file" || return 1
     fi
-    addOrUpdateYaml "$client_configfile" "quic.keepAlivePeriod" "60s"
+    addOrUpdateYaml "$client_file" "quic.keepAlivePeriod" "60s" || return 1
     if [ "${congestion_mode}" == "brutal" ]; then
-        addOrUpdateYaml "$client_configfile" "bandwidth.down" "${download}"
-        addOrUpdateYaml "$client_configfile" "bandwidth.up" "${upload}"
+        addOrUpdateYaml "$client_file" "bandwidth.down" "${download}" || return 1
+        addOrUpdateYaml "$client_file" "bandwidth.up" "${upload}" || return 1
     else
-        yq eval 'del(.bandwidth)' -i "$client_configfile"
+        yq eval 'del(.bandwidth)' -i "$client_file" || return 1
     fi
-    addOrUpdateYaml "$client_configfile" "fastOpen" "true"
-    addOrUpdateYaml "$client_configfile" "lazy" "true"
-    addOrUpdateYaml "$client_configfile" "socks5.listen" "127.0.0.1:20808"
+    addOrUpdateYaml "$client_file" "fastOpen" "true" || return 1
+    addOrUpdateYaml "$client_file" "lazy" "true" || return 1
+    addOrUpdateYaml "$client_file" "socks5.listen" "127.0.0.1:20808" || return 1
     if [ "${realmMode}" == "true" ]; then
         url=""
         native_url=""
@@ -4167,6 +4161,34 @@ generate_client_config() {
             native_url="hy2://$(encodeURIComponent "$auth_secret")@${uri_host}:${port},${serverPortRange}/?${url#*\?}"
         fi
     fi
+    return 0
+}
+
+# Build each export beside its destination and publish only a complete YAML map.
+# A failed write leaves the previous export intact; rename does not follow links.
+writeClientExport() {
+    local destination="$1" writer="$2" temporary
+    temporary=$(mktemp './.hihy-export.XXXXXX') || return 1
+    if "$writer" "$temporary" && chmod 600 "$temporary" &&
+        yq -e 'tag == "!!map"' "$temporary" >/dev/null &&
+        mv -fT -- "$temporary" "$destination"; then
+        return 0
+    fi
+    rm -f -- "$temporary"
+    echoColor red "客户端配置导出失败，原文件保留: $destination" >&2
+    return 1
+}
+
+generate_client_config() {
+    local ech_config=""
+    if [ ! -f "$HIHY_CONFIG_FILE" ] || [ ! -f "$HIHY_BACKUP_FILE" ] || [ ! -x "$HIHY_ROOT_DIR/bin/appS" ]; then
+        echoColor red "Hysteria2 未安装或配置不完整，无法导出客户端配置。"
+        return 1
+    fi
+    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" remarks) || return 1
+    safe_remarks=$(sanitizeFileComponent "$remarks")
+    client_configfile="./Hy2-${safe_remarks}-v2rayN.yaml"
+    writeClientExport "$client_configfile" buildNativeClientConfig || return 1
     # 在生成配置前添加分隔线
     echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo -e "📝 生成客户端配置文件..."
@@ -4178,7 +4200,7 @@ generate_client_config() {
     echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [ "${realmMode}" != "true" ]; then
-        if [ "${portHoppingStatus}" == "false" ]; then
+        if [ -z "$masquerade_listener" ] || [ "$masquerade_listener" = null ]; then
             echo -e "⚠️  注意: 伪装并未监听tcp端口"
             echo -e "💡 您可能需要$(echoColor red 手动在浏览器添加h3)支持才能访问"
         fi
@@ -4224,7 +4246,7 @@ generate_client_config() {
     fi
     echoColor purple "客户端使用教程: ${HIHY_REPO_URL}/blob/${HIHY_REPO_BRANCH}/md/client.md"
     echoColor green "↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓COPY↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓"
-    cat ${client_configfile}
+    cat "$client_configfile" || return 1
     echoColor green "↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑COPY↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑"
     if [ -n "$ech_config" ]; then
         echoColor yellow "ECH 已写入原生 YAML 和可用的分享链接；暂不生成 Clash Meta 配置。"
@@ -4236,24 +4258,17 @@ generate_client_config() {
     echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
 }
 
-generateMetaYaml() {
+buildMetaYaml() {
+    local metaFile="$1"
     local ech_path
     ech_path=$(getYamlValue "$HIHY_CONFIG_FILE" "ech.keyPath") || return 1
     if [ -n "$ech_path" ] && [ "$ech_path" != null ]; then
         echoColor yellow "ECH 模式请使用原生 Hysteria YAML；暂不导出 Clash Meta 配置。"
         return 1
     fi
-    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" "remarks")
-    local safe_remarks
-    safe_remarks=$(sanitizeFileComponent "$remarks")
-    local metaFile="./Hy2-${safe_remarks}-ClashMeta.yaml"
-    if [ -f "${metaFile}" ]; then
-        rm -f ${metaFile}
-    fi
-    touch ${metaFile}
-    chmod 600 "$metaFile"
+    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" "remarks") || return 1
 
-    cat <<EOF >${metaFile}
+    cat <<EOF >"$metaFile" || return 1
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -4391,50 +4406,45 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 EOF
-    realmMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "realmMode" "false")
-    serverAddress=$(getYamlValue "$HIHY_BACKUP_FILE" "serverAddress")
-    listen_value=$(getYamlValue "$HIHY_CONFIG_FILE" "listen")
-    port=$(getListenPrimaryPort "${listen_value}")
-    auth_secret=$(getYamlValue "$HIHY_CONFIG_FILE" "auth.password")
-    tls_sni=$(getYamlValue "$HIHY_BACKUP_FILE" "domain")
-    insecure=$(getYamlValue "$HIHY_BACKUP_FILE" "insecure")
-    masquerade_tcp=$(getYamlValue "$HIHY_BACKUP_FILE" "masquerade_tcp")
-    obfs_type=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.type")
+    realmMode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "realmMode" "false") || return 1
+    serverAddress=$(getYamlValue "$HIHY_BACKUP_FILE" "serverAddress") || return 1
+    listen_value=$(getYamlValue "$HIHY_CONFIG_FILE" "listen") || return 1
+    port=$(getListenPrimaryPort "${listen_value}") || return 1
+    auth_secret=$(getYamlValue "$HIHY_CONFIG_FILE" "auth.password") || return 1
+    tls_sni=$(getYamlValue "$HIHY_BACKUP_FILE" "domain") || return 1
+    insecure=$(getYamlValue "$HIHY_BACKUP_FILE" "insecure") || return 1
+    obfs_type=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.type") || return 1
     if [ "${obfs_type}" == "salamander" ] || [ "${obfs_type}" == "gecko" ]; then
         obfs_status="true"
-        obfs_pass=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.${obfs_type}.password")
+        obfs_pass=$(getYamlValue "$HIHY_CONFIG_FILE" "obfs.${obfs_type}.password") || return 1
     else
         obfs_status="false"
         obfs_type=""
         obfs_pass=""
     fi
-    SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initStreamReceiveWindow")
-    CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.initConnReceiveWindow")
-    max_CRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxConnReceiveWindow")
-    max_SRW=$(getYamlValue "$HIHY_CONFIG_FILE" "quic.maxStreamReceiveWindow")
-    download=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.up")
+    download=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.up") || return 1
     download=$(echo ${download} | sed 's/[^0-9]//g')
-    upload=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.down")
+    upload=$(getYamlValue "$HIHY_CONFIG_FILE" "bandwidth.down") || return 1
     upload=$(echo ${upload} | sed 's/[^0-9]//g')
-    portHoppingStatus=$(getYamlValue "$HIHY_BACKUP_FILE" "portHoppingStatus")
+    portHoppingStatus=$(getYamlValue "$HIHY_BACKUP_FILE" "portHoppingStatus") || return 1
     if [ "${portHoppingStatus}" == "true" ]; then
-        portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}")
-        portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}")
+        portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingStart" "${port}") || return 1
+        portHoppingEnd=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" "portHoppingEnd" "${port}") || return 1
     fi
     serverAddress="${serverAddress#[}"
     serverAddress="${serverAddress%]}"
-    addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}" "string"
-    addOrUpdateYaml "${metaFile}" "proxies[0].type" "hysteria2"
+    addOrUpdateYaml "${metaFile}" "proxies[0].name" "${remarks}" "string" || return 1
+    addOrUpdateYaml "${metaFile}" "proxies[0].type" "hysteria2" || return 1
     if [ "${realmMode}" == "true" ]; then
-        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}" "string"
-        yq eval 'del(.proxies[0].port)' -i "${metaFile}"
+        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}" "string" || return 1
+        yq eval 'del(.proxies[0].port)' -i "${metaFile}" || return 1
     else
-        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}" "string"
-        addOrUpdateYaml "${metaFile}" "proxies[0].port" "${port}"
+        addOrUpdateYaml "${metaFile}" "proxies[0].server" "${serverAddress}" "string" || return 1
+        addOrUpdateYaml "${metaFile}" "proxies[0].port" "${port}" || return 1
         if [ "${portHoppingStatus}" == "true" ]; then
-            addOrUpdateYaml "${metaFile}" "proxies[0].ports" "${portHoppingStart}-${portHoppingEnd}"
+            addOrUpdateYaml "${metaFile}" "proxies[0].ports" "${portHoppingStart}-${portHoppingEnd}" || return 1
             local hop_mode hop_min hop_max hop_fixed
-            hop_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingIntervalMode fixed)
+            hop_mode=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingIntervalMode fixed) || return 1
             if [ "$hop_mode" = random ]; then
                 hop_min=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMinHopInterval 10s)") || return 1
                 hop_max=$(normalizeHopInterval "$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingMaxHopInterval 30s)") || return 1
@@ -4447,36 +4457,45 @@ EOF
         fi
     fi
     local meta_congestion meta_profile
-    meta_congestion=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" congestionMode brutal)
+    meta_congestion=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" congestionMode brutal) || return 1
     if [ "$meta_congestion" = bbr ]; then
-        meta_profile=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" congestionBbrProfile standard)
+        meta_profile=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" congestionBbrProfile standard) || return 1
         addOrUpdateYaml "$metaFile" 'proxies[0].bbr-profile' "$meta_profile" string || return 1
     elif [ "$meta_congestion" = reno ]; then
         echoColor yellow "Mihomo 导出仅服务端下行使用 Reno，客户端上行仍为 BBR；双向 Reno 请使用原生 YAML。"
     fi
-    addOrUpdateYaml "${metaFile}" "proxies[0].password" "${auth_secret}" "string"
+    addOrUpdateYaml "${metaFile}" "proxies[0].password" "${auth_secret}" "string" || return 1
     # BBR/Reno 不设置固定带宽，不能导出空的 " Mbps"。
     if [[ "$upload" =~ ^[0-9]+$ ]] && [ "$upload" -gt 0 ]; then
-        addOrUpdateYaml "${metaFile}" "proxies[0].up" "${upload} Mbps"
+        addOrUpdateYaml "${metaFile}" "proxies[0].up" "${upload} Mbps" || return 1
     else
-        yq eval 'del(.proxies[0].up)' -i "$metaFile"
+        yq eval 'del(.proxies[0].up)' -i "$metaFile" || return 1
     fi
     if [[ "$download" =~ ^[0-9]+$ ]] && [ "$download" -gt 0 ]; then
-        addOrUpdateYaml "${metaFile}" "proxies[0].down" "${download} Mbps"
+        addOrUpdateYaml "${metaFile}" "proxies[0].down" "${download} Mbps" || return 1
     else
-        yq eval 'del(.proxies[0].down)' -i "$metaFile"
+        yq eval 'del(.proxies[0].down)' -i "$metaFile" || return 1
     fi
-    addOrUpdateYaml "${metaFile}" "proxies[0].skip-cert-verify" "${insecure}"
+    addOrUpdateYaml "${metaFile}" "proxies[0].skip-cert-verify" "${insecure}" || return 1
     if [ "${obfs_status}" == "true" ]; then
-        addOrUpdateYaml "${metaFile}" "proxies[0].obfs" "${obfs_type}"
-        addOrUpdateYaml "${metaFile}" "proxies[0].obfs-password" "${obfs_pass}" "string"
+        addOrUpdateYaml "${metaFile}" "proxies[0].obfs" "${obfs_type}" || return 1
+        addOrUpdateYaml "${metaFile}" "proxies[0].obfs-password" "${obfs_pass}" "string" || return 1
     else
-        yq eval 'del(.proxies[0].obfs, .proxies[0].obfs-password)' -i "${metaFile}"
+        yq eval 'del(.proxies[0].obfs, .proxies[0].obfs-password)' -i "${metaFile}" || return 1
     fi
-    addOrUpdateYaml "${metaFile}" "proxies[0].sni" "${tls_sni}" "string"
-    addOrUpdateYaml "${metaFile}" "proxy-groups[0].name" "PROXY"
-    addOrUpdateYaml "${metaFile}" "proxy-groups[0].type" "select"
-    addOrUpdateYaml "${metaFile}" "proxy-groups[0].proxies[0]" "${remarks}" "string"
+    addOrUpdateYaml "${metaFile}" "proxies[0].sni" "${tls_sni}" "string" || return 1
+    addOrUpdateYaml "${metaFile}" "proxy-groups[0].name" "PROXY" || return 1
+    addOrUpdateYaml "${metaFile}" "proxy-groups[0].type" "select" || return 1
+    addOrUpdateYaml "${metaFile}" "proxy-groups[0].proxies[0]" "${remarks}" "string" || return 1
+    return 0
+}
+
+generateMetaYaml() {
+    local safe_remarks metaFile
+    remarks=$(getYamlValue "$HIHY_BACKUP_FILE" remarks) || return 1
+    safe_remarks=$(sanitizeFileComponent "$remarks")
+    metaFile="./Hy2-${safe_remarks}-ClashMeta.yaml"
+    writeClientExport "$metaFile" buildMetaYaml || return 1
     echoColor purple "\n📱 4、[Clash.Mini/ClashX.Meta/Clash.Meta for Android/Clash.verge/openclash] ClashMeta配置。文件地址: $(echoColor green ${metaFile})"
     if [ "${realmMode}" == "true" ]; then
         echoColor yellow "⚠ Clash Meta可能不完全支持Realm模式,建议优先使用原生配置文件"

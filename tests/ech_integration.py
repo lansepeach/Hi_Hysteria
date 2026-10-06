@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -17,6 +18,10 @@ from urllib.parse import parse_qs
 
 repo = Path(__file__).resolve().parents[1]
 core = Path(sys.argv[1]).resolve()
+version_output = subprocess.check_output([str(core), 'version'], text=True)
+version_match = re.search(r'^Version:\s*v(\d+)\.(\d+)\.(\d+)\s*$', version_output, re.MULTILINE)
+assert version_match, f'cannot identify core version: {version_output}'
+core_version = tuple(map(int, version_match.groups()))
 processes = []
 logs = []
 
@@ -97,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix='hihy-ech-test-') as temporary:
         server_proc, _ = launch(server_file, 'server', 'server')
         time.sleep(0.5)
         assert server_proc.poll() is None
-        client_proc, _ = launch(client_file, 'client', 'client')
+        client_proc, client_log = launch(client_file, 'client', 'client')
         deadline = time.monotonic() + 10
         while True:
             try:
@@ -136,8 +141,13 @@ with tempfile.TemporaryDirectory(prefix='hihy-ech-test-') as temporary:
             worker.join(timeout=6)
             assert not worker.is_alive()
 
-        # Standard TLS reports ECHAccepted directly. The 2.12.3 ChromeParrot
-        # adapter omits that field when copying connection state (logs say false).
+        # v2.13.0 fixes ECH acceptance reporting with default Chrome parroting.
+        # Keep testing v2.12.3, whose adapter omitted ECHAccepted from its state.
+        if core_version >= (2, 13, 0):
+            client_log.seek(0)
+            assert '"ech": true' in client_log.read(), 'Chrome parroting did not report ECH acceptance'
+
+        # Also verify the standard TLS path independently of Chrome parroting.
         standard = dict(client, tls=dict(client['tls'], ech=public),
                         quic={'disableChromeParrot': True},
                         socks5={'listen': f'127.0.0.1:{port(socket.SOCK_STREAM)}'})

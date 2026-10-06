@@ -1,4 +1,4 @@
-# ECH 与 Hysteria v2.12.3
+# ECH 与 Hysteria 核心升级
 
 脚本 1.0.17 支持 ECH（Encrypted Client Hello），用来加密 QUIC/TLS 握手中的真实 SNI。外层公开域名仍以明文可见。ECH 默认关闭，适合未开启 Salamander/Gecko 混淆的连接；已开启混淆时通常没有额外收益。
 
@@ -9,6 +9,8 @@
 运行中的服务会在替换后启动，并持续 5 秒检查进程是否存活、是否发生重启；启动失败则恢复旧核心并尝试启动。此检查不能替代客户端连通性测试。原本停止的服务会保持停止。旧核心保存在 `/etc/hihy/bin/appS.rollback`，下一次升级会替换这份备份。更新使用目录锁防止并发替换；若进程被强制终止而遗留 `.core-update.lock`，先确认没有更新任务仍在执行，再清理这个空锁目录。
 
 v2.12.3 修复了 Linux 原生端口跳跃错误重定向本机出站 UDP 的问题。仅获取该修复无需运行 `hihy 9`。明文 HTTP 经 HTTP 代理传输超过 10 秒断开的修复位于客户端，需更新相应客户端核心。
+
+建议升级至 v2.13.0：服务端修复多包 QUIC ClientHello 的嗅探，使域名 ACL 能作用于这些流量；已有嗅探配置无需重新生成。`sniff.timeout` 现在仅对 TCP 生效。客户端更新后获得 Chrome 154 指纹模仿和 ECH 接受状态日志修复。官方客户端 TUN 的 `route.strict` 已移除；脚本不导出此字段。
 
 ## 开启 ECH
 
@@ -39,8 +41,10 @@ ECH 模式暂不生成 Clash Meta 配置，避免未经验证的参数兼容性�
 
 参考：[v2.12.3 发布说明](https://github.com/HyNetworks/hysteria/releases/tag/app%2Fv2.12.3)、[官方 ECH 文档](https://hysteria.network/zh/docs/advanced/ECH/)。
 
-## 验证与已知上游日志问题
+## 验证与旧版日志问题
 
 仓库回归测试：`bash tests/hy2_regression.sh`（需要 Bash、yq v4、常用 Linux 工具）。真实核心联调：`python3 tests/ech_integration.py /path/to/hysteria`（另需 Python 3 和 openssl），仅使用临时目录及本机回环地址。若机器已有端口跳跃规则，可通过 `HIHY_TEST_UDP_PORT` 指定规则范围外的空闲 UDP 端口。
 
 v2.12.3 默认 ChromeParrot 路径的客户端日志可能显示 `ech: false`：其 quic-go 的 [uTLS 状态转换](https://github.com/apernet/quic-go/blob/73339f7edbb9/internal/handshake/tls_conn_utls.go) 没有复制 `ECHAccepted` 字段。因此不能单凭这个日志字段判断 ECH 是否生效。联调测试覆盖默认路径的匹配密钥通信及错误密钥拒绝，并通过标准 TLS 路径确认 `ech: true`。脚本保留核心的默认 ChromeParrot 设置。
+
+此日志问题已在 [v2.13.0](https://github.com/HyNetworks/hysteria/releases/tag/app/v2.13.0) 修复。联调测试会在 v2.13.0 及更高版本额外检查默认 ChromeParrot 路径报告 `ech: true`，同时保留 v2.12.3 的兼容验证。

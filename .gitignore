@@ -26,4 +26,5 @@ hihy-cert-profile-*.gpg
 *.bak
 
 Hy2-*.yaml
+.hihy-export.*
 hihy_debug.info

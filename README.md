@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.26`
+当前脚本版本：`1.0.28`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -103,7 +103,7 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 
 - [防火墙问题](md/firewall.md)
 - [证书配置与多服务器分发](md/certificate.md)
-- [ECH 配置与 v2.12.3 升级](md/ech.md)
+- [ECH 配置与核心升级](md/ech.md)
 - [实时监控](md/monitor.md)
 - [2026-09-22 代码审查与复盘](md/audit-2026-09-22.md)
 - [UDP 服务商排雷列表](md/blacklist.md)
@@ -111,6 +111,19 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 - [支持的客户端](md/client.md)
 - [常见问题](md/issues.md)
 - [伪装网站](md/masquerade.md)
+
+## 1.0.28 修复说明
+
+- 原生和 Clash/Mihomo 客户端配置先写入权限为 `600` 的临时文件，完整生成后再替换；ECH 读取、YAML 解析或写入失败时保留该格式的旧导出文件。
+- 导出不跟随目标文件的符号链接，失败清理临时文件并返回错误，避免半成品被误报为成功。
+- 伪装 TCP 提示读取实际 `masquerade.listenHTTPS`，不再根据是否开启端口跳跃判断。
+- 增加导出失败场景回归并接入 CI，移除 Mihomo 导出中无用的窗口配置读取。
+
+## 1.0.27 更新说明
+
+- 核对 Hysteria v2.13.0 配置兼容性，注明 `sniff.timeout` 仅对 TCP 生效。
+- 真实核心 CI 同时覆盖 v2.12.3 和 v2.13.0，新增新版默认 Chrome 指纹模仿下的 ECH 日志验证。
+- 更新核心升级建议和 ECH 文档，说明 QUIC 嗅探修复及客户端更新范围。
 
 ## 1.0.26 修复说明
 
@@ -129,7 +142,9 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 
 ## 更新说明
 
-升级至本版脚本后，先运行 `hihy 7` 更新核心（建议 v2.12.3 或更高版本）。仅获取端口跳跃修复不需要重新配置。
+升级至本版脚本后，先运行 `hihy 7` 更新核心（建议 v2.13.0 或更高版本）。仅获取端口跳跃和 QUIC 嗅探修复不需要重新配置。
+
+v2.13.0 修复多包 QUIC ClientHello 的域名嗅探，已有 `sniff.enable: true` 的配置可直接受益；`sniff.timeout` 现在仅对 TCP 生效。若服务端屏蔽了 UDP/443，相关 QUIC 流量仍会被屏蔽。Chrome 154 指纹模仿和 ECH 日志修复需要更新客户端核心。脚本不生成原生 TUN 配置，Clash/Mihomo 的 `tun` 参数不能按官方核心移除 `route.strict` 的改动直接调整。
 
 如需启用 ECH 或修改其他配置，再运行：
 
@@ -157,6 +172,7 @@ bash tests/safety_regression.sh
 bash tests/audit_regression.sh
 bash tests/compatibility_regression.sh
 bash tests/review_regression.sh
+bash tests/export_regression.sh
 sudo env "PATH=$PATH" bash tests/nft_integration.sh
 sudo env "PATH=$PATH" bash tests/iptables_integration.sh
 python3 tests/ech_integration.py /path/to/hysteria
@@ -164,7 +180,7 @@ python3 tests/config_integration.py /path/to/hysteria
 python3 tests/monitor_integration.py /path/to/hysteria
 ```
 
-测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，不会调用生产节点或申请真实证书。
+测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，真实核心联调同时覆盖 v2.12.3 和 v2.13.0，不会调用生产节点或申请真实证书。
 
 nftables 集成测试还需要 root、nftables、iproute2 和网络命名空间支持；它在独立网络命名空间内验证 IPv4/IPv6 通流、重载及卸载清理，不修改主机防火墙。
 
