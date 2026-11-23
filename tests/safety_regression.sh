@@ -183,6 +183,32 @@ sed 's/a\./b./g;s/name=a/name=b/' "$node" > "$HIHY_CERT_MANAGER_DIR/nodes/b.conf
     assert_eq "$(cat "$scratch/retried")" root@a.example.com
 )
 
+(
+    HIHY_CERT_MANAGER_CONFIG="$scratch/nonexistent-manager.conf"
+    unset -f ssh-keygen
+    initCertificateReceiver example.com node.example.com >/dev/null
+    receiver_home="$scratch/receiver-home"
+    mkdir -m 700 -p "$receiver_home/.ssh"
+    chmod 700 "$receiver_home" "$HIHY_BIN_LINK"
+    getent() { printf 'deploy:x:%s:0::%s:/bin/bash\n' "$(id -u)" "$receiver_home"; }
+    ssh-keygen -q -t ed25519 -N '' -f "$scratch/receiver-test-key"
+    expected=$(ssh-keygen -E sha256 -lf "$scratch/receiver-test-key.pub" | awk '{print $2}')
+    keys="$receiver_home/.ssh/authorized_keys"
+    cp "$scratch/receiver-test-key.pub" "$keys"
+    if checkCertificateReceiver deploy "$expected" > "$scratch/receiver-check"; then fail 'unrestricted key accepted'; fi
+    grep -q '未找到 hihy 标准格式' "$scratch/receiver-check" || fail 'missing restricted key not reported'
+    printf 'restrict,command="%s cert receive" %s\n' "$HIHY_BIN_LINK" "$(cat "$scratch/receiver-test-key.pub")" > "$keys"
+    chmod 600 "$keys"
+    checkCertificateReceiver deploy "$expected" > "$scratch/receiver-check"
+    grep -qF "$expected" "$scratch/receiver-check" || fail 'matched fingerprint not reported'
+    if checkCertificateReceiver deploy "SHA256:$(printf '%043d' 0)" > "$scratch/receiver-check"; then fail 'fingerprint mismatch accepted'; fi
+    grep -q '指纹不匹配' "$scratch/receiver-check" || fail 'fingerprint mismatch not reported'
+    chmod 666 "$keys"
+    if checkCertificateReceiver deploy "$expected" > "$scratch/receiver-check"; then fail 'writable keys accepted'; fi
+    grep -q '权限异常' "$scratch/receiver-check" || fail 'unsafe permissions not reported'
+    assert_eq "$(stat -c %a "$keys")" 666
+)
+
 # Multiple actions remain in the submenu, and EOF returns rather than looping forever.
 certificateManagerMenu <<< $'10\n11\n0' > "$scratch/menu"
 [ "$(grep -c '多服务器证书管理 ·' "$scratch/menu")" -eq 3 ] || fail 'certificate submenu exited after one action'

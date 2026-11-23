@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.29"
+hihyV="ver1.30"
 
 umask 077
 
@@ -5796,6 +5796,55 @@ getCertificateReceiverDomain() {
     fi
 }
 
+checkCertificateReceiver() {
+    local user="${1:-root}" expected="${2:-}" account uid home path owner mode
+    local domain hostname prefix fingerprints result=0
+    if ! validateCertificateNodeField user "$user" ||
+        { [ -n "$expected" ] && [[ ! "$expected" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; }; then
+        echoColor red "用法: hihy cert receiver-check [SSH用户] [SHA256:部署公钥指纹]"
+        return 1
+    fi
+    if [ "$(getCertificateRole)" = receiver ] &&
+        domain=$(getCertificateReceiverDomain) && validateCertificateNodeField domain "$domain" &&
+        hostname=$(getSharedCertificateHostname "$domain"); then
+        echoColor green "接收端配置有效，客户端 SNI: $hostname"
+    else
+        echoColor red "接收端角色未初始化、存在冲突或域名无效。请检查证书菜单中的本机角色。"
+        result=1
+    fi
+    if [ ! -x "$HIHY_BIN_LINK" ]; then
+        echoColor red "SSH 证书接收命令不可执行: $HIHY_BIN_LINK"
+        result=1
+    fi
+    account=$(getent passwd "$user") || { echoColor red "找不到 SSH 用户: $user"; return 1; }
+    IFS=: read -r _ _ uid _ _ home _ <<< "$account"
+    echoColor purple "检查 $user 的默认 SSH 公钥文件: $home/.ssh/authorized_keys"
+    for path in "$home" "$home/.ssh" "$home/.ssh/authorized_keys"; do
+        if ! read -r owner mode < <(stat -Lc '%u %a' -- "$path" 2>/dev/null); then
+            echoColor red "缺少或无法检查: $path"
+            result=1
+        elif { [ "$owner" != "$uid" ] && [ "$owner" != 0 ]; } || (( (8#$mode & 022) != 0 )); then
+            echoColor red "所有者或权限异常（SSH StrictModes 可能拒绝公钥）: $path"
+            result=1
+        fi
+    done
+    prefix="restrict,command=\"$HIHY_BIN_LINK cert receive\" "
+    if [ ! -f "$home/.ssh/authorized_keys" ] || [ ! -r "$home/.ssh/authorized_keys" ] ||
+        ! fingerprints=$(awk -v prefix="$prefix" 'index($0, prefix) == 1' "$home/.ssh/authorized_keys" |
+            ssh-keygen -E sha256 -lf /dev/stdin 2>/dev/null); then
+        echoColor red "未找到 hihy 标准格式的受限部署公钥。请检查接收用户、登录公钥文件和强制命令。"
+        result=1
+    elif [ -n "$expected" ] && ! awk -v expected="$expected" '$2 == expected {found=1} END {exit !found}' <<< "$fingerprints"; then
+        echoColor red "受限部署公钥存在，但与中心端指纹不匹配。"
+        result=1
+    else
+        echoColor green "找到受限部署公钥指纹:"
+        awk '{print $2}' <<< "$fingerprints"
+    fi
+    echoColor yellow "本检查不测试远程登录；SSH 自定义公钥路径或 Match 规则需结合 sshd 日志确认。"
+    return "$result"
+}
+
 extractCertificateArchive() {
     # Consume the archive on fd 3; never let tar follow archive-controlled links.
     local kind="$1" destination="$2"
@@ -6316,6 +6365,7 @@ certificateManagerMenu() {
         echoColor yellow "9) 导入 GPG 加密配置包"
         echoColor yellow "10) 查看所有 SSH 节点"
         echoColor yellow "11) 只重试未同步节点(失败/旧证书/尚未分发)"
+        echoColor yellow "12) 接收端 SSH 与证书配置自检(默认 root，只读)"
         echoColor yellow "0) 返回主菜单"
         read -r -p "请选择证书操作: " cert_choice || return 0
         if case "$cert_choice" in
@@ -6330,8 +6380,9 @@ certificateManagerMenu() {
             9) importCertificateManagerProfile ;;
             10) showCertificateNodes ;;
             11) deployCertificateToAllNodes pending ;;
+            12) checkCertificateReceiver ;;
             0) return 0 ;;
-            *) echoColor yellow "请输入 0–11。" ;;
+            *) echoColor yellow "请输入 0–12。" ;;
         esac; then
             :
         else
@@ -6539,6 +6590,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             case "$2" in
                 manager-init) initCertificateManager ;;
                 receiver-init) initCertificateReceiver "${3:-}" "${4:-}" ;;
+                receiver-check) checkCertificateReceiver "${3:-}" "${4:-}" ;;
                 issue) issueOrRenewWildcardCertificate ;;
                 renew-auto) renewAndDeployCertificates ;;
                 deploy) deployCertificateToAllNodes "${3:-all}" ;;
