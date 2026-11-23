@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.28"
+hihyV="ver1.29"
 
 umask 077
 
@@ -5562,7 +5562,7 @@ issueOrRenewWildcardCertificate() {
 }
 
 issueOrRenewWildcardCertificateUnlocked() {
-    local domain email wildcard lego_cert lego_key renew_days action="run"
+    local domain email wildcard lego_cert lego_key renew_days
 
     requireCertificateManager || return 1
     domain=$(getCertificateManagerValue domain) || return 1
@@ -5573,13 +5573,11 @@ issueOrRenewWildcardCertificateUnlocked() {
 
     lego_cert="$HIHY_CERT_MANAGER_DIR/lego/certificates/_.${domain}.crt"
     lego_key="$HIHY_CERT_MANAGER_DIR/lego/certificates/_.${domain}.key"
-    [ -f "$lego_cert" ] && action="renew"
-
     renew_days=$(getCertificateManagerValue renew_days 2>/dev/null) || renew_days=30
     [[ "$renew_days" =~ ^[0-9]+$ ]] && [ "$renew_days" -gt 0 ] || return 1
-    local lego_args=(--path "$HIHY_CERT_MANAGER_DIR/lego" --email "$email"
-        --accept-tos --dns cloudflare --dns.propagation.disable-rns --domains "$wildcard" "$action")
-    [ "$action" != renew ] || lego_args+=(--days "$renew_days")
+    local lego_args=(run --path "$HIHY_CERT_MANAGER_DIR/lego" --email "$email"
+        --accept-tos --dns cloudflare --dns.propagation.disable-rns --domains "$wildcard"
+        --renew-days "$renew_days")
     if ! CF_DNS_API_TOKEN_FILE="$HIHY_CERT_TOKEN_FILE" "$HIHY_LEGO_BIN" "${lego_args[@]}"; then
         echoColor red "通配符证书申请或续期失败。"
         return 1

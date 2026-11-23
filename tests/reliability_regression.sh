@@ -197,7 +197,6 @@ assert unquote(u.fragment)=='Hy2-中文, [x] #备注'
 PY
 done
 
-# ACME chooses run vs renew, and supplies the configured renewal threshold.
 mkdir -p "$HIHY_CERT_MANAGER_DIR"/{config,state,lego/certificates,bin,nodes} "$HIHY_SHARED_CERT_DIR/current"
 cat > "$HIHY_CERT_MANAGER_CONFIG" <<'CONF'
 domain=example.com
@@ -214,12 +213,13 @@ chmod +x "$HIHY_LEGO_BIN"
     installLego() { return 0; }
     verifyCloudflareToken() { return 0; }
     publishSharedCertificate() { return 0; }
+    expected_args=$(printf '%s\n' run --path "$HIHY_CERT_MANAGER_DIR/lego" --email test@example.com \
+        --accept-tos --dns cloudflare --dns.propagation.disable-rns --domains '*.example.com' --renew-days 40)
     issueOrRenewWildcardCertificate
-    assert_eq "$(tail -1 "$HIHY_TEST_LEGO_ARGS")" run
+    assert_eq "$(cat "$HIHY_TEST_LEGO_ARGS")" "$expected_args"
     touch "$HIHY_CERT_MANAGER_DIR/lego/certificates/_.example.com.crt"
     issueOrRenewWildcardCertificate
-    assert_eq "$(tail -3 "$HIHY_TEST_LEGO_ARGS" | tr '\n' ' ')" 'renew --days 40 '
-    assert_eq "$(head -1 "$HIHY_TEST_LEGO_ARGS")" --path
+    assert_eq "$(cat "$HIHY_TEST_LEGO_ARGS")" "$expected_args"
 )
 
 # Real deployment bookkeeping, with an SSH fixture that never leaves this process.
