@@ -23,6 +23,7 @@ outbounds: [{name: hihy, type: direct, direct: {mode: auto}}]
 YAML
 printf 'domain: node.example.com\n' > "$HIHY_BACKUP_FILE"
 printf 'reject(suffix:old.example.com)\n' > "$HIHY_ACL_FILE"
+addOrUpdateYaml "$HIHY_CONFIG_FILE" acl.file "$HIHY_ACL_FILE" string
 echo stopped > "$scratch/service-state"
 serviceIsActive() { [ "$(cat "$scratch/service-state")" = running ]; }
 serviceRestart() { echo restarted >> "$scratch/restarts"; echo running > "$scratch/service-state"; }
@@ -57,6 +58,15 @@ cmp "$HIHY_ACL_FILE" "$scratch/acl-before" || fail 'ACL deletion rollback failed
 echo stopped > "$scratch/service-state"
 updateACLRule add NEW.example.com reject > /dev/null
 [ ! -f "$scratch/restarts" ] || fail 'ACL started a stopped service'
+printf '%s\n' 'reject(all, udp/443)' 'direct(*, */*) # fallback' > "$HIHY_ACL_FILE"
+updateACLRule add specific.example.com reject > /dev/null
+assert_eq "$(sed -n '2p' "$HIHY_ACL_FILE")" 'reject(suffix:specific.example.com)'
+printf 'direct(all)\n' > "$scratch/external-acl"
+addOrUpdateYaml "$HIHY_CONFIG_FILE" acl.file "$scratch/external-acl" string
+cp "$HIHY_ACL_FILE" "$scratch/managed-acl-before"
+if updateACLRule add inactive.example.com reject > /dev/null; then fail 'inactive ACL edited'; fi
+cmp "$HIHY_ACL_FILE" "$scratch/managed-acl-before" || fail 'inactive ACL changed'
+assert_eq "$(cat "$scratch/external-acl")" 'direct(all)'
 
 # Link members and arbitrary archive files never reach certificate/profile consumers.
 python3 - "$scratch" <<'PY'

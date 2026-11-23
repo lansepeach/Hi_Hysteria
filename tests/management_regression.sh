@@ -156,6 +156,7 @@ cmp "$scratch/socks-backup-before" "$HIHY_BACKUP_FILE" || fail 'SOCKS rollback l
 
 # Exact ACL deletion retains unrelated domains and supports case-insensitive DNS.
 printf '%s\n' 'reject(suffix:example.com)' 'v4_only(suffix:example.com)' 'reject(suffix:notexample.com)' 'reject(suffix:exampleXcom)' 'reject(all, udp/443)' > "$HIHY_ACL_FILE"
+addOrUpdateYaml "$HIHY_CONFIG_FILE" acl.file "$HIHY_ACL_FILE" string
 aclControl <<< $'2\nEXAMPLE.COM' > /dev/null
 assert_eq "$(wc -l < "$HIHY_ACL_FILE")" 3
 grep -qxF 'reject(suffix:notexample.com)' "$HIHY_ACL_FILE" || fail 'unrelated suffix deleted'
@@ -261,8 +262,30 @@ done
     curl() { while [ "$1" != -o ]; do shift; done; cp "$HIHY_TEST_DOWNLOAD" "$2"; }
     export -f id curl
     export HIHY_BIN="$scratch/bootstrap" HIHY_TEST_DOWNLOAD="$scratch/download.sh"
+    export HIHY_ROOT_DIR="$scratch/legacy-root"
+    mkdir -p "$HIHY_ROOT_DIR"/{bin,conf,cert}
+    printf 'old core\n' > "$HIHY_ROOT_DIR/bin/appS"
+    printf 'listen: :8443\n' > "$HIHY_ROOT_DIR/conf/config.yaml"
+    printf 'old certificate\n' > "$HIHY_ROOT_DIR/cert/legacy.pem"
+    cp -a "$HIHY_ROOT_DIR" "$scratch/legacy-before"
+    printf '#!/bin/bash\nhihyV="1.0.3"\nexit 29\n' > "$HIHY_BIN"
+    cp "$HIHY_BIN" "$scratch/old-bootstrap"
+    printf '#!/bin/bash\nhihyV="ver1.31"\ncheckRoot() { :; }\nmenu() { :; }\nexit 37\n' > "$HIHY_TEST_DOWNLOAD"
+    bash "$repo/server/install.sh" --upgrade > /dev/null
+    cmp "$HIHY_BIN" "$HIHY_TEST_DOWNLOAD" || fail 'upgrade did not replace old launcher'
+    cmp "$HIHY_BIN.previous" "$scratch/old-bootstrap" || fail 'old launcher backup missing'
+    bash "$repo/server/install.sh" --upgrade > /dev/null
+    cmp "$HIHY_BIN.previous" "$scratch/old-bootstrap" || fail 'identical upgrade destroyed useful backup'
+    diff -r "$HIHY_ROOT_DIR" "$scratch/legacy-before" || fail 'upgrade changed old installation'
+    [ ! -e "${HIHY_ROOT_DIR}.operation.lock" ] || fail 'bootstrap upgrade leaked lock'
+    mkdir "${HIHY_ROOT_DIR}.operation.lock"
+    if bash "$repo/server/install.sh" --upgrade > /dev/null 2>&1; then fail 'bootstrap bypassed operation lock'; fi
+    rmdir "${HIHY_ROOT_DIR}.operation.lock"
+    sed -i 's/ver1.31/ver1.29/' "$HIHY_TEST_DOWNLOAD"
+    if bash "$repo/server/install.sh" --upgrade > /dev/null 2>&1; then fail 'bootstrap accepted downgrade'; fi
+    grep -qx 'hihyV="ver1.31"' "$HIHY_BIN" || fail 'downgrade overwrote launcher'
     for status in 0 7; do
-        printf '#!/bin/bash\nhihyV="test"\ncheckRoot() { :; }\nexit %s\n' "$status" > "$HIHY_TEST_DOWNLOAD"
+        printf '#!/bin/bash\nhihyV="ver1.31"\ncheckRoot() { :; }\nmenu() { :; }\nexit %s\n' "$status" > "$HIHY_TEST_DOWNLOAD"
         result=0
         bash "$repo/server/install.sh" > /dev/null || result=$?
         assert_eq "$result" "$status"
@@ -272,6 +295,26 @@ done
     if bash "$repo/server/install.sh" > /dev/null 2>&1; then fail 'invalid bootstrap accepted'; fi
     cmp "$HIHY_BIN" "$scratch/bootstrap-before" || fail 'invalid download replaced launcher'
 )
+(
+    HIHY_BIN_LINK="$scratch/in-app-launcher"
+    HIHY_REMOTE_SCRIPT_URL=primary HIHY_REMOTE_SCRIPT_MIRROR_URL=mirror
+    printf '#!/bin/bash\nhihyV="ver1.08"\n' > "$HIHY_BIN_LINK"
+    cp "$HIHY_BIN_LINK" "$scratch/legacy-in-app"
+    downloadToFile() {
+        local candidate=ver1.30
+        if [ "$1" = mirror ]; then candidate="${mirror_version:-ver1.31}"; fi
+        printf '#!/bin/bash\nhihyV="%s"\ncheckRoot() { :; }\nmenu() { :; }\n' "$candidate" > "$2"
+    }
+    mirror_version=ver1.29
+    if withHihyOperationLock updateHihyLauncher ver1.31 > /dev/null; then fail 'mismatched script version accepted'; fi
+    cmp "$HIHY_BIN_LINK" "$scratch/legacy-in-app" || fail 'version mismatch replaced launcher'
+    unset mirror_version
+    withHihyOperationLock updateHihyLauncher ver1.31 > /dev/null
+    grep -qx 'hihyV="ver1.31"' "$HIHY_BIN_LINK" || fail 'valid mirror was not used'
+    cmp "$HIHY_BIN_LINK.previous" "$scratch/legacy-in-app" || fail 'in-app update lost old launcher'
+    [ ! -e "${HIHY_ROOT_DIR}.operation.lock" ] || fail 'in-app update leaked lock'
+)
+assert_eq "$(bash "$repo/server/hy2.sh" version)" "hihy $(cat "$repo/VERSION")"
 (
     cd "$scratch"
     if python3 "$repo/optimize_hihy.py" > /dev/null 2>&1; then fail 'retired optimizer succeeded'; fi

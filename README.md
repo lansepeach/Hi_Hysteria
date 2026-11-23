@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.30`
+当前脚本版本：`1.0.31`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -63,6 +63,41 @@ bash <(curl -fsSL https://github.com/lansepeach/Hi_Hysteria/raw/refs/heads/main/
 hihy
 ```
 
+## 从旧版升级（不重装）
+
+如果服务器已经在跑 **Hysteria 2**，不要卸载，也不用重新输入域名、端口或密码。升级分三件事：更新 **hihy 管理脚本**、更新 **Hysteria 内核**、迁移 **开机启动方式**。下面先做第一件，后两件按需操作。
+
+### 菜单能更新：直接用选项 11
+
+如果旧脚本的更新地址已经指向本仓库，切到 root 后运行 `hihy 11`。升级完成后会载入新版菜单；不会重启当前服务，也不会改端口、防火墙、证书或客户端配置。
+
+### 菜单不能更新：用独立入口
+
+早期脚本可能还指向原上游仓库，也可能因换源或下载失败而打不开。遇到这些情况，不需要先补装某个中间版本。用 root 执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lansepeach/Hi_Hysteria/refs/heads/main/server/install.sh \
+    -o /root/hihy-upgrade.sh &&
+bash /root/hihy-upgrade.sh --upgrade &&
+hihy version
+```
+
+`--upgrade` 只校验并替换 `/usr/bin/hihy`，不会打开菜单或执行安装向导；即使旧启动器已丢失，只要服务和配置还在，也可以用它补回启动器。**这不是 Hysteria 1 到 Hysteria 2 的迁移工具**，也不适用于第三方自定义目录或配置结构未经确认的安装。
+
+### 升完要做什么？怎么回退？
+
+- 运行 `hihy version` 看脚本版本，运行 `hihy 6` 查看服务。原有客户端应继续使用原地址、端口和密码。只是更新脚本，不需要运行 `hihy 1` 或 `hihy 9`。
+- 想使用新版内核功能（如 ACL 预览），再运行 `hihy 7`。这一步是单独的核心更新，正在运行的服务会重启验证；建议选空闲时间。
+- systemd 主机若提示旧版 `rc.local`/SysV 启动方式，可以先选“暂不迁移”。确认要切换启动方式时，再执行 `hihy migrate-service`；更新脚本本身不会执行迁移。
+- 成功替换前会把旧脚本留在 `/usr/bin/hihy.previous`。如果只想退回管理脚本，先确认没有 hihy 操作在运行，再执行下面的命令；它不会回退核心或配置。
+
+```bash
+cp -p -- /usr/bin/hihy.previous /usr/bin/hihy.rollback.tmp &&
+mv -Tf -- /usr/bin/hihy.rollback.tmp /usr/bin/hihy
+```
+
+下载失败、脚本校验失败，或识别出下载版本低于已安装版本时，更新会拒绝替换当前脚本。
+
 ## 常用命令
 
 ```bash
@@ -78,7 +113,9 @@ hihy 8            # 查看/重新生成客户端配置
 hihy 9            # 重新配置服务端
 hihy 10           # 切换自动、IPv4/IPv6 优先或仅 IPv4/IPv6 出口
 hihy 11           # 更新 hihy 脚本
+hihy version      # 只显示管理脚本版本，不打开菜单
 hihy 12           # ACL 域名分流管理
+hihy 12 test example.com:443 udp # 预览 UDP 请求命中的规则与出站（核心 v2.14.0+）
 hihy 13           # 查看统计信息
 hihy 14           # 查看实时日志
 hihy 15           # 添加 socks5 出站
@@ -98,6 +135,43 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 脚本更新完成后会自动重新载入新版菜单。远程版本由仓库根目录的 `VERSION` 提供，完整脚本下载失败时不会覆盖当前安装。
 
 安装需输入 `INSTALL`，卸载需输入 `UNINSTALL`；回车、其他输入或输入结束均取消。已有配置不会被选项 1 覆盖，更新核心用选项 7，修改配置用选项 9。卸载会删除本机证书管理凭据和节点记录，中心端请先从选项 16 导出配置包并安排后续续期。安装与卸载共用操作锁，正常结束或收到退出信号时自动释放。
+
+## ACL 分流：升级后怎么用
+
+ACL 是服务端的分流规则。它可以让指定域名走 IPv4 或 IPv6 出站，也可以拒绝访问。**规则从上往下检查，第一条匹配的规则生效**。例如，`direct(all)` 的意思是“其它流量直连”；如果把它写在最前面，后面的域名规则就可能永远用不到。
+
+### 已有配置需要迁移吗？
+
+**不需要。** Hysteria `v2.14.0` 仍支持旧式 `acl.file`（文件）和 `acl.inline`（写在配置里的文本规则）。要使用新的 ACL 预览，运行 `hihy 7` 更新核心即可，不用为了升级再跑一遍 `hihy 9`。旧核心仍可用原来的托管 ACL，并继续使用菜单增删规则；只是不能用预览。
+
+新版核心另外支持表达式 ACL：`acl.rules` 写在服务端 YAML 中，`acl.rulesFile` 则指向外部的规则文件。四种入口只能启用一种。运行 `hihy 9` 重配置时：
+
+- **使用旧式 ACL**：保留原来的规则顺序；外部旧式 ACL 或内联规则会复制到 hihy 托管文件，外部源文件不改。向导的 HTTP/3 开关只增删它负责的 `reject(all, udp/443)`。
+- **使用表达式 ACL**：保留原来的 `acl.rules` 或 `acl.rulesFile`、规则顺序和外部文件，不会转换成旧式。向导会跳过 HTTP/3 开关；如果要改变是否拒绝 UDP/443，请改你原来的规则。
+- **路径提示**：`acl.file` 和 `acl.rulesFile` 指向外部文件时请使用可读的绝对路径，例如 `/etc/hihy/acl/my-rules.yaml`。相对路径依赖服务从哪个目录启动，向导不会猜测。
+
+### 我改了一条规则，怎么知道有没有生效？
+
+1. 运行 `hihy 12`，选 **3 查看当前配置的 ACL**。这里显示的是服务端 YAML 引用的规则，而不是碰巧留在磁盘上的旧文件。
+2. 选 **1 添加**或 **2 删除**来管理 hihy 托管的旧式域名规则。只有配置实际引用 hihy 托管的 ACL 文件（默认 `/etc/hihy/acl/acl.txt`）时才允许写入。外部文件、内联规则和表达式规则可查看和预览，但应在原处编辑；菜单不会替你修改。
+3. 选 **4 预览规则命中**，或者直接运行下面的命令。新增域名规则会放在普通的全匹配兜底规则（如 `direct(all)`）前面。更早的具体规则、端口规则和用户自定义的顺序不会被重排，因此改完最好做一次预览。
+
+```bash
+hihy 12 test example.com:443       # 不写协议时按 TCP 检查
+hihy 12 test example.com:443 udp   # 用同一目标检查 UDP，例如排查 HTTP/3
+hihy 12 test '[2001:db8::1]:443'   # IPv6 地址用方括号括起来
+```
+
+结果中，`Rule` 是命中的规则，`Outbound` 是选择的出站。例如下面两条规则会让 UDP/443 显示 `reject`，同一个目标的 TCP 请求则显示 `direct`：
+
+```text
+reject(all, udp/443)
+direct(all)
+```
+
+要是本来想屏蔽某个域名却看到 `direct`，先看是不是前面的规则已经匹配，不要只看列表里有没有那条屏蔽规则。
+
+预览读取磁盘上的服务端配置，不修改配置、不重启服务，也不会连接你填的目标。它不做 DNS 解析、不模拟嗅探，也不传入客户端认证 ID 或来源地址，所以依赖这些信息的规则可能与真实连接的结果不同。要测试这类规则，请用核心自带的 `acl test --help` 查看 `--ipv4`、`--ipv6`、`--auth` 和 `--client` 等选项。如果规则使用 GeoIP 或 GeoSite，核心仍可能按配置下载或刷新地理数据缓存。手工修改文件后，预览通过不等于运行中的服务已经加载了改动。
 
 ## 文档
 
@@ -142,7 +216,7 @@ hihy migrate-service # 将旧版启动方式迁移到原生 systemd
 
 ## 更新说明
 
-升级至本版脚本后，先运行 `hihy 7` 更新核心（建议 v2.13.0 或更高版本）。仅获取端口跳跃和 QUIC 嗅探修复不需要重新配置。
+建议用 `hihy 7` 更新到 Hysteria v2.14.0 或更高版本。若只是获取内核的 UDP 性能改进、端口跳跃和 QUIC 嗅探修复，不需要运行 `hihy 9` 或重新导出客户端配置。旧式 ACL 也可以直接继续使用。
 
 v2.13.0 修复多包 QUIC ClientHello 的域名嗅探，已有 `sniff.enable: true` 的配置可直接受益；`sniff.timeout` 现在仅对 TCP 生效。若服务端屏蔽了 UDP/443，相关 QUIC 流量仍会被屏蔽。Chrome 154 指纹模仿和 ECH 日志修复需要更新客户端核心。脚本不生成原生 TUN 配置，Clash/Mihomo 的 `tun` 参数不能按官方核心移除 `route.strict` 的改动直接调整。
 
@@ -180,7 +254,7 @@ python3 tests/config_integration.py /path/to/hysteria
 python3 tests/monitor_integration.py /path/to/hysteria
 ```
 
-测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查，真实核心联调同时覆盖 v2.12.3 和 v2.13.0，不会调用生产节点或申请真实证书。
+测试使用临时目录、模拟服务/ACME/SSH 和回环连接，需要 Bash、yq v4、Python 3、openssl 与常见 Linux 工具。GitHub Actions 会在 push 和 pull request 时自动执行这些检查。真实核心联调覆盖 v2.12.3、v2.13.0 和 v2.14.0，并在新版内核检查表达式 ACL 保留、外部规则文件及 TCP/UDP 命中差异；不会调用生产节点或申请真实证书。
 
 nftables 集成测试还需要 root、nftables、iproute2 和网络命名空间支持；它在独立网络命名空间内验证 IPv4/IPv6 通流、重载及卸载清理，不修改主机防火墙。
 

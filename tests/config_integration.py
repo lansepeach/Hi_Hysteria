@@ -14,6 +14,9 @@ import time
 
 repo = Path(__file__).resolve().parents[1]
 core = Path(sys.argv[1]).resolve()
+version = subprocess.check_output([str(core), 'version'], text=True)
+core_release = tuple(map(int, next(line.split()[1] for line in version.splitlines()
+                                   if line.startswith('Version:'))[1:].split('.')))
 
 
 def free_port(kind):
@@ -173,6 +176,47 @@ changeServerConfig
                   'addOrUpdateYaml "$HIHY_CONFIG_FILE" resolver.udp.addr 127.0.0.1:5353 string; '
                   'addOrUpdateYaml "$HIHY_CONFIG_FILE" sniff.timeout 3s string')
             retained_outbounds = yaml(root / 'conf/config.yaml')['outbounds']
+
+    if core_release >= (2, 14, 0):
+        managed_acl = root / 'acl/acl.txt'
+        managed_acl.write_text('direct(all)\n')
+        assert 'Outbound:  direct' in shell('previewHihyACL example.com:443')
+        shell('updateACLRule add example.com reject')
+        assert 'Outbound:  reject' in shell('aclControl test example.com:443 udp')
+        assert 'Outbound:  direct' in shell('previewHihyACL other.test:443')
+        config_path = root / 'conf/config.yaml'
+        external_rules = root / 'external-acl.yaml'
+        expression_rules = [
+            {'outbound': 'reject', 'match': 'proto == "udp" && dst.port == 443'},
+            {'outbound': 'direct'},
+        ]
+        external_rules.write_text(json.dumps(expression_rules))
+        managed_before = managed_acl.read_bytes()
+        external_before = external_rules.read_bytes()
+        expression_answers = answers[:-2] + [answers[-1]]
+        for expression_acl in ({'rules': expression_rules}, {'rulesFile': str(external_rules)}):
+            config = yaml(config_path)
+            config['acl'] = expression_acl
+            config_path.write_text(json.dumps(config))
+            shell('if updateACLRule add inactive.example.com reject; then exit 92; fi')
+            output = shell('changeServerConfig', '\n'.join(expression_answers) + '\n')
+            assert '跳过 HTTP/3 开关' in output, output
+            assert yaml(config_path)['acl'] == expression_acl
+            assert managed_acl.read_bytes() == managed_before
+            assert external_rules.read_bytes() == external_before
+            assert 'Outbound:  reject' in shell('previewHihyACL example.com:443 udp')
+            assert 'Outbound:  direct' in shell('previewHihyACL example.com:443 tcp')
+            connect(cert, 'helloworld.com')
+        config = yaml(config_path)
+        config['acl']['file'] = str(managed_acl)
+        config_path.write_text(json.dumps(config))
+        output = shell('if setHysteriaConfig 2>&1; then exit 93; fi', '')
+        assert 'ACL 只能配置' in output, output
+        del config['acl']['file']
+        config_path.write_text(json.dumps(config))
+    else:
+        output = shell('if previewHihyACL example.com:443; then exit 94; fi')
+        assert '需要 Hysteria v2.14.0' in output, output
 
     # Let the real core parse and re-export a native URI; ranges must survive.
     shell('addOrUpdateYaml "$HIHY_BACKUP_FILE" portHoppingStatus true bool; '

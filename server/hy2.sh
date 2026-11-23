@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.30"
+hihyV="ver1.31"
 
 umask 077
 
@@ -105,12 +105,19 @@ sanitizeFileComponent() {
     printf '%s\n' "$value"
 }
 
+hihyScriptVersion() {
+    local version
+    version=$(sed -nE 's/^hihyV="(ver[0-9]+\.[0-9]+)"$/\1/p' "$@") || return 1
+    [[ "$version" =~ ^ver[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
 validateDownloadedShell() {
     local file="$1"
 
     [ -s "$file" ] || return 1
     bash -n "$file" || return 1
-    grep -qE '^[[:space:]]*hihyV=' "$file" || return 1
+    hihyScriptVersion "$file" >/dev/null || return 1
     grep -qF 'checkRoot()' "$file" || return 1
     grep -qF 'menu()' "$file" || return 1
 }
@@ -355,16 +362,7 @@ getLatestHihyVersion() {
 
     content=$(fetchRemoteBodyFromSources "$HIHY_REMOTE_SCRIPT_URL" "$HIHY_REMOTE_SCRIPT_MIRROR_URL") || return 1
 
-    version=$(printf '%s\n' "$content" \
-        | grep -E '^[[:space:]]*hihyV=' \
-        | head -n 1 \
-        | sed -E 's/^[[:space:]]*hihyV=["'\''"]?([^"'\''"]+)["'\''"]?.*/\1/')
-
-    if [ -z "$version" ]; then
-        return 1
-    fi
-
-    printf '%s\n' "$version"
+    hihyScriptVersion <<< "$content"
 }
 
 isHysteriaReleaseVersion() {
@@ -1314,6 +1312,26 @@ prepareLocalTrafficStats() {
         addOrUpdateYaml "$backup" trafficPort "$api_port" number
 }
 
+getHihyACLSource() {
+    local config="$1" lengths source="" index
+    local -a fields=(file inline rules rulesFile) counts
+    if [ ! -f "$config" ]; then
+        printf '%s\n' none
+        return 0
+    fi
+    lengths=$(yq -r '[(.acl.file | length), (.acl.inline | length), (.acl.rules | length), (.acl.rulesFile | length)] | @csv' "$config") || return 1
+    IFS=, read -r -a counts <<< "$lengths"
+    for index in "${!fields[@]}"; do
+        [ "${counts[index]}" -gt 0 ] || continue
+        if [ -n "$source" ]; then
+            echoColor red "ACL 只能配置 file、inline、rules、rulesFile 中的一种，请先修正服务端配置。" >&2
+            return 1
+        fi
+        source="${fields[index]}"
+    done
+    printf '%s\n' "${source:-none}"
+}
+
 prepareConfigurationACL() {
     local old_config="$1" target="$2" block_http3="$3" source_acl=""
     : > "$target" || return 1
@@ -1327,8 +1345,6 @@ prepareConfigurationACL() {
             cat "$source_acl" > "$target" || return 1
         elif yq -e '.acl.inline != null' "$old_config" >/dev/null 2>&1; then
             yq -r '.acl.inline[]' "$old_config" > "$target" || return 1
-        elif [ -f "$HIHY_ACL_FILE" ]; then
-            cat "$HIHY_ACL_FILE" > "$target" || return 1
         fi
     fi
     # Only the wizard's exact UDP/443 rule is controlled by this switch.
@@ -1349,7 +1365,17 @@ beginReconfiguration() {
 
 setHysteriaConfig() (
     local ech_key_path="" old_ech_path="" yaml_file="" backup_file="" validation_pid="" debug_file="" config_stage=""
-    local reconfigure_dir="${2:-}" old_auth_password="" owned_pid=""
+    local reconfigure_dir="${2:-}" old_auth_password="" owned_pid="" acl_source acl_path
+    acl_source=$(getHihyACLSource "$HIHY_CONFIG_FILE") || return 1
+    case "$acl_source" in
+        file | rulesFile)
+            acl_path=$(getYamlValue "$HIHY_CONFIG_FILE" "acl.$acl_source") || return 1
+            if [[ "$acl_path" != /* ]] || [ ! -f "$acl_path" ] || [ ! -r "$acl_path" ]; then
+                echoColor red "请先将 acl.$acl_source 设为可读取的绝对路径: $acl_path"
+                return 1
+            fi
+            ;;
+    esac
     trap 'if [ -n "$validation_pid" ]; then kill "$validation_pid" 2>/dev/null || true; wait "$validation_pid" 2>/dev/null || true; fi; rm -rf -- "$config_stage"' EXIT
     if [ "$#" -gt 0 ]; then
         ech_key_path="$1"
@@ -2072,18 +2098,22 @@ setHysteriaConfig() (
             fi
         fi
     fi
-    echoColor green "\n(12/13)是否在服务器屏蔽http3流量(hysteria对udp流量拥塞控制无增强效果，导致访问youtube等使用QUIC连接的网站效果不佳):"
-    echoColor lightYellow "如果开启此选项，hysteria2将不会代理udp/443，无法使用QUIC连接访问网站，并且需要在客户端配置中禁用QUIC连接，否则会导致连接失败。\n"
-    echo -e "也可以仅在客户端屏蔽QUIC/HTTP3/UDP 443连接，服务器不做屏蔽，效果一样\n"
-    echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、启用(推荐)\n2、跳过(默认)\033[0m\033[32m\n\n输入序号:\033[0m"
-    read -r block_http3 || return 1
-    if [ -z "${block_http3}" ] || [ ${block_http3} == "2" ]; then
-        block_http3="false"
-        echo -e "\n->您选择不屏蔽http3流量，这会导致访问使用QUIC连接的网站无hy2增强效果\n"
-        echoColor lightYellow "Tip: 建议在客户端开启屏蔽QUIC/HTTP3/UDP 443此选项以获得更好的访问体验。\n"
+    if [ "$acl_source" = rules ] || [ "$acl_source" = rulesFile ]; then
+        echoColor yellow "(12/13) 保留现有 acl.$acl_source 和规则顺序，跳过 HTTP/3 开关；如需调整，请在原规则中修改 UDP/443。"
     else
-        block_http3="true"
-        echoColor red "\n->您选择屏蔽http3流量，请根据自己使用的客户端，屏蔽QUIC/HTTP3流量，否则会导致对使用QUIC的网站连接失败\n"
+        echoColor green "\n(12/13)是否在服务器屏蔽http3流量(hysteria对udp流量拥塞控制无增强效果，导致访问youtube等使用QUIC连接的网站效果不佳):"
+        echoColor lightYellow "如果开启此选项，hysteria2将不会代理udp/443，无法使用QUIC连接访问网站，并且需要在客户端配置中禁用QUIC连接，否则会导致连接失败。\n"
+        echo -e "也可以仅在客户端屏蔽QUIC/HTTP3/UDP 443连接，服务器不做屏蔽，效果一样\n"
+        echo -e "\033[32m请选择:\n\n\033[0m\033[33m\033[01m1、启用(推荐)\n2、跳过(默认)\033[0m\033[32m\n\n输入序号:\033[0m"
+        read -r block_http3 || return 1
+        if [ -z "${block_http3}" ] || [ "$block_http3" = 2 ]; then
+            block_http3="false"
+            echo -e "\n->您选择不屏蔽http3流量，这会导致访问使用QUIC连接的网站无hy2增强效果\n"
+            echoColor lightYellow "Tip: 建议在客户端开启屏蔽QUIC/HTTP3/UDP 443此选项以获得更好的访问体验。\n"
+        else
+            block_http3="true"
+            echoColor red "\n->您选择屏蔽http3流量，请根据自己使用的客户端，屏蔽QUIC/HTTP3流量，否则会导致对使用QUIC的网站连接失败\n"
+        fi
     fi
     echoColor green "(13/13)请输入客户端名称备注(默认使用域名或IP区分,例如输入test,则名称为Hy2-test):"
     read -r remarks || return 1
@@ -2138,7 +2168,11 @@ setHysteriaConfig() (
     else
         : > "$yaml_file" || return 1
     fi
-    prepareConfigurationACL "$HIHY_CONFIG_FILE" "$config_stage/acl.txt" "$block_http3" || return 1
+    if [ "$acl_source" != rules ] && [ "$acl_source" != rulesFile ]; then
+        prepareConfigurationACL "$HIHY_CONFIG_FILE" "$config_stage/acl.txt" "$block_http3" || return 1
+        yq -i 'del(.acl.inline)' "$yaml_file" || return 1
+        addOrUpdateYaml "$yaml_file" acl.file "$config_stage/acl.txt" string || return 1
+    fi
     if [ -n "$ech_key_path" ]; then
         addOrUpdateYaml "$yaml_file" "ech.keyPath" "$ech_key_path" "string" || return 1
     fi
@@ -2199,9 +2233,6 @@ setHysteriaConfig() (
     else
         yq eval 'del(.bandwidth)' -i "$yaml_file" || return 1
     fi
-    # Validate using the staged ACL; publish it together with the configuration.
-    yq -i 'del(.acl.inline)' "$yaml_file" || return 1
-    addOrUpdateYaml "$yaml_file" "acl.file" "$config_stage/acl.txt" "string" || return 1
     case ${masquerade_type} in
         "string")
             addOrUpdateYaml "$yaml_file" "masquerade.type" "string" || return 1
@@ -2464,9 +2495,11 @@ setHysteriaConfig() (
     else
         addOrUpdateYaml ${backup_file} "insecure" "false" || return 1
     fi
-    addOrUpdateYaml "$yaml_file" acl.file "$HIHY_ACL_FILE" string || return 1
-    mv -f "$config_stage/acl.txt" "$HIHY_ACL_FILE" &&
-        mv -f "$yaml_file" "$HIHY_CONFIG_FILE" && mv -f "$backup_file" "$HIHY_BACKUP_FILE" || return 1
+    if [ -f "$config_stage/acl.txt" ]; then
+        addOrUpdateYaml "$yaml_file" acl.file "$HIHY_ACL_FILE" string || return 1
+        mv -f "$config_stage/acl.txt" "$HIHY_ACL_FILE" || return 1
+    fi
+    mv -f "$yaml_file" "$HIHY_CONFIG_FILE" && mv -f "$backup_file" "$HIHY_BACKUP_FILE" || return 1
     secureHihyPermissions || return 1
     if ! installHihyLauncher; then
         markInstallFailed "launcher" "failed to install hihy launcher"
@@ -2612,49 +2645,66 @@ hihy_update_notifycation() {
     displayCachedVersionNotifications
 }
 
-hihyUpdate() {
-    local localV="${hihyV}"
-    local remoteV=""
-    local tmp_file=""
+updateHihyLauncher() (
+    local version="$1" stage url downloaded=false installed_version newest
+    stage=$(mktemp -d "$(dirname "$HIHY_BIN_LINK")/.hihy-upgrade.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
-    remoteV=$(getLatestHihyVersion || true)
-
-    if [ -z "$remoteV" ]; then
-        echoColor red "Network Error: Can't connect to ${HIHY_REPO_URL}!"
-        exit 1
+    for url in "${HIHY_REMOTE_SCRIPT_URL}?t=$(date +%s)" "$HIHY_REMOTE_SCRIPT_MIRROR_URL"; do
+        if downloadToFile "$url" "$stage/hihy" && validateDownloadedShell "$stage/hihy" &&
+            [ "$(hihyScriptVersion "$stage/hihy")" = "$version" ]; then
+            downloaded=true
+            break
+        fi
+    done
+    if [ "$downloaded" != true ]; then
+        echoColor red "下载失败或脚本版本与 $version 不一致，已保留现有启动器。"
+        return 1
     fi
 
-    echo -e "Local hihy version: $(echoColor red "${localV}")"
-    echo -e "Remote hihy version: $(echoColor red "${remoteV}")"
+    chmod 755 "$stage/hihy" || return 1
+    if [ -e "$HIHY_BIN_LINK" ]; then
+        [ -f "$HIHY_BIN_LINK" ] || return 1
+        installed_version=$(hihyScriptVersion "$HIHY_BIN_LINK") || installed_version=""
+        if [ -n "$installed_version" ]; then
+            newest=$(printf '%s\n' "$installed_version" "$version" | sort -V | tail -n 1) || return 1
+            if [ "$newest" != "$version" ]; then
+                echoColor red "已安装的 $installed_version 比下载版本 $version 更新，拒绝降级。"
+                return 1
+            fi
+        fi
+        if [ -x "$HIHY_BIN_LINK" ] && cmp -s "$stage/hihy" "$HIHY_BIN_LINK"; then
+            return 0
+        fi
+        cp -pL -- "$HIHY_BIN_LINK" "$stage/previous" &&
+            mv -Tf -- "$stage/previous" "$HIHY_BIN_LINK.previous" || return 1
+        echoColor purple "旧脚本备份: $HIHY_BIN_LINK.previous"
+    fi
+    mv -Tf -- "$stage/hihy" "$HIHY_BIN_LINK" || return 1
+    rm -f -- "$HIHY_VERSION_STATUS_FILE" || true
+)
 
-    if [ "$localV" = "$remoteV" ]; then
-        echoColor green "Already the latest version. Ignore."
+hihyUpdate() {
+    local remote_version newest
+    remote_version=$(getLatestHihyVersion) || {
+        echoColor red "无法读取 hihy 版本，请稍后重试，或按 README 使用独立升级入口。"
+        return 1
+    }
+    echoColor purple "当前脚本: $hihyV；远端版本: $remote_version"
+    newest=$(printf '%s\n' "$hihyV" "$remote_version" | sort -V | tail -n 1) || return 1
+    if [ "$newest" != "$remote_version" ]; then
+        echoColor yellow "远端版本比当前版本旧，保留当前脚本。"
+        return 1
+    fi
+    if [ "$hihyV" = "$remote_version" ]; then
+        echoColor green "hihy 已是最新版本。"
         return 0
     fi
 
-    tmp_file="${HIHY_BIN_LINK}.tmp.$$"
-
-    if ! downloadToFile "${HIHY_REMOTE_SCRIPT_URL}?t=$(date +%s)" "$tmp_file"; then
-        if ! downloadToFile "$HIHY_REMOTE_SCRIPT_MIRROR_URL" "$tmp_file"; then
-            rm -f "$tmp_file"
-            echoColor red "hihy 更新失败，请检查网络或写入权限。"
-            exit 1
-        fi
-    fi
-
-    chmod 755 "$tmp_file" || { rm -f "$tmp_file"; return 1; }
-    if ! validateDownloadedShell "$tmp_file"; then
-        rm -f "$tmp_file"
-        echoColor red "下载的 hihy 脚本校验失败，保留当前版本。"
-        exit 1
-    fi
-    mv "$tmp_file" "$HIHY_BIN_LINK" || { rm -f "$tmp_file"; return 1; }
-
-    rm -f "$HIHY_VERSION_STATUS_FILE"
-
-    echoColor green "hihy 更新完成。"
-    echoColor purple "更新来源: ${HIHY_REPO_URL}"
-    echoColor purple "正在重新载入新版脚本..."
+    withHihyOperationLock updateHihyLauncher "$remote_version" || return 1
+    echoColor green "hihy 更新完成，正在重新载入新版菜单。服务和配置未修改。"
     exec "$HIHY_BIN_LINK"
 }
 
@@ -5269,8 +5319,14 @@ changeServerConfigUnlocked() (
 updateACLRule() { withHihyOperationLock updateACLRuleUnlocked "$@"; }
 
 updateACLRuleUnlocked() (
-    local action="$1" domain="${2,,}" target="${3:-}" stage was_running=false restored=true
-    [ -f "$HIHY_ACL_FILE" ] || return 1
+    local action="$1" domain="${2,,}" target="${3:-}" stage acl_source acl_path was_running=false restored=true
+    acl_source=$(getHihyACLSource "$HIHY_CONFIG_FILE") || return 1
+    acl_path=$(getYamlValue "$HIHY_CONFIG_FILE" acl.file) || return 1
+    if [ "$acl_source" != file ] || [ "$acl_path" != "$HIHY_ACL_FILE" ] ||
+        [ ! -f "$HIHY_ACL_FILE" ] || [ -L "$HIHY_ACL_FILE" ]; then
+        echoColor yellow "只能编辑服务端配置引用的 hihy 托管 ACL 文件。当前来源: $acl_source；可在菜单查看或预览，原配置未修改。"
+        return 1
+    fi
     domain=${domain%.}
     [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] && [[ "$domain" != *..* ]] &&
         [ "${#domain}" -le 253 ] || { echoColor red "请输入有效域名，不要包含端口、括号或空白。"; return 1; }
@@ -5282,8 +5338,14 @@ updateACLRuleUnlocked() (
         if grep -ixF "$target(suffix:$domain)" "$HIHY_ACL_FILE" >/dev/null; then
             echoColor yellow "规则已存在。"; return 0
         fi
-        cp -p "$HIHY_ACL_FILE" "$stage/new" || return 1
-        printf '\n%s(suffix:%s)\n' "$target" "$domain" >>"$stage/new" || return 1
+        awk -v new_rule="$target(suffix:$domain)" '
+            !inserted && tolower($0) ~ /^[[:space:]]*[[:alnum:]_]+[[:space:]]*\([[:space:]]*(all|\*)[[:space:]]*(,[[:space:]]*\*(\/\*)?[[:space:]]*)?\)[[:space:]]*(#.*)?$/ {
+                print new_rule
+                inserted=1
+            }
+            {print}
+            END {if (!inserted) print new_rule}
+        ' "$HIHY_ACL_FILE" >"$stage/new" || return 1
     else
         HIHY_ACL_DOMAIN="$domain" awk '
             BEGIN {domain=ENVIRON["HIHY_ACL_DOMAIN"]}
@@ -5309,10 +5371,56 @@ updateACLRuleUnlocked() (
     echoColor green "ACL 修改成功，保留原服务启停状态。"
 )
 
+showHihyACL() {
+    local source path
+    source=$(getHihyACLSource "$HIHY_CONFIG_FILE") || return 1
+    case "$source" in
+        file | rulesFile)
+            path=$(getYamlValue "$HIHY_CONFIG_FILE" "acl.$source") || return 1
+            echoColor purple "ACL 来源: acl.$source ($path)"
+            [[ "$path" = /* ]] || { echoColor yellow "相对路径由服务工作目录决定，请直接检查原规则文件。"; return 1; }
+            cat -- "$path"
+            ;;
+        inline | rules)
+            echoColor purple "ACL 来源: acl.$source"
+            yq ".acl.$source" "$HIHY_CONFIG_FILE"
+            ;;
+        none) echoColor yellow "服务端配置未设置 ACL。" ;;
+    esac
+}
+
+previewHihyACL() (
+    local destination="${1:-}" protocol="${2:-tcp}" version major minor core="$HIHY_ROOT_DIR/bin/appS"
+    if [ -z "$destination" ] || [[ "$destination" != *:* ]] || [ "$#" -gt 2 ]; then
+        echoColor yellow "用法: hihy 12 test <域名或IP:端口> [tcp|udp]，IPv6 地址请加方括号。"
+        return 1
+    fi
+    case "$protocol" in tcp | udp) ;; *) echoColor red "协议只能是 tcp 或 udp。"; return 1 ;; esac
+    version=$(getLocalHysteriaVersion "$core") || return 1
+    if [[ "$version" =~ ^app/v([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+        major="${BASH_REMATCH[1]}"
+        minor="${BASH_REMATCH[2]}"
+    else
+        echoColor red "无法读取当前 Hysteria 核心版本。"
+        return 1
+    fi
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 14 ]; }; then
+        echoColor yellow "规则预览需要 Hysteria v2.14.0 或更新版本；可用 hihy 7 更新核心。"
+        return 1
+    fi
+    [ -f "$HIHY_CONFIG_FILE" ] || { echoColor red "未找到服务端配置。"; return 1; }
+    cd / || return 1
+    "$core" --disable-update-check -c "$HIHY_CONFIG_FILE" acl test --no-resolve --proto "$protocol" -- "$destination"
+)
+
 aclControl() {
-    local input domain target
-    [ -f "$HIHY_ACL_FILE" ] || { echoColor red "未找到 ACL 文件。"; return 1; }
-    echoColor yellow "1) 添加  2) 删除  3) 查看  0) 返回"
+    local input domain target protocol
+    if [ "${1:-}" = test ]; then
+        shift
+        previewHihyACL "$@"
+        return $?
+    fi
+    echoColor yellow "1) 添加  2) 删除  3) 查看当前配置的 ACL  4) 预览规则命中（不改配置）  0) 返回"
     read -r -p "请选择: " input || return 0
     case "$input" in
         1)
@@ -5326,7 +5434,12 @@ aclControl() {
             read -r -p "请输入要删除的域名: " domain || return 0
             updateACLRule remove "$domain"
             ;;
-        3) cat "$HIHY_ACL_FILE" ;;
+        3) showHihyACL ;;
+        4)
+            read -r -p "请输入目标 (例如 example.com:443): " target || return 0
+            read -r -p "请输入协议 (tcp/udp，默认 tcp): " protocol || return 0
+            previewHihyACL "$target" "${protocol:-tcp}"
+            ;;
         0) return 0 ;;
         *) echoColor red "输入错误。"; return 1 ;;
     esac
@@ -6488,7 +6601,7 @@ menu() {
                 ;;
             11)
                 hihyUpdate
-                exit 0
+                exit $?
                 ;;
             12)
                 aclControl
@@ -6524,6 +6637,10 @@ menu() {
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    if [ "${1:-}" = version ] || [ "${1:-}" = --version ]; then
+        printf 'hihy %s\n' "$hihyV"
+        exit 0
+    fi
     checkRoot
     case "$1" in
         install | 1)
@@ -6566,13 +6683,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             echoColor purple "-> 10) 切换ipv4/ipv6优先级"
             changeIp64
             ;;
-        hihyUpdate | 11)
+        update | hihyUpdate | 11)
             echoColor purple "-> 11) 更新hihy"
             hihyUpdate
             ;;
         aclControl | 12)
             echoColor purple "-> 12) ACL管理"
-            aclControl
+            aclControl "${@:2}"
             ;;
         getHysteriaTrafic | 13)
             echoColor purple "-> 13) 查看hysteria统计信息"
