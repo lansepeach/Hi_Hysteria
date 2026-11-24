@@ -24,7 +24,7 @@ assert_eq() { [ "$1" = "$2" ] || fail "expected '$2', got '$1'"; }
     cp "$(command -v sleep)" "$HIHY_ROOT_DIR/bin/appS"
     sleep 30 &
     unrelated=$!
-    "$HIHY_ROOT_DIR/bin/appS" 30 &
+    (exec -a sleep "$HIHY_ROOT_DIR/bin/appS" 30) &
     owned=$!
     trap 'kill "$owned" "$unrelated" 2>/dev/null || true; wait "$owned" "$unrelated" 2>/dev/null || true' EXIT
     printf '%s\n' "$unrelated" > "$HIHY_PID_FILE"
