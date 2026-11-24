@@ -21,10 +21,11 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_eq() { [ "$1" = "$2" ] || fail "expected '$2', got '$1'"; }
 
 (
-    cp "$(command -v sleep)" "$HIHY_ROOT_DIR/bin/appS"
+    cp "$BASH" "$HIHY_ROOT_DIR/bin/appS"
+    mkfifo "$scratch/core-wait"
     sleep 30 &
     unrelated=$!
-    (exec -a sleep "$HIHY_ROOT_DIR/bin/appS" 30) &
+    "$HIHY_ROOT_DIR/bin/appS" -c 'read -r -t 30 unused <> "$1"' appS "$scratch/core-wait" &
     owned=$!
     trap 'kill "$owned" "$unrelated" 2>/dev/null || true; wait "$owned" "$unrelated" 2>/dev/null || true' EXIT
     printf '%s\n' "$unrelated" > "$HIHY_PID_FILE"
@@ -37,7 +38,7 @@ assert_eq() { [ "$1" = "$2" ] || fail "expected '$2', got '$1'"; }
         sleep 0.1
     done
     legacyHihyProcessMatches "$owned" || fail 'owned process not recognized'
-    cp "$(command -v sleep)" "$scratch/replacement-core"
+    cp "$BASH" "$scratch/replacement-core"
     mv -Tf "$scratch/replacement-core" "$HIHY_ROOT_DIR/bin/appS"
     legacyHihyProcessMatches "$owned" || fail 'old core not recognized after atomic replacement'
     printf '%s\n' "$owned" > "$HIHY_PID_FILE"
