@@ -1,5 +1,5 @@
 #!/bin/bash
-hihyV="ver1.31"
+hihyV="ver1.32"
 
 umask 077
 
@@ -2581,6 +2581,62 @@ hihyProcessAlive() {
     [ -n "$state" ] && [ "$state" != Z ]
 }
 
+legacyHihyProcessMatches() {
+    local pid="$1" executable expected="$HIHY_ROOT_DIR/bin/appS"
+    hihyProcessAlive "$pid" || return 1
+    executable=$(readlink -- "/proc/$pid/exe") || return 1
+    expected=$(readlink -f -- "$expected") || return 1
+    [ "$executable" = "$expected" ] || [ "$executable" = "$expected (deleted)" ]
+}
+
+legacyHihyStart() {
+    local core="$HIHY_ROOT_DIR/bin/appS" pid attempt pid_stage
+    local -a prefix
+    if [ -r "$HIHY_PID_FILE" ] && legacyHihyProcessMatches "$(cat "$HIHY_PID_FILE")"; then
+        return 0
+    fi
+    [ -x "$core" ] && [ -s "$HIHY_CONFIG_FILE" ] || return 1
+    mkdir -p "$(dirname "$HIHY_LOG_FILE")" || return 1
+    pid_stage=$(mktemp "${HIHY_PID_FILE}.XXXXXX") || return 1
+    read -r -a prefix <<< "$(getStartCommand)"
+    nohup "${prefix[@]}" "$core" --log-level info -c "$HIHY_CONFIG_FILE" server </dev/null >"$HIHY_LOG_FILE" 2>&1 &
+    pid=$!
+    for ((attempt=0; attempt<20; attempt++)); do
+        if legacyHihyProcessMatches "$pid"; then
+            if printf '%s\n' "$pid" >"$pid_stage" && mv -Tf -- "$pid_stage" "$HIHY_PID_FILE"; then
+                return 0
+            fi
+            if legacyHihyProcessMatches "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+            break
+        fi
+        hihyProcessAlive "$pid" || break
+        sleep 0.1
+    done
+    rm -f -- "$pid_stage"
+    echoColor red "未能确认旧版服务已启动，请检查日志: $HIHY_LOG_FILE"
+    return 1
+}
+
+legacyHihyStop() {
+    local pid attempt
+    [ -e "$HIHY_PID_FILE" ] || return 0
+    pid=$(cat "$HIHY_PID_FILE") || return 1
+    if legacyHihyProcessMatches "$pid"; then
+        if ! kill -TERM "$pid" && legacyHihyProcessMatches "$pid"; then return 1; fi
+        for ((attempt=0; attempt<50; attempt++)); do
+            legacyHihyProcessMatches "$pid" || break
+            sleep 0.1
+        done
+        if legacyHihyProcessMatches "$pid"; then
+            echoColor red "旧版 Hysteria 进程未退出，已保留 PID 文件: $HIHY_PID_FILE"
+            return 1
+        fi
+    fi
+    rm -f -- "$HIHY_PID_FILE"
+}
+
+legacyHihyRestart() { legacyHihyStop && legacyHihyStart; }
+
 getHihyServicePID() {
     if [ -f "$HIHY_SERVICE_FILE" ] && [ "$(detectServiceManager)" = systemd ]; then
         systemctl show -p MainPID --value hihy.service
@@ -2874,59 +2930,14 @@ EOF
 }
 
 writeLegacyService() {
-    local start_cmd_prefix
-    start_cmd_prefix=$(getStartCommand)
-    mkdir -p "$(dirname "$HIHY_LEGACY_SERVICE")"
-
-    cat >"$HIHY_LEGACY_SERVICE" <<EOF
-#!/bin/sh
-HIHY_PATH="${HIHY_ROOT_DIR}"
-PID_FILE="${HIHY_PID_FILE}"
-LOG_FILE="${HIHY_LOG_FILE}"
-START_CMD_PREFIX="${start_cmd_prefix}"
-
-start() {
-    if [ -f "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null; then
-        echo "hihy is already running"
-        return 0
-    fi
-    rm -f "\$PID_FILE"
-    if [ -n "\$START_CMD_PREFIX" ]; then
-        nohup \$START_CMD_PREFIX "\$HIHY_PATH/bin/appS" --log-level info -c "\$HIHY_PATH/conf/config.yaml" server >"\$LOG_FILE" 2>&1 &
-    else
-        nohup "\$HIHY_PATH/bin/appS" --log-level info -c "\$HIHY_PATH/conf/config.yaml" server >"\$LOG_FILE" 2>&1 &
-    fi
-    echo \$! >"\$PID_FILE"
-}
-
-stop() {
-    [ -f "\$PID_FILE" ] || return 0
-    pid=\$(cat "\$PID_FILE")
-    if kill -0 "\$pid" 2>/dev/null; then
-        kill "\$pid"
-    fi
-    rm -f "\$PID_FILE"
-}
-
-status() {
-    if [ -f "\$PID_FILE" ] && kill -0 "\$(cat "\$PID_FILE")" 2>/dev/null; then
-        echo "hihy is running"
-        return 0
-    fi
-    echo "hihy is not running"
-    return 3
-}
-
-case "\$1" in
-    start) start ;;
-    stop) stop ;;
-    restart) stop; sleep 2; start ;;
-    status) status ;;
-    log) tail -f "\$LOG_FILE" ;;
-    *) echo "Usage: \$0 {start|stop|restart|status|log}"; exit 1 ;;
-esac
-EOF
-    chmod 755 "$HIHY_LEGACY_SERVICE"
+    mkdir -p "$(dirname "$HIHY_LEGACY_SERVICE")" || return 1
+    {
+        printf '#!/bin/bash\n'
+        printf 'export HIHY_ROOT_DIR=%q HIHY_CONFIG_FILE=%q HIHY_PID_FILE=%q HIHY_LOG_FILE=%q\n' \
+            "$HIHY_ROOT_DIR" "$HIHY_CONFIG_FILE" "$HIHY_PID_FILE" "$HIHY_LOG_FILE"
+        printf 'exec %q legacy-service "$@"\n' "$HIHY_BIN_LINK"
+    } >"$HIHY_LEGACY_SERVICE" || return 1
+    chmod 755 "$HIHY_LEGACY_SERVICE" || return 1
     if [ -d "$(dirname "$HIHY_INIT_SERVICE")" ]; then
         ln -sf "$HIHY_LEGACY_SERVICE" "$HIHY_INIT_SERVICE"
     fi
@@ -2995,7 +3006,7 @@ installHihyService() {
             ;;
         *)
             writeLegacyService || return 1
-            "$HIHY_LEGACY_SERVICE" restart >>"$service_log" 2>&1 || return 1
+            legacyHihyRestart >>"$service_log" 2>&1 || return 1
             ;;
     esac
     rm -f "$service_log"
@@ -3017,7 +3028,7 @@ serviceStart() {
     elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
         rc-service hihy start
     else
-        "$HIHY_LEGACY_SERVICE" start
+        legacyHihyStart
     fi
 }
 
@@ -3027,7 +3038,7 @@ serviceStop() {
     elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
         rc-service hihy stop
     else
-        "$HIHY_LEGACY_SERVICE" stop
+        legacyHihyStop
     fi
 }
 
@@ -3047,7 +3058,7 @@ serviceRestart() {
     elif [ -f "$HIHY_INIT_SERVICE" ] && [ "$(detectServiceManager)" = "openrc" ]; then
         rc-service hihy restart
     else
-        "$HIHY_LEGACY_SERVICE" restart
+        legacyHihyRestart
     fi
 }
 
@@ -3059,13 +3070,15 @@ serviceIsActive() {
     else
         local pid
         pid=$(getHihyServicePID) || return 1
-        hihyProcessAlive "$pid"
+        legacyHihyProcessMatches "$pid"
     fi
 }
 
-migrateLegacyService() {
+migrateLegacyService() { withHihyOperationLock migrateLegacyServiceUnlocked "$@"; }
+
+migrateLegacyServiceUnlocked() {
     local was_running="false"
-    local backup_dir
+    local backup_dir pid
     local had_init_service="false"
     local migration_log="$HIHY_ROOT_DIR/result/service-migration.log"
 
@@ -3073,19 +3086,22 @@ migrateLegacyService() {
     ensureHihyDirectories || return 1
     : >"$migration_log"
     chmod 600 "$migration_log"
-    if isNativeHihySystemdService; then
-        systemctl enable hihy.service >/dev/null 2>&1 || true
-        if [ -f "$HIHY_RC_LOCAL" ]; then
-            sed -i "\|${HIHY_LEGACY_SERVICE} start|d" "$HIHY_RC_LOCAL"
-        fi
-        return 0
+    if isNativeHihySystemdService; then return 0; fi
+    [ -f "$HIHY_LEGACY_SERVICE" ] || return 1
+    if [ -e "$HIHY_SERVICE_FILE" ] || [ -L "$HIHY_SERVICE_FILE" ]; then
+        echoColor red "已有未识别的 systemd unit，未覆盖: $HIHY_SERVICE_FILE"
+        return 1
     fi
-    [ -f "$HIHY_LEGACY_SERVICE" ] || return 0
 
-    "$HIHY_LEGACY_SERVICE" status >/dev/null 2>&1 && was_running="true"
+    if [ -r "$HIHY_PID_FILE" ]; then
+        pid=$(cat "$HIHY_PID_FILE") || return 1
+        if legacyHihyProcessMatches "$pid"; then was_running=true; fi
+    fi
     backup_dir=$(mktemp -d "$HIHY_ROOT_DIR/result/service-migration.XXXXXX") || return 1
     cp -a "$HIHY_LEGACY_SERVICE" "$backup_dir/hihy.legacy" || return 1
-    [ -f "$HIHY_RC_LOCAL" ] && cp -a "$HIHY_RC_LOCAL" "$backup_dir/rc.local"
+    if [ -f "$HIHY_RC_LOCAL" ]; then
+        cp -a "$HIHY_RC_LOCAL" "$backup_dir/rc.local" || return 1
+    fi
     if [ -e "$HIHY_INIT_SERVICE" ] || [ -L "$HIHY_INIT_SERVICE" ]; then
         cp -a "$HIHY_INIT_SERVICE" "$backup_dir/hihy.init" || return 1
         rm -f "$HIHY_INIT_SERVICE"
@@ -3117,8 +3133,10 @@ migrateLegacyService() {
         return 1
     fi
 
-    "$HIHY_LEGACY_SERVICE" stop >/dev/null 2>&1 || true
-    if ! systemctl start hihy.service >>"$migration_log" 2>&1 || ! systemctl is-active --quiet hihy.service; then
+    if [ "$was_running" = true ] &&
+        { ! legacyHihyStop >>"$migration_log" 2>&1 ||
+          ! systemctl start hihy.service >>"$migration_log" 2>&1 ||
+          ! waitHihyServiceHealthy >>"$migration_log" 2>&1; }; then
         echoColor red "原生 hihy.service 启动失败，正在恢复旧启动方式。"
         systemctl status hihy.service --no-pager >>"$migration_log" 2>&1 || true
         tail -n 30 "$migration_log"
@@ -3129,7 +3147,9 @@ migrateLegacyService() {
         [ "$had_init_service" = "true" ] && cp -a "$backup_dir/hihy.init" "$HIHY_INIT_SERVICE"
         [ -f "$backup_dir/rc.local" ] && cp -a "$backup_dir/rc.local" "$HIHY_RC_LOCAL"
         systemctl daemon-reload >/dev/null 2>&1 || true
-        [ "$was_running" = "true" ] && "$HIHY_LEGACY_SERVICE" start >/dev/null 2>&1
+        if ! legacyHihyStart >>"$migration_log" 2>&1; then
+            echoColor red "旧服务未能恢复，请检查日志和备份: $migration_log；$backup_dir"
+        fi
         return 1
     fi
 
@@ -3697,6 +3717,12 @@ installHihyConfirmed() {
     local install_state
     install_state=$(classifyInstallState)
 
+    if [ "$install_state" = partially-installed ] &&
+        { [ -e "$HIHY_CONFIG_FILE" ] || [ -L "$HIHY_CONFIG_FILE" ] ||
+          [ -e "$HIHY_BACKUP_FILE" ] || [ -L "$HIHY_BACKUP_FILE" ]; }; then
+        echoColor yellow "检测到未完成的安装或已有配置。未覆盖配置；如上次安装失败，请运行 hihy repair-install。"
+        return 1
+    fi
     if [ "$install_state" = "installed" ] || [ -e "$HIHY_CONFIG_FILE" ] || [ -L "$HIHY_CONFIG_FILE" ] ||
         [ -e "$HIHY_BACKUP_FILE" ] || [ -L "$HIHY_BACKUP_FILE" ]; then
         echoColor yellow "检测到已有安装或配置，已阻止重复安装，不会覆盖现有配置。"
@@ -3730,11 +3756,47 @@ installHihyConfirmed() {
     downloadHysteriaCore || return 1
     setHysteriaConfig || return 1
 
-    if ! installHihyService; then
-        markInstallFailed "service" "failed to install or start service"
-        echoColor red "服务安装或启动失败。"
+    finishHihyInstallation
+}
+
+repairHihyInstallation() { withHihyOperationLock repairHihyInstallationUnlocked "$@"; }
+
+repairHihyInstallationUnlocked() {
+    local marker phase config
+    marker=$(getInstallFailureMarker)
+    [ -f "$marker" ] || { echoColor red "未找到未完成的安装记录，无需修复安装。"; return 1; }
+    phase=$(sed -n 's/^phase=//p' "$marker") || return 1
+    case "$phase" in
+        launcher | service | finalize) ;;
+        *) echoColor red "当前安装记录处于 $phase，不能自动续装。请保留配置并检查原始错误。"; return 1 ;;
+    esac
+    [ -x "$HIHY_ROOT_DIR/bin/appS" ] || { echoColor red "核心缺失，不能用已有配置续装。"; return 1; }
+    for config in "$HIHY_CONFIG_FILE" "$HIHY_BACKUP_FILE"; do
+        if [ ! -s "$config" ] || ! yq -e 'tag == "!!map"' "$config" >/dev/null; then
+            echoColor red "配置缺失或无效，未进行修复: $config"
+            return 1
+        fi
+    done
+    echoColor yellow "将保留现有配置，继续安装服务并生成客户端文件；可能启动或重启服务。"
+    confirmHihyAction REPAIR || { echoColor yellow "已取消修复。"; return 0; }
+    if [ "$phase" = launcher ]; then installHihyLauncher || return 1; fi
+    finishHihyInstallation "$phase"
+}
+
+finishHihyInstallation() {
+    local phase="${1:-service}" portHoppingStatus portHoppingStart portHoppingEnd
+    markInstallFailed service "service registration or health check incomplete" || return 1
+    if [ "$phase" != finalize ] || ! serviceIsActive; then
+        if ! installHihyService; then
+            echoColor red "服务安装或启动失败。"
+            return 1
+        fi
+    fi
+    if ! waitHihyServiceHealthy; then
+        echoColor red "服务未稳定运行；修正问题后可运行 hihy repair-install。"
         return 1
     fi
+    markInstallFailed finalize "service started but installation finalization incomplete" || return 1
 
     portHoppingStatus=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingStatus false)
     portHoppingStart=$(getBackupValueOrDefault "$HIHY_BACKUP_FILE" portHoppingStart "")
@@ -3751,7 +3813,7 @@ installHihyConfirmed() {
 
     generate_client_config || return 1
     secureHihyPermissions || return 1
-    clearInstallFailureMarker
+    clearInstallFailureMarker || return 1
     echoColor yellowBlack "安装完毕"
 }
 
@@ -6647,6 +6709,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             echoColor purple "-> 1) 安装 hysteria"
             install
             ;;
+        repair-install) repairHihyInstallation ;;
         uninstall | 2)
             echoColor purple "-> 2) 卸载 hysteria"
             uninstall
@@ -6734,6 +6797,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             ;;
         firewall-apply) applyNftOwnedRuleset ;;
         firewall-restore) restoreNftOwnedFirewall ;;
+        legacy-service)
+            case "${2:-}" in
+                start) withHihyOperationLock legacyHihyStart ;;
+                stop) withHihyOperationLock legacyHihyStop ;;
+                restart) withHihyOperationLock legacyHihyRestart ;;
+                status) [ -r "$HIHY_PID_FILE" ] && legacyHihyProcessMatches "$(cat "$HIHY_PID_FILE")" || exit 3 ;;
+                log) tail -f "$HIHY_LOG_FILE" ;;
+                *) exit 1 ;;
+            esac
+            ;;
         cronTask) cronTask ;;
         *) menu ;;
     esac

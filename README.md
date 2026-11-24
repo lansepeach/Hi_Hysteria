@@ -2,7 +2,7 @@
 
 个人维护版 Hysteria2 一键安装与管理脚本，基于 [emptysuns/Hi_Hysteria](https://github.com/emptysuns/Hi_Hysteria) 修改，面向自用和学习场景。
 
-当前脚本版本：`1.0.31`
+当前脚本版本：`1.0.32`
 
 [历史改进](md/log.md) | [Hysteria V1 版本](https://github.com/emptysuns/Hi_Hysteria/tree/v1)
 
@@ -63,6 +63,18 @@ bash <(curl -fsSL https://github.com/lansepeach/Hi_Hysteria/raw/refs/heads/main/
 hihy
 ```
 
+### 安装中断后怎么继续？
+
+如果域名、端口和密码已经保存，但启动服务或生成客户端文件时失败，**不要先卸载**。先看终端报错；服务安装失败的日志通常在 `/etc/hihy/result/service-install.log`，systemd 主机也可以用 `journalctl -u hihy.service -n 50 --no-pager` 查看原因。处理报错后，用 root 执行：
+
+```bash
+hihy repair-install
+```
+
+输入 `REPAIR` 才会继续。此命令只处理脚本已记录的启动器、服务或安装收尾失败，不会重新下载核心、重跑配置向导或更换端口和密码。若服务尚未就绪，修复会启动或重启它；如果只是导出失败且服务仍正常运行，则不重启。成功后用 `hihy 6` 查看状态，用 `hihy 8` 查看客户端配置。
+
+如果提示核心或配置缺失、安装阶段无法自动恢复，请先保留 `/etc/hihy` 和终端报错，按提示排查；重复跑 `hihy install` 不会覆盖已存在的配置。
+
 ## 从旧版升级（不重装）
 
 如果服务器已经在跑 **Hysteria 2**，不要卸载，也不用重新输入域名、端口或密码。升级分三件事：更新 **hihy 管理脚本**、更新 **Hysteria 内核**、迁移 **开机启动方式**。下面先做第一件，后两件按需操作。
@@ -88,7 +100,8 @@ hihy version
 
 - 运行 `hihy version` 看脚本版本，运行 `hihy 6` 查看服务。原有客户端应继续使用原地址、端口和密码。只是更新脚本，不需要运行 `hihy 1` 或 `hihy 9`。
 - 想使用新版内核功能（如 ACL 预览），再运行 `hihy 7`。这一步是单独的核心更新，正在运行的服务会重启验证；建议选空闲时间。
-- systemd 主机若提示旧版 `rc.local`/SysV 启动方式，可以先选“暂不迁移”。确认要切换启动方式时，再执行 `hihy migrate-service`；更新脚本本身不会执行迁移。
+- systemd 主机若提示旧版 `rc.local`/SysV 启动方式，可以先选“暂不迁移”。确认要切换启动方式时，再执行 `hihy migrate-service`。迁移会启用开机启动，但**原来停着的服务不会立即启动**；若服务正在运行，会切换到新服务并验证，安排在空闲时间操作。更新脚本本身不会执行迁移。
+- 尚未迁移的 SysV 主机，请用 `hihy stop` 或 `hihy restart` 管理服务。新版命令会先确认 PID 属于本机 Hysteria 核心；旧的 `/etc/rc.d/hihy` 不会在只更新启动器时被重写。
 - 成功替换前会把旧脚本留在 `/usr/bin/hihy.previous`。如果只想退回管理脚本，先确认没有 hihy 操作在运行，再执行下面的命令；它不会回退核心或配置。
 
 ```bash
@@ -103,6 +116,7 @@ mv -Tf -- /usr/bin/hihy.rollback.tmp /usr/bin/hihy
 ```bash
 hihy              # 打开交互菜单
 hihy install      # 安装 Hysteria2
+hihy repair-install # 保留已有配置，接着完成上次失败的安装
 hihy uninstall    # 卸载
 hihy start        # 启动
 hihy stop         # 停止

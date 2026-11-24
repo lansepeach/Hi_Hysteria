@@ -20,6 +20,41 @@ mkdir -p "$HIHY_ROOT_DIR/bin" "$scratch/releases"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_eq() { [ "$1" = "$2" ] || fail "expected '$2', got '$1'"; }
 
+(
+    cp "$(command -v sleep)" "$HIHY_ROOT_DIR/bin/appS"
+    sleep 30 &
+    unrelated=$!
+    "$HIHY_ROOT_DIR/bin/appS" 30 &
+    owned=$!
+    trap 'kill "$owned" "$unrelated" 2>/dev/null || true; wait "$owned" "$unrelated" 2>/dev/null || true' EXIT
+    printf '%s\n' "$unrelated" > "$HIHY_PID_FILE"
+    if legacyHihyProcessMatches "$unrelated"; then fail 'unrelated process accepted as Hysteria'; fi
+    legacyHihyStop
+    kill -0 "$unrelated" || fail 'stale PID stopped unrelated process'
+    [ ! -e "$HIHY_PID_FILE" ] || fail 'stale PID file left behind'
+    for attempt in {1..20}; do
+        if legacyHihyProcessMatches "$owned"; then break; fi
+        sleep 0.1
+    done
+    legacyHihyProcessMatches "$owned" || fail 'owned process not recognized'
+    cp "$(command -v sleep)" "$scratch/replacement-core"
+    mv -Tf "$scratch/replacement-core" "$HIHY_ROOT_DIR/bin/appS"
+    legacyHihyProcessMatches "$owned" || fail 'old core not recognized after atomic replacement'
+    printf '%s\n' "$owned" > "$HIHY_PID_FILE"
+    legacyHihyStop
+    if legacyHihyProcessMatches "$owned"; then fail 'owned process still running'; fi
+    [ ! -e "$HIHY_PID_FILE" ] || fail 'confirmed stop did not remove PID'
+)
+(
+    printf '1234\n' > "$HIHY_PID_FILE"
+    legacyHihyProcessMatches() { [ "$1" = 1234 ]; }
+    kill() { [ "$*" = '-TERM 1234' ]; }
+    sleep() { return 0; }
+    if legacyHihyStop > /dev/null; then fail 'stop succeeded before process exited'; fi
+    assert_eq "$(cat "$HIHY_PID_FILE")" 1234
+    rm -f "$HIHY_PID_FILE"
+)
+
 # Follow redirects (including a repository move), accept encoded tags, reject junk.
 (
     fetchRemoteBodyFromSources() { printf '%s' '{"tag_name":"app/v2.12.3"}'; }
@@ -61,6 +96,10 @@ CORE
 }
 asset=$(getHysteriaAssetName)
 make_core "$HIHY_ROOT_DIR/bin/appS" v2.12.2
+mkdir -p "$(dirname "$HIHY_CONFIG_FILE")"
+printf 'listen: :8443\n' > "$HIHY_CONFIG_FILE"
+legacyHihyProcessMatches() { hihyProcessAlive "$1"; }
+getStartCommand() { return 0; }
 make_release() {
     make_core "$scratch/releases/$asset" "${1:-v2.12.3}" "${2:-false}"
     printf '%s  build/%s\n' "$(sha256sum "$scratch/releases/$asset" | cut -d ' ' -f1)" "$asset" > "$scratch/releases/hashes.txt"

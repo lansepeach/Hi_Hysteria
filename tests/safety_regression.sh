@@ -40,7 +40,7 @@ printf 'listen: :44443\n' > "$HIHY_CONFIG_FILE"
 assert_eq "$(classifyInstallState)" installed
 cp "$HIHY_CONFIG_FILE" "$scratch/original-config"
 markInstallFailed old old
-install <<< INSTALL > /dev/null
+if install <<< INSTALL > /dev/null; then fail 'incomplete configured installation reported success'; fi
 cmp "$HIHY_CONFIG_FILE" "$scratch/original-config" || fail 'existing configuration overwritten'
 for answer in '' y 2 uninstall; do
     uninstall <<< "$answer" > /dev/null
@@ -53,6 +53,27 @@ mkdir -m 700 "${HIHY_ROOT_DIR}.operation.lock"
 if install <<< INSTALL > /dev/null; then fail 'concurrent installation accepted'; fi
 if uninstall <<< UNINSTALL > /dev/null; then fail 'concurrent uninstall accepted'; fi
 rmdir "${HIHY_ROOT_DIR}.operation.lock"
+(
+    printf 'remarks: retained\n' > "$HIHY_BACKUP_FILE"
+    cp "$HIHY_BACKUP_FILE" "$scratch/original-backup"
+    markInstallFailed service test
+    setHysteriaConfig() { fail 'repair re-entered configuration wizard'; }
+    installHihyService() { printf 'service\n' >> "$scratch/repair-steps"; }
+    waitHihyServiceHealthy() { return 0; }
+    serviceIsActive() { return 0; }
+    installCronTask() { return 0; }
+    generate_client_config() { printf 'export\n' >> "$scratch/repair-steps"; return 1; }
+    repairHihyInstallation <<< '' > /dev/null
+    [ ! -e "$scratch/repair-steps" ] || fail 'unconfirmed repair changed service'
+    if repairHihyInstallation <<< REPAIR > /dev/null; then fail 'failed finalization reported success'; fi
+    grep -qx 'phase=finalize' "$(getInstallFailureMarker)" || fail 'missing finalization marker'
+    generate_client_config() { printf 'export\n' >> "$scratch/repair-steps"; }
+    repairHihyInstallation <<< REPAIR > /dev/null
+    assert_eq "$(cat "$scratch/repair-steps")" $'service\nexport\nexport'
+    cmp "$HIHY_CONFIG_FILE" "$scratch/original-config" || fail 'repair modified service configuration'
+    cmp "$HIHY_BACKUP_FILE" "$scratch/original-backup" || fail 'repair modified backup configuration'
+    [ ! -e "$(getInstallFailureMarker)" ] || fail 'successful repair left failure marker'
+)
 (
     rm "$HIHY_CONFIG_FILE"
     rm -f "$HIHY_BACKUP_FILE"
@@ -83,6 +104,59 @@ rmdir "${HIHY_ROOT_DIR}.operation.lock"
     [ -f "$scratch/stopped" ] && [ -f "$HIHY_CONFIG_FILE" ] || fail 'uninstall recovery state missing'
     [ ! -e "${HIHY_ROOT_DIR}.operation.lock" ] || fail 'failed uninstall leaked lock'
 )
+(
+    rm -f "$HIHY_SERVICE_FILE" "$HIHY_PID_FILE"
+    printf '#!/bin/sh\nexit 0\n' > "$HIHY_LEGACY_SERVICE"
+    chmod 755 "$HIHY_LEGACY_SERVICE"
+    detectServiceManager() { echo systemd; }
+    isNativeHihySystemdService() { return 1; }
+    writeSystemdService() { touch "$HIHY_SERVICE_FILE"; }
+    systemctl() {
+        [ -d "${HIHY_ROOT_DIR}.operation.lock" ] || fail 'migration ran without lock'
+        case "$1" in daemon-reload | enable) ;; *) fail "unexpected stopped-service migration operation: $*";; esac
+    }
+    migrateLegacyService > /dev/null
+    [ -f "$HIHY_SERVICE_FILE" ] || fail 'stopped service did not migrate'
+    [ ! -e "${HIHY_ROOT_DIR}.operation.lock" ] || fail 'migration leaked lock'
+)
+for migration in running rollback; do
+(
+    HIHY_SERVICE_FILE="$scratch/native-$migration"
+    HIHY_LEGACY_SERVICE="$scratch/legacy-$migration"
+    HIHY_INIT_SERVICE="$scratch/init-$migration"
+    HIHY_RC_LOCAL="$scratch/rc-$migration"
+    HIHY_PID_FILE="$scratch/pid-$migration"
+    printf '#!/bin/sh\nexit 0\n' > "$HIHY_LEGACY_SERVICE"
+    cp "$HIHY_LEGACY_SERVICE" "$scratch/legacy-before-$migration"
+    ln -s "$HIHY_LEGACY_SERVICE" "$HIHY_INIT_SERVICE"
+    printf '%s start\n' "$HIHY_LEGACY_SERVICE" > "$HIHY_RC_LOCAL"
+    printf '1234\n' > "$HIHY_PID_FILE"
+    detectServiceManager() { echo systemd; }
+    isNativeHihySystemdService() { return 1; }
+    writeSystemdService() { touch "$HIHY_SERVICE_FILE"; }
+    legacyHihyProcessMatches() { [ "$1" = 1234 ]; }
+    legacyHihyStop() { printf 'legacy-stop\n' >> "$scratch/steps-$migration"; rm -f "$HIHY_PID_FILE"; }
+    legacyHihyStart() { printf 'legacy-start\n' >> "$scratch/steps-$migration"; }
+    systemctl() {
+        case "$1" in
+            start) printf 'native-start\n' >> "$scratch/steps-$migration" ;;
+            daemon-reload | enable | status | disable) ;;
+            *) fail "unexpected migration operation: $*" ;;
+        esac
+    }
+    waitHihyServiceHealthy() { [ "$migration" = running ]; }
+    if [ "$migration" = running ]; then
+        migrateLegacyService > /dev/null
+        assert_eq "$(cat "$scratch/steps-$migration")" $'legacy-stop\nnative-start'
+        [ ! -e "$HIHY_INIT_SERVICE" ] || fail 'old init entry remained after migration'
+    else
+        if migrateLegacyService > /dev/null; then fail 'unhealthy migration reported success'; fi
+        assert_eq "$(cat "$scratch/steps-$migration")" $'legacy-stop\nnative-start\nlegacy-start'
+        cmp "$HIHY_LEGACY_SERVICE" "$scratch/legacy-before-$migration" || fail 'legacy script not restored'
+        [ ! -e "$HIHY_SERVICE_FILE" ] && [ -L "$HIHY_INIT_SERVICE" ] || fail 'failed migration did not restore service entry'
+    fi
+)
+done
 
 # Role detection, defaults and guards do not invoke ACME/SSH on a receiver.
 assert_eq "$(getCertificateRole)" unconfigured
